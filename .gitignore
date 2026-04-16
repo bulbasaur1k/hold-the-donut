@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+Cargo.lock.lock
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.env
+.env.local
+/dist
+/release
+# CI artifacts
+coverage/
+*.profraw
+# Local-only testbench data
+scripts/xray-testbench/*.key
+scripts/xray-testbench/*.crt
+scripts/xray-testbench/data/

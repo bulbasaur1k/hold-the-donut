@@ -1,0 +1,19 @@
+[package]
+name = "donut-quic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+donut-core.workspace = true
+donut-rustls.workspace = true
+donut-xhttp.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

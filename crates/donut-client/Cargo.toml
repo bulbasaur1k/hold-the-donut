@@ -1,0 +1,28 @@
+[package]
+name = "donut-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "donut-client"
+path = "src/main.rs"
+
+[dependencies]
+donut-core.workspace = true
+donut-config.workspace = true
+donut-reality.workspace = true
+donut-vless.workspace = true
+donut-xhttp.workspace = true
+donut-quic.workspace = true
+donut-routing.workspace = true
+donut-dns.workspace = true
+donut-socks.workspace = true
+donut-io.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "donut-geo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+donut-core.workspace = true
+prost.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ahash.workspace = true
+
+[build-dependencies]
+# prost-build added when M6 generates geodat.proto bindings

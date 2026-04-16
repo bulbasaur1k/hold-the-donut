@@ -1,0 +1,38 @@
+version: "3.9"
+
+# Interop testbench: a real xray-core server + client on the host network,
+# used as ground-truth for protocol compliance tests from M1 onward.
+#
+# Usage (from repo root):
+#   cd scripts/xray-testbench
+#   ./gen-keys.sh                     # one-time, writes private/public/shortid
+#   docker compose up -d xray-server  # isolated server
+#   docker compose run --rm xray-client  # one-shot client that connects
+#
+# Test plan:
+#   * Capture pcap on the docker bridge for reference REALITY/XHTTP traffic.
+#   * Run our donut-server against the xray-client container.
+#   * Run our donut-client against the xray-server container.
+
+services:
+  xray-server:
+    image: teddysun/xray:latest
+    container_name: donut-xray-server
+    restart: "no"
+    ports:
+      - "127.0.0.1:18443:8443/tcp"
+      - "127.0.0.1:18443:8443/udp"
+    volumes:
+      - ./server.json:/etc/xray/config.json:ro
+    command: ["xray", "-c", "/etc/xray/config.json"]
+
+  xray-client:
+    image: teddysun/xray:latest
+    container_name: donut-xray-client
+    restart: "no"
+    network_mode: "host"
+    volumes:
+      - ./client.json:/etc/xray/config.json:ro
+    command: ["xray", "-c", "/etc/xray/config.json"]
+    depends_on:
+      - xray-server

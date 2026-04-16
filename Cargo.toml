@@ -1,0 +1,120 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/donut-core",
+    "crates/donut-io",
+    "crates/donut-dns",
+    "crates/donut-geo",
+    "crates/donut-routing",
+    "crates/donut-config",
+    "crates/donut-rustls",
+    "crates/donut-reality",
+    "crates/donut-vless",
+    "crates/donut-xhttp",
+    "crates/donut-quic",
+    "crates/donut-socks",
+    "crates/donut-server",
+    "crates/donut-client",
+    "crates/donut-tools",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MPL-2.0"
+repository = "https://github.com/daniilkozin/hold-the-donut"
+authors = ["hold-the-donut contributors"]
+
+[workspace.dependencies]
+# Async runtime + I/O
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io", "codec"] }
+futures-util = { version = "0.3", default-features = false }
+bytes = "1"
+pin-project-lite = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+
+# HTTP stack
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client", "server-auto"] }
+http = "1"
+http-body-util = "0.1"
+
+# QUIC / HTTP-3
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+# TLS (rustls is the upstream; rustls-reality fork patches it — M2)
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+
+# Crypto primitives for REALITY
+x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+hkdf = { version = "0.12", default-features = false }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+ring = "0.17"
+rand = "0.8"
+zeroize = "1"
+
+# Protobuf / serde / ids
+prost = "0.13"
+prost-types = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+hex = "0.4"
+
+# Errors / logging / CLI
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+# DNS
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "dns-over-rustls"] }
+
+# Collections / concurrency
+arc-swap = "1"
+parking_lot = "0.12"
+crossbeam-queue = "0.3"
+ahash = "0.8"
+smallvec = "1"
+
+# Local crates
+donut-core = { path = "crates/donut-core" }
+donut-io = { path = "crates/donut-io" }
+donut-dns = { path = "crates/donut-dns" }
+donut-geo = { path = "crates/donut-geo" }
+donut-routing = { path = "crates/donut-routing" }
+donut-config = { path = "crates/donut-config" }
+donut-rustls = { path = "crates/donut-rustls" }
+donut-reality = { path = "crates/donut-reality" }
+donut-vless = { path = "crates/donut-vless" }
+donut-xhttp = { path = "crates/donut-xhttp" }
+donut-quic = { path = "crates/donut-quic" }
+donut-socks = { path = "crates/donut-socks" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+
+[profile.dev]
+opt-level = 0
+debug = 1

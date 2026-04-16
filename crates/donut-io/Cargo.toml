@@ -1,0 +1,16 @@
+[package]
+name = "donut-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+bytes.workspace = true
+pin-project-lite.workspace = true
+parking_lot.workspace = true
+crossbeam-queue.workspace = true
+socket2.workspace = true
+tracing.workspace = true

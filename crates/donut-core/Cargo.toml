@@ -1,0 +1,17 @@
+[package]
+name = "donut-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+uuid.workspace = true
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]

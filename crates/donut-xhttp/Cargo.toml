@@ -1,0 +1,23 @@
+[package]
+name = "donut-xhttp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+donut-core.workspace = true
+donut-vless.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+pin-project-lite.workspace = true
+ahash.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
