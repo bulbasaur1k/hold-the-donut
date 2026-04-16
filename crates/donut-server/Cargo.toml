@@ -13,9 +13,9 @@ path = "src/main.rs"
 [dependencies]
 donut-core.workspace = true
 donut-config.workspace = true
-donut-reality.workspace = true
-donut-vless.workspace = true
-donut-xhttp.workspace = true
+donut-veil.workspace = true
+donut-wire.workspace = true
+donut-carrier.workspace = true
 donut-quic.workspace = true
 donut-routing.workspace = true
 donut-dns.workspace = true

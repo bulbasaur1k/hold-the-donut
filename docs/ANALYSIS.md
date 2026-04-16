@@ -205,10 +205,10 @@ hold-the-donut/
 ├── Cargo.toml                          # workspace
 ├── crates/
 │   ├── donut-core/                     # domain types, ports, errors
-│   ├── donut-reality/                  # REALITY auth + selfsteal logic
+│   ├── donut-veil/                  # REALITY auth + selfsteal logic
 │   ├── donut-rustls/                   # thin wrapper поверх rustls-reality форка
-│   ├── donut-vless/                    # VLESS encode/decode
-│   ├── donut-xhttp/                    # XHTTP: server + client, 3 modes
+│   ├── donut-wire/                    # VLESS encode/decode
+│   ├── donut-carrier/                    # XHTTP: server + client, 3 modes
 │   ├── donut-quic/                     # QUIC listener/dialer + rustls-reality
 │   ├── donut-geo/                      # geoip/geosite lookup
 │   ├── donut-dns/                      # async resolver (UDP + DoH)

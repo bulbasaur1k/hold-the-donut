@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// VLESS command byte.
+/// Inner-frame command byte.
 ///
 /// On the wire: 1 unsigned byte at offset `18 + addon_len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 pub enum Command {
     Tcp = 0x01,
     Udp = 0x02,
-    /// Mux.Cool. Accepted on the wire for compatibility but we do not
-    /// implement a multiplexer; inbound requests tagged Mux are rejected.
+    /// Multiplexer command. Accepted on the wire for compatibility but
+    /// we do not implement a multiplexer; inbound requests tagged Mux
+    /// are rejected.
     Mux = 0x03,
 }
 
@@ -24,48 +25,54 @@ impl Command {
     }
 }
 
-/// VLESS flow selector carried inside `Addons.flow`.
+/// Flow selector carried inside the inner-frame `Addons.flow` field.
 ///
-/// Vision is accepted only alongside `TransportKind::RawTcp`; all other
-/// transports enforce `None`.
+/// The extended variant is accepted only alongside
+/// `TransportKind::RawTcp`; all other transports enforce `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FlowKind {
     #[default]
     None,
+    /// Extended flow variant carried on the wire as the upstream
+    /// "xtls-rprx-vision" identifier.
     #[serde(rename = "xtls-rprx-vision")]
-    Vision,
+    Extended,
 }
 
 impl FlowKind {
-    pub const VISION_WIRE: &'static str = "xtls-rprx-vision";
+    /// On-wire identifier for the extended flow variant. Must match
+    /// the upstream codepoint byte-for-byte — this is a wire constant,
+    /// not a display name.
+    pub const EXTENDED_WIRE: &'static str = "xtls-rprx-vision";
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::None => "",
-            Self::Vision => Self::VISION_WIRE,
+            Self::Extended => Self::EXTENDED_WIRE,
         }
     }
 
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "" | "none" => Some(Self::None),
-            Self::VISION_WIRE => Some(Self::Vision),
+            Self::EXTENDED_WIRE => Some(Self::Extended),
             _ => None,
         }
     }
 }
 
-/// Transport carrying VLESS frames.
+/// Transport carrying the inner frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportKind {
-    /// Plain TCP — VLESS is the first byte after the TLS record layer.
+    /// Plain TCP — the inner frame is the first byte after the TLS
+    /// record layer.
     RawTcp,
-    /// XHTTP over HTTP/1.1 or HTTP/2.
-    Xhttp,
-    /// XHTTP over HTTP/3 (QUIC).
-    XhttpH3,
+    /// HTTP-based carrier over HTTP/1.1 or HTTP/2.
+    Carrier,
+    /// HTTP-based carrier over HTTP/3 (QUIC).
+    CarrierQuic,
 }
 
 /// TLS layer beneath the transport.
@@ -74,5 +81,7 @@ pub enum TransportKind {
 pub enum TlsKind {
     None,
     Tls,
-    Reality,
+    /// Veiled TLS: authenticated client masquerade where non-auth'd
+    /// probes are forwarded to the fronted target.
+    Veil,
 }

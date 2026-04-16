@@ -350,21 +350,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "donut-carrier"
+version = "0.0.1"
+dependencies = [
+ "ahash",
+ "bytes",
+ "donut-core",
+ "donut-wire",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "donut-client"
 version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "donut-carrier",
  "donut-config",
  "donut-core",
  "donut-dns",
  "donut-io",
  "donut-quic",
- "donut-reality",
  "donut-routing",
  "donut-socks",
- "donut-vless",
- "donut-xhttp",
+ "donut-veil",
+ "donut-wire",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -435,34 +455,15 @@ name = "donut-quic"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "donut-carrier",
  "donut-core",
  "donut-rustls",
- "donut-xhttp",
  "h3",
  "h3-quinn",
  "quinn",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "donut-reality"
-version = "0.0.1"
-dependencies = [
- "aes-gcm",
- "bytes",
- "donut-core",
- "donut-rustls",
- "hex",
- "hkdf",
- "hmac",
- "rand 0.8.5",
- "sha2",
- "thiserror 2.0.18",
- "tracing",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]
@@ -498,15 +499,15 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "donut-carrier",
  "donut-config",
  "donut-core",
  "donut-dns",
  "donut-io",
  "donut-quic",
- "donut-reality",
  "donut-routing",
- "donut-vless",
- "donut-xhttp",
+ "donut-veil",
+ "donut-wire",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -535,7 +536,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "donut-vless"
+name = "donut-veil"
+version = "0.0.1"
+dependencies = [
+ "aes-gcm",
+ "bytes",
+ "donut-core",
+ "donut-rustls",
+ "hex",
+ "hkdf",
+ "hmac",
+ "rand 0.8.5",
+ "sha2",
+ "thiserror 2.0.18",
+ "tracing",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "donut-wire"
 version = "0.0.1"
 dependencies = [
  "bytes",
@@ -544,26 +564,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "donut-xhttp"
-version = "0.0.1"
-dependencies = [
- "ahash",
- "bytes",
- "donut-core",
- "donut-vless",
- "futures-util",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "pin-project-lite",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

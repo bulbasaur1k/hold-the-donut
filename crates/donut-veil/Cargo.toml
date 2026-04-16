@@ -1,5 +1,5 @@
 [package]
-name = "donut-reality"
+name = "donut-veil"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

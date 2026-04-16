@@ -1,5 +1,5 @@
 [package]
-name = "donut-xhttp"
+name = "donut-carrier"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 donut-core.workspace = true
-donut-vless.workspace = true
+donut-wire.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true

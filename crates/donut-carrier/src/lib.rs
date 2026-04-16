@@ -1,18 +1,17 @@
-//! donut-xhttp — XHTTP transport (3 modes, over H1/H2/H3).
+//! donut-carrier — HTTP-based transport (3 modes, over H1/H2/H3).
 //!
-//! Modes:
+//! Three framing modes under an HTTP cover:
 //! * `packet-up` — many short POSTs with sequence numbers (uplink),
 //!   single long GET (downlink). Default placements: session via Path,
 //!   seq via `X-Seq` header.
-//! * `stream-up` — one long chunked POST, one long GET. Fastest split mode.
+//! * `stream-up` — one long chunked POST, one long GET. Fastest split.
 //! * `stream-one` — single request carries both directions. Default
-//!   mode when REALITY is the TLS layer (xray `auto` resolves here).
+//!   when the underlying TLS layer is veiled (`auto` resolves here).
 //!
 //! Session-id placements: `Path` (default), `Query`, `Header(X-Session)`,
-//! `Cookie(x_session)`, `Body`. Padding via `Referer` query when
-//! obfuscation is off.
+//! `Cookie(x_session)`, `Body`.
 //!
-//! Server tunables (xray defaults):
+//! Server tunables (upstream defaults):
 //! * `sc_max_each_post_bytes` = 1_000_000
 //! * `sc_min_posts_interval_ms` = 30
 //! * `sc_max_buffered_posts` = 30

@@ -8,9 +8,9 @@ members = [
     "crates/donut-routing",
     "crates/donut-config",
     "crates/donut-rustls",
-    "crates/donut-reality",
-    "crates/donut-vless",
-    "crates/donut-xhttp",
+    "crates/donut-veil",
+    "crates/donut-wire",
+    "crates/donut-carrier",
     "crates/donut-quic",
     "crates/donut-socks",
     "crates/donut-server",
@@ -52,7 +52,7 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 webpki-roots = "0.26"
 
-# Crypto primitives for REALITY
+# Crypto primitives for the masked-TLS handshake
 x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 hkdf = { version = "0.12", default-features = false }
@@ -97,9 +97,9 @@ donut-geo = { path = "crates/donut-geo" }
 donut-routing = { path = "crates/donut-routing" }
 donut-config = { path = "crates/donut-config" }
 donut-rustls = { path = "crates/donut-rustls" }
-donut-reality = { path = "crates/donut-reality" }
-donut-vless = { path = "crates/donut-vless" }
-donut-xhttp = { path = "crates/donut-xhttp" }
+donut-veil = { path = "crates/donut-veil" }
+donut-wire = { path = "crates/donut-wire" }
+donut-carrier = { path = "crates/donut-carrier" }
 donut-quic = { path = "crates/donut-quic" }
 donut-socks = { path = "crates/donut-socks" }
 

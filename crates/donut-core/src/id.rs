@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// User identifier. Wraps a 128-bit UUID, serialised on the wire as 16
-/// raw bytes (VLESS header) and as hex/UUID-canonical in config.
+/// User identifier. Wraps a 128-bit UUID, serialised on the wire as
+/// 16 raw bytes inside the inner-frame header, and as canonical UUID
+/// in config files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserId(Uuid);
@@ -42,8 +43,8 @@ impl FromStr for UserId {
     }
 }
 
-/// REALITY `ShortID`. Exactly 8 bytes on the wire, stored in the
-/// plaintext `SessionID[8..16]` of the modified ClientHello.
+/// Veiled-TLS short identifier. Exactly 8 bytes on the wire, stored
+/// in the plaintext `SessionID[8..16]` of the modified ClientHello.
 ///
 /// Config representation: hex string, 1..=16 nibbles, zero-padded on
 /// the right when shorter than 16 nibbles.
@@ -62,8 +63,8 @@ impl ShortId {
         &self.0
     }
 
-    /// Zero-length ShortID — valid per xray (matches any input with a
-    /// single-empty entry in `shortIds`).
+    /// Zero-length short id — wildcard per upstream semantics
+    /// (an empty-string entry in the configured list allows all).
     pub const fn zero() -> Self {
         Self([0; 8])
     }

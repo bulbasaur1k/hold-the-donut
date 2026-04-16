@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 donut-core.workspace = true
 donut-rustls.workspace = true
-donut-xhttp.workspace = true
+donut-carrier.workspace = true
 quinn.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true

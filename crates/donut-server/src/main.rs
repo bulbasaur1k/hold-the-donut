@@ -1,13 +1,13 @@
-//! donut-server — VLESS+REALITY+XHTTP proxy server.
+//! donut-server — edge daemon.
 //!
 //! Status: **M0 stub.** Full implementation in M6.
 
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "donut-server", version, about = "hold-the-donut proxy server")]
+#[command(name = "donut-server", version, about = "hold-the-donut edge daemon")]
 struct Args {
-    /// Path to JSON config (xray-compatible subset).
+    /// Path to JSON config.
     #[arg(short, long, default_value = "/etc/donut/server.json")]
     config: String,
 }
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    tracing::info!(config = %args.config, "donut-server stub — M0");
-    eprintln!("donut-server: not yet implemented (M0 stub; see docs/PLAN.md)");
+    tracing::info!(config = %args.config, "donut-server starting (M0 stub)");
+    eprintln!("donut-server: not yet implemented (M0 stub)");
     Ok(())
 }

@@ -1,11 +1,11 @@
-//! donut-tools — ops CLI: keygen, config-gen, check-reality.
+//! donut-tools — ops CLI: key generation, config helpers, peer probe.
 //!
 //! Status: **M0 stub.** Subcommands materialise in M9.
 
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "donut-tools", version, about = "hold-the-donut ops tool")]
+#[command(name = "donut-tools", version, about = "hold-the-donut ops cli")]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -13,10 +13,10 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Generate an X25519 keypair + ShortID for a REALITY server.
+    /// Generate an X25519 keypair + short identifier for a server.
     Keygen,
-    /// Sanity-check a REALITY server (TLS handshake + selfsteal).
-    CheckReality { target: String },
+    /// Connectivity check against a peer (handshake + fallback path).
+    Probe { target: String },
     /// Interactive config generator.
     ConfigGen {
         #[arg(long, value_parser = ["server", "client"])]
@@ -32,9 +32,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Keygen => eprintln!("keygen: not yet implemented (M9)"),
-        Cmd::CheckReality { target } => {
-            eprintln!("check-reality {target}: not yet implemented (M9)")
-        }
+        Cmd::Probe { target } => eprintln!("probe {target}: not yet implemented (M9)"),
         Cmd::ConfigGen { kind } => eprintln!("config-gen {kind}: not yet implemented (M9)"),
     }
     Ok(())

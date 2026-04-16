@@ -1,4 +1,4 @@
-//! donut-config — JSON loader for an Xray-compatible subset.
+//! donut-config — JSON loader for an upstream-compatible subset.
 //!
 //! Accepts: `inbounds`, `outbounds`, `routing`, `log`, `dns` (subset).
 //! Native form: TOML with the same structure.

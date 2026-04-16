@@ -1,8 +1,8 @@
-//! donut-quic — QUIC / HTTP-3 transport for XHTTP.
+//! donut-quic — QUIC / HTTP-3 transport for the HTTP-based carrier.
 //!
 //! Uses [`quinn`] with a custom rustls provider that honours the
-//! REALITY hooks from [`donut-rustls`]. `h3` + `h3-quinn` for the HTTP-3
-//! layer. XHTTP framing is delegated to [`donut-xhttp`].
+//! veil hooks from [`donut-rustls`]. `h3` + `h3-quinn` for the
+//! HTTP-3 layer. Framing is delegated to [`donut-carrier`].
 //!
 //! Status: **M0 stub.** Implementation in M5.
 

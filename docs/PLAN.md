@@ -34,7 +34,7 @@
 
 **Цель:** байт-точный encode/decode VLESS header.
 
-**Crate:** `donut-vless`.
+**Crate:** `donut-wire`.
 
 **Deliverables:**
 - [ ] `Request { version, user_uuid, flow, command, target }` — encode → `Bytes`, decode из `&mut Bytes`
@@ -76,7 +76,7 @@
 
 **Цель:** auth-логика REALITY поверх rustls-reality хуков.
 
-**Crate:** `donut-reality`.
+**Crate:** `donut-veil`.
 
 **Deliverables:**
 - [ ] `RealityServerConfig { private_key: X25519, short_ids: HashSet<[u8;8]>, target: SocketAddr, server_names: Vec<String> }`
@@ -99,7 +99,7 @@
 
 **Цель:** server + client для XHTTP по H1/H2.
 
-**Crate:** `donut-xhttp`.
+**Crate:** `donut-carrier`.
 
 **Deliverables:**
 - [ ] Server mode `stream-one` (MVP, default под REALITY):
@@ -130,7 +130,7 @@
 
 **Цель:** XHTTP поверх HTTP/3.
 
-**Crate:** `donut-quic` + расширение `donut-xhttp`.
+**Crate:** `donut-quic` + расширение `donut-carrier`.
 
 **Deliverables:**
 - [ ] `quinn` с custom `rustls-reality` как TLS provider

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 /// Target address reachable over the network.
 ///
-/// Mirrors the three VLESS address-type variants:
+/// Mirrors the three inner-frame address-type variants:
 /// * `Ipv4` — 4 raw bytes.
 /// * `Domain` — UTF-8 hostname, 1..=255 bytes.
 /// * `Ipv6` — 16 raw bytes.

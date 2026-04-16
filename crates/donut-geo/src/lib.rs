@@ -1,7 +1,8 @@
-//! donut-geo — v2fly/xray `.dat` parser + lookup.
+//! donut-geo — `.dat` parser + lookup for the v2fly-compatible
+//! geodata format (both geoip.dat and geosite.dat).
 //!
-//! Reference format: `common/geodata/geodat.proto` in xray-core.
-//! Messages: `GeoIPList { GeoIP { country_code, cidr[] } }`,
+//! Reference schema: `common/geodata/geodat.proto` from the upstream
+//! project. Messages: `GeoIPList { GeoIP { country_code, cidr[] } }`,
 //! `GeoSiteList { GeoSite { country_code, domain[] } }`.
 //!
 //! Status: **M0 stub.** Implementation in M6.
