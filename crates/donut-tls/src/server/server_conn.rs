@@ -446,6 +446,59 @@ pub struct ServerConfig {
     ///
     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
+
+    /// Hook invoked on the server with the raw ClientHello bytes
+    /// before any TLS processing. Used by the veiled-handshake layer
+    /// to authenticate the connection, and to decide whether to
+    /// continue the TLS state machine (`VeilDecision::Tunnel`) or to
+    /// bail out carrying the raw bytes so the caller can splice to
+    /// the fronted target (`VeilDecision::Forward`).
+    ///
+    /// When `Forward` is returned, the raw bytes are surfaced via
+    /// [`ServerConnection::take_forwarded`].
+    pub raw_client_hello_hook: Option<RawClientHelloHook>,
+}
+
+/// Decision returned by the raw ClientHello hook. See
+/// [`ServerConfig::raw_client_hello_hook`].
+#[derive(Clone, Debug)]
+pub enum VeilDecision {
+    /// Continue the TLS handshake normally.
+    Tunnel,
+    /// Stop the TLS state machine; surface the raw bytes via
+    /// [`ServerConnection::take_forwarded`] so the caller can proxy
+    /// the connection byte-for-byte to the fronted target.
+    Forward {
+        /// Raw ClientHello bytes that will be handed back to the
+        /// caller.
+        raw_client_hello: Vec<u8>,
+    },
+}
+
+/// See [`ServerConfig::raw_client_hello_hook`]. Wrapper around a
+/// shared closure; kept named so `ServerConfig` still derives
+/// `Debug` cleanly.
+#[derive(Clone)]
+pub struct RawClientHelloHook(Arc<dyn Fn(&[u8]) -> VeilDecision + Send + Sync>);
+
+impl RawClientHelloHook {
+    /// Wrap a closure as a `RawClientHelloHook`.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&[u8]) -> VeilDecision + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    pub(crate) fn call(&self, bytes: &[u8]) -> VeilDecision {
+        (self.0)(bytes)
+    }
+}
+
+impl Debug for RawClientHelloHook {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("RawClientHelloHook(..)")
+    }
 }
 
 impl ServerConfig {
@@ -645,6 +698,18 @@ mod connection {
                     ServerExtensionsInput::default(),
                 )?),
             })
+        }
+
+        /// Veiled-handshake: take the raw ClientHello bytes stashed
+        /// by a [`VeilDecision::Forward`] from
+        /// [`ServerConfig::raw_client_hello_hook`]. Returns `Some` at
+        /// most once per connection — on the call right after
+        /// [`ConnectionCommon::process_new_packets`] first sees the
+        /// forwarded ClientHello. A `Some` return means the caller
+        /// should stop driving TLS and proxy the underlying transport
+        /// verbatim to the fronted target.
+        pub fn take_forwarded(&mut self) -> Option<alloc::vec::Vec<u8>> {
+            self.inner.core.data.forwarded.take()
         }
 
         /// Retrieves the server name, if any, used to select the certificate and
@@ -1242,6 +1307,10 @@ pub struct ServerConnectionData {
     pub(super) received_resumption_data: Option<Vec<u8>>,
     pub(super) resumption_data: Vec<u8>,
     pub(super) early_data: EarlyDataState,
+    /// Set by the server-side veil hook when it returns
+    /// `VeilDecision::Forward`. Drained by
+    /// [`ServerConnection::take_forwarded`].
+    pub(crate) forwarded: Option<Vec<u8>>,
 }
 
 impl ServerConnectionData {

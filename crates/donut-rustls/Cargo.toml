@@ -17,7 +17,5 @@ bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-# NOTE: This crate will be switched to the `rustls-reality` fork
-# (see `forks/rustls-reality/`) once M2 lands its patches. Until then
-# it is a thin wrapper over upstream rustls, sufficient for smoke
-# tests of plain TLS.
+[dev-dependencies]
+rcgen = { version = "0.14", features = ["pem", "ring"], default-features = false }

@@ -28,6 +28,7 @@ use crate::msgs::handshake::{
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::server::common::ActiveCertifiedKey;
+use crate::server::server_conn::VeilDecision;
 use crate::server::{ClientHello, ServerConfig, tls13};
 use crate::sync::Arc;
 use crate::{SupportedCipherSuite, suites};
@@ -668,8 +669,51 @@ impl State<ServerConnectionData> for ExpectClientHello {
     where
         Self: 'm,
     {
+        // Veil hook: let the configured callback inspect the raw
+        // ClientHello bytes before any TLS processing. If it returns
+        // `Forward`, bail out of the TLS state machine — the caller
+        // will drain the bytes via `ServerConnection::take_forwarded`
+        // and proxy the underlying transport byte-for-byte to the
+        // fronted target.
+        if let Some(hook) = self.config.raw_client_hello_hook.as_ref() {
+            if let MessagePayload::Handshake { encoded, .. } = &m.payload {
+                match hook.call(encoded.bytes()) {
+                    VeilDecision::Tunnel => { /* proceed */ }
+                    VeilDecision::Forward { raw_client_hello } => {
+                        cx.data.forwarded = Some(raw_client_hello);
+                        return Ok(Box::new(ForwardedVeil));
+                    }
+                }
+            }
+        }
+
         let (client_hello, sig_schemes) = process_client_hello(&m, self.done_retry, cx)?;
         self.with_certified_key(sig_schemes, client_hello, &m, cx)
+    }
+
+    fn into_owned(self: Box<Self>) -> NextState<'static> {
+        self
+    }
+}
+
+/// Terminal state entered after
+/// [`VeilDecision::Forward`]. Any further TLS message is an error
+/// — the caller is expected to have stopped driving TLS after
+/// seeing a non-empty [`ServerConnection::take_forwarded`] return.
+struct ForwardedVeil;
+
+impl State<ServerConnectionData> for ForwardedVeil {
+    fn handle<'m>(
+        self: Box<Self>,
+        _cx: &mut ServerContext<'_>,
+        _m: Message<'m>,
+    ) -> NextStateOrError<'m>
+    where
+        Self: 'm,
+    {
+        Err(Error::General(
+            "connection has been forwarded via the veil hook".into(),
+        ))
     }
 
     fn into_owned(self: Box<Self>) -> NextState<'static> {

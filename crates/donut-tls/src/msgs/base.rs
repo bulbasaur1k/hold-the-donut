@@ -34,6 +34,21 @@ impl<'a> Payload<'a> {
         }
     }
 
+    /// Mutable access to the underlying bytes. Consumed by the
+    /// veiled-handshake client-hello mutator to rewrite the
+    /// serialised ClientHello in place before it is hashed into the
+    /// transcript and sent on the wire. Converts a `Borrowed` payload
+    /// to `Owned` on first call.
+    pub fn bytes_mut(&mut self) -> &mut Vec<u8> {
+        if let Self::Borrowed(bytes) = self {
+            *self = Self::Owned(bytes.to_vec());
+        }
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Borrowed(_) => unreachable!(),
+        }
+    }
+
     pub fn into_owned(self) -> Payload<'static> {
         Payload::Owned(self.into_vec())
     }

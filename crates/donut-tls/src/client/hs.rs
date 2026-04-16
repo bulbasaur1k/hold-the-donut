@@ -444,7 +444,7 @@ fn emit_client_hello_for_retry(
         _ => None,
     };
 
-    let ch = Message {
+    let mut ch = Message {
         version: match retryreq {
             // <https://datatracker.ietf.org/doc/html/rfc8446#section-5.1>:
             // "This value MUST be set to 0x0303 for all records generated
@@ -459,6 +459,17 @@ fn emit_client_hello_for_retry(
         },
         payload: MessagePayload::handshake(chp),
     };
+
+    // Veil hook: let the caller rewrite the ClientHello bytes (typically
+    // the 32-byte SessionID at offset 39) before they are hashed into
+    // the transcript and sent. `add_message` and `send_msg` both read
+    // from `encoded`, so mutating it here keeps client and server
+    // transcripts in sync.
+    if let Some(mutator) = config.client_hello_mutator.as_ref() {
+        if let MessagePayload::Handshake { encoded, .. } = &mut ch.payload {
+            mutator.call(encoded.bytes_mut().as_mut_slice());
+        }
+    }
 
     if retryreq.is_some() {
         // send dummy CCS to fool middleboxes prior

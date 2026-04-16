@@ -286,6 +286,46 @@ pub struct ClientConfig {
 
     /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
     pub(super) ech_mode: Option<EchMode>,
+
+    /// Mutator invoked after the ClientHello is serialised and before
+    /// it is fed to the transcript hash and sent on the wire. Used by
+    /// the veiled-handshake layer to rewrite the 32-byte legacy
+    /// SessionID in place.
+    ///
+    /// The slice passed to the callback is the full handshake message
+    /// body, starting with the 1-byte `HandshakeType` and the 3-byte
+    /// length — the same layout the peer sees on the wire. The
+    /// SessionID sits at offset **39** of this slice.
+    ///
+    /// The callback must not change the slice length.
+    pub client_hello_mutator: Option<ClientHelloMutator>,
+}
+
+/// Post-marshal, pre-send hook on the outgoing ClientHello. See
+/// [`ClientConfig::client_hello_mutator`]. Wrapper around a shared
+/// closure; kept as a named type so `ClientConfig` can still derive
+/// `Debug` cleanly.
+#[derive(Clone)]
+pub struct ClientHelloMutator(Arc<dyn Fn(&mut [u8]) + Send + Sync>);
+
+impl ClientHelloMutator {
+    /// Wrap a closure as a `ClientHelloMutator`.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&mut [u8]) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    pub(crate) fn call(&self, buf: &mut [u8]) {
+        (self.0)(buf);
+    }
+}
+
+impl fmt::Debug for ClientHelloMutator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ClientHelloMutator(..)")
+    }
 }
 
 impl ClientConfig {
