@@ -1,4 +1,8 @@
 /target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/references
 **/*.rs.bk
 Cargo.lock.lock
 .DS_Store

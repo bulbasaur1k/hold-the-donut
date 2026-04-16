@@ -17,6 +17,7 @@ members = [
     "crates/donut-client",
     "crates/donut-tools",
 ]
+exclude = ["fuzz", "references"]
 
 [workspace.package]
 version = "0.0.1"

@@ -1,0 +1,35 @@
+[package]
+name = "donut-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+donut-wire = { path = "../crates/donut-wire" }
+donut-core = { path = "../crates/donut-core" }
+
+[[bin]]
+name = "decode_request"
+path = "fuzz_targets/decode_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_response"
+path = "fuzz_targets/decode_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+bench = false
