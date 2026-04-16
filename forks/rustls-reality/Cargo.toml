@@ -1,0 +1,30 @@
+# Trimmed workspace for the rustls-reality fork.
+#
+# The fork carries a single library crate — the forked rustls — pinned
+# against upstream tag v/0.23.38 (commit 6b116bc). See PATCH_POINTS.md
+# for the list of intentional patches.
+
+[workspace]
+members = ["rustls"]
+resolver = "2"
+
+[workspace.dependencies]
+# Minimum set required by rustls/Cargo.toml (deps only, no dev-deps —
+# the fork's rustls crate has dev-deps stripped in its own Cargo.toml).
+aws-lc-rs = { version = "1.14", default-features = false }
+brotli = { version = "8", default-features = false, features = ["std"] }
+brotli-decompressor = "5.0.0"
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more"] }
+log = { version = "0.4.8" }
+once_cell = { version = "1.16", default-features = false, features = ["alloc", "race"] }
+pki-types = { package = "rustls-pki-types", version = "1.12", features = ["alloc"] }
+ring = "0.17"
+subtle = { version = "2.5.0", default-features = false }
+webpki = { package = "rustls-webpki", version = "0.103.5", features = ["alloc"], default-features = false }
+zeroize = "1.8"
+zlib-rs = "0.6"
+rustversion = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

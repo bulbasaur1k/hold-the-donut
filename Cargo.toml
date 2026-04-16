@@ -17,7 +17,7 @@ members = [
     "crates/donut-client",
     "crates/donut-tools",
 ]
-exclude = ["fuzz", "references"]
+exclude = ["fuzz", "references", "forks"]
 
 [workspace.package]
 version = "0.0.1"
@@ -103,6 +103,13 @@ donut-wire = { path = "crates/donut-wire" }
 donut-carrier = { path = "crates/donut-carrier" }
 donut-quic = { path = "crates/donut-quic" }
 donut-socks = { path = "crates/donut-socks" }
+
+[patch.crates-io]
+# Route every `rustls = "0.23"` in the workspace through our forked
+# copy. Patches (ClientHello mutator, raw-CH hook) live in
+# forks/rustls-reality/rustls/src/reality_hook.rs — see
+# forks/rustls-reality/PATCH_POINTS.md.
+rustls = { path = "forks/rustls-reality/rustls" }
 
 [profile.release]
 opt-level = 3
