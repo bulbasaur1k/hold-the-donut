@@ -9,7 +9,5 @@ repository.workspace = true
 [dependencies]
 donut-core.workspace = true
 bytes.workspace = true
-uuid.workspace = true
-prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

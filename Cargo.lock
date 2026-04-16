@@ -560,10 +560,8 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "donut-core",
- "prost",
  "thiserror 2.0.18",
  "tracing",
- "uuid",
 ]
 
 [[package]]
