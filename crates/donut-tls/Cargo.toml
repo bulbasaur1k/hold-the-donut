@@ -1,0 +1,86 @@
+[package]
+# NB: the package name stays `rustls` on purpose — this crate is the
+# workspace's sole TLS implementation, substituted for upstream
+# rustls via [patch.crates-io] at the repo root. That redirect only
+# works when the replacement crate is named identically. The
+# directory (`crates/donut-tls`) and the README describe ownership.
+name = "rustls"
+version = "0.23.38"
+edition = "2021"
+rust-version.workspace = true
+license = "Apache-2.0 OR ISC OR MIT"
+description = "TLS stack for hold-the-donut — based on rustls 0.23.38 with added veiled-handshake hooks. See MODIFICATIONS.md."
+repository.workspace = true
+categories = ["network-programming", "cryptography"]
+autobenches = false
+autotests = false
+exclude = ["src/testdata"]
+build = "build.rs"
+
+[lib]
+# Inline `#[cfg(test)]` modules in the vendored upstream code depend on
+# dev-dependencies (rustls-test, rcgen, x509-parser, etc.) that we
+# deliberately don't pull in. Our own patches are tested from
+# `crates/donut-rustls`, which drives the public API end-to-end.
+test = false
+doctest = false
+bench = false
+
+[features]
+default = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"]
+
+aws-lc-rs = ["aws_lc_rs"]
+aws_lc_rs = ["dep:aws-lc-rs", "webpki/aws-lc-rs", "aws-lc-rs/aws-lc-sys", "aws-lc-rs/prebuilt-nasm"]
+brotli = ["dep:brotli", "dep:brotli-decompressor", "std"]
+custom-provider = []
+fips = ["aws_lc_rs", "aws-lc-rs?/fips", "webpki/aws-lc-rs-fips"]
+logging = ["log"]
+prefer-post-quantum = ["aws_lc_rs"]
+read_buf = ["rustversion", "std"]
+ring = ["dep:ring", "webpki/ring"]
+std = ["webpki/std", "pki-types/std", "once_cell/std"]
+tls12 = []
+zlib = ["dep:zlib-rs"]
+
+[build-dependencies]
+rustversion = { version = "1.0.6", optional = true }
+
+[dependencies]
+# Everything here is a direct dep — we do not re-export versions into
+# the outer workspace to avoid dragging TLS-internal crates into
+# adjacent crates by accident.
+aws-lc-rs = { version = "1.14", default-features = false, optional = true }
+brotli = { version = "8", default-features = false, features = ["std"], optional = true }
+brotli-decompressor = { version = "5.0.0", optional = true }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more"], optional = true }
+log = { version = "0.4.8", optional = true }
+once_cell = { version = "1.16", default-features = false, features = ["alloc", "race"] }
+ring = { version = "0.17", optional = true }
+subtle = { version = "2.5.0", default-features = false }
+webpki = { package = "rustls-webpki", version = "0.103.5", features = ["alloc"], default-features = false }
+pki-types = { package = "rustls-pki-types", version = "1.12", features = ["alloc"] }
+zeroize = { version = "1.8" }
+zlib-rs = { version = "0.6", optional = true }
+
+[package.metadata.docs.rs]
+features = ["read_buf", "ring"]
+rustdoc-args = ["--cfg", "rustls_docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  "cfg(bench)",
+  "cfg(coverage_nightly)",
+  "cfg(read_buf)",
+  "cfg(rustls_docsrs)",
+] }
+
+# Vendored upstream code uses a different clippy profile than the rest
+# of the workspace. Keep clippy quiet here so `cargo clippy -- -D warnings`
+# at the workspace level still passes; we run our own clippy against
+# `donut-rustls` where our patches are exercised.
+[lints.clippy]
+all = "allow"
+complexity = "allow"
+perf = "allow"
+style = "allow"
+pedantic = "allow"

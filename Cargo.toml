@@ -7,6 +7,7 @@ members = [
     "crates/donut-geo",
     "crates/donut-routing",
     "crates/donut-config",
+    "crates/donut-tls",
     "crates/donut-rustls",
     "crates/donut-veil",
     "crates/donut-wire",
@@ -17,7 +18,7 @@ members = [
     "crates/donut-client",
     "crates/donut-tools",
 ]
-exclude = ["fuzz", "references", "forks"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.1"
@@ -105,11 +106,13 @@ donut-quic = { path = "crates/donut-quic" }
 donut-socks = { path = "crates/donut-socks" }
 
 [patch.crates-io]
-# Route every `rustls = "0.23"` in the workspace through our forked
-# copy. Patches (ClientHello mutator, raw-CH hook) live in
-# forks/rustls-reality/rustls/src/reality_hook.rs — see
-# forks/rustls-reality/PATCH_POINTS.md.
-rustls = { path = "forks/rustls-reality/rustls" }
+# Route every `rustls = "0.23"` in the workspace (direct + transitive
+# through quinn, tokio-rustls, hyper-rustls, h3-quinn, etc.) through
+# our own crate in crates/donut-tls. The on-disk directory names it
+# `donut-tls` because that's ours; the Cargo package name stays
+# `rustls` so this patch redirect works with zero downstream fuss.
+# See crates/donut-tls/MODIFICATIONS.md for the intentional diffs.
+rustls = { path = "crates/donut-tls" }
 
 [profile.release]
 opt-level = 3
