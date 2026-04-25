@@ -1,22 +1,38 @@
 //! donut-carrier — HTTP-based transport (3 modes, over H1/H2/H3).
 //!
-//! Three framing modes under an HTTP cover:
-//! * `packet-up` — many short POSTs with sequence numbers (uplink),
-//!   single long GET (downlink). Default placements: session via Path,
-//!   seq via `X-Seq` header.
-//! * `stream-up` — one long chunked POST, one long GET. Fastest split.
-//! * `stream-one` — single request carries both directions. Default
-//!   when the underlying TLS layer is veiled (`auto` resolves here).
+//! See `docs/PROTOCOLS.md` § 3 for the frozen byte spec.
 //!
-//! Session-id placements: `Path` (default), `Query`, `Header(X-Session)`,
-//! `Cookie(x_session)`, `Body`.
+//! Modes (status):
+//! * `stream-one`  — implemented (M4). Single bidirectional HTTP
+//!                   exchange; default under the veiled-TLS layer.
+//! * `stream-up`   — implemented (M4). One long POST + one long GET.
+//! * `packet-up`   — implemented (M4). Many sequenced POSTs + one GET.
 //!
-//! Server tunables (upstream defaults):
-//! * `sc_max_each_post_bytes` = 1_000_000
-//! * `sc_min_posts_interval_ms` = 30
-//! * `sc_max_buffered_posts` = 30
-//! * `sc_stream_up_server_secs` = 20..80
-//!
-//! Status: **M0 stub.** Implementation in M4 (H1/H2), extended in M5 (H3).
+//! HTTP/3 (QUIC) lands in M5.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
+// Kept around for the M6 proxy plumbing; the wiring is exercised by
+// the e2e tests.
+#![allow(dead_code)]
+
+mod config;
+mod error;
+mod io_glue;
+mod mode;
+mod placement;
+mod session;
+
+pub mod client;
+pub mod server;
+
+#[cfg(test)]
+mod tests;
+
+pub use config::{ClientConfig, ServerConfig};
+pub use error::CarrierError;
+pub use io_glue::CarrierStream;
+pub use mode::Mode;
+pub use placement::Placement;
+pub use session::SessionId;
