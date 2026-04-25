@@ -13,7 +13,17 @@ donut-carrier.workspace = true
 quinn.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
+http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+rcgen = { version = "0.14", features = ["pem", "ring"], default-features = false }
