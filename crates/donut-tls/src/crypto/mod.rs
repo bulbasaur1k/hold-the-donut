@@ -595,6 +595,20 @@ pub trait ActiveKeyExchange: Send + Sync {
 
     /// Return the group being used.
     fn group(&self) -> NamedGroup;
+
+    /// Compute the shared secret with `peer_pub_key` **without**
+    /// consuming the local private key.
+    ///
+    /// Used by veiled-handshake protocols that need to derive an
+    /// auxiliary auth key from the same X25519 ephemeral the TLS
+    /// handshake will later use for its own key share. Default
+    /// implementation returns `None` to indicate the operation is
+    /// not supported by this key exchange.
+    ///
+    /// X25519 implementations should override and return `Some(_)`.
+    fn diffie_hellman(&self, _peer_pub_key: &[u8]) -> Option<SharedSecret> {
+        None
+    }
 }
 
 /// The result from [`SupportedKxGroup::start_and_complete()`].

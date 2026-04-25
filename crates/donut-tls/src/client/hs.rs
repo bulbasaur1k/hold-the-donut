@@ -467,7 +467,11 @@ fn emit_client_hello_for_retry(
     // transcripts in sync.
     if let Some(mutator) = config.client_hello_mutator.as_ref() {
         if let MessagePayload::Handshake { encoded, .. } = &mut ch.payload {
-            mutator.call(encoded.bytes_mut().as_mut_slice());
+            let kx_ref: Option<&dyn ActiveKeyExchange> = match key_share.as_deref() {
+                Some(kx) => Some(kx),
+                None => None,
+            };
+            mutator.call(encoded.bytes_mut().as_mut_slice(), kx_ref);
         }
     }
 

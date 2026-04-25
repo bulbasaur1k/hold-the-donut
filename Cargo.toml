@@ -55,8 +55,8 @@ rustls-pki-types = "1"
 webpki-roots = "0.26"
 
 # Crypto primitives for the masked-TLS handshake
-x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+x25519-dalek = { version = "2", default-features = false, features = ["zeroize", "static_secrets"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 hkdf = { version = "0.12", default-features = false }
 hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }

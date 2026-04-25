@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 donut-core.workspace = true
 donut-rustls.workspace = true
+rustls.workspace = true
 x25519-dalek.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
@@ -18,5 +19,9 @@ rand.workspace = true
 zeroize.workspace = true
 bytes.workspace = true
 hex.workspace = true
+ahash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rcgen = { version = "0.14", features = ["pem", "ring"], default-features = false }

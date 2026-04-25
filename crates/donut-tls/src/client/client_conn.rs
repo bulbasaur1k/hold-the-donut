@@ -305,20 +305,35 @@ pub struct ClientConfig {
 /// [`ClientConfig::client_hello_mutator`]. Wrapper around a shared
 /// closure; kept as a named type so `ClientConfig` can still derive
 /// `Debug` cleanly.
+///
+/// The callback receives:
+/// * a mutable slice over the serialised ClientHello body (handshake
+///   header included; the 32-byte legacy SessionID lives at offset 39);
+/// * an optional borrow of the in-progress TLS 1.3 key exchange — the
+///   same X25519 ephemeral the TLS handshake will use for its key
+///   share. Veiled-handshake protocols call
+///   [`ActiveKeyExchange::diffie_hellman`] on it to derive an
+///   auxiliary shared secret without consuming the TLS key.
 #[derive(Clone)]
-pub struct ClientHelloMutator(Arc<dyn Fn(&mut [u8]) + Send + Sync>);
+pub struct ClientHelloMutator(
+    Arc<dyn Fn(&mut [u8], Option<&dyn crate::crypto::ActiveKeyExchange>) + Send + Sync>,
+);
 
 impl ClientHelloMutator {
     /// Wrap a closure as a `ClientHelloMutator`.
     pub fn new<F>(f: F) -> Self
     where
-        F: Fn(&mut [u8]) + Send + Sync + 'static,
+        F: Fn(&mut [u8], Option<&dyn crate::crypto::ActiveKeyExchange>) + Send + Sync + 'static,
     {
         Self(Arc::new(f))
     }
 
-    pub(crate) fn call(&self, buf: &mut [u8]) {
-        (self.0)(buf);
+    pub(crate) fn call(
+        &self,
+        buf: &mut [u8],
+        kx: Option<&dyn crate::crypto::ActiveKeyExchange>,
+    ) {
+        (self.0)(buf, kx);
     }
 }
 

@@ -108,7 +108,7 @@ fn both_hooks_fire_and_see_the_same_bytes() {
     };
     let marker_cb = marker;
 
-    let client_mutator = ClientHelloMutator::new(move |buf: &mut [u8]| {
+    let client_mutator = ClientHelloMutator::new(move |buf: &mut [u8], _kx| {
         client_saw_cb.fetch_add(1, Ordering::SeqCst);
         assert!(
             buf.len() >= SESSION_ID_OFFSET + SESSION_ID_LEN,

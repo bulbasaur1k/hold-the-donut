@@ -113,29 +113,44 @@ AuthKey = HKDF-SHA256(salt, info).expand(shared) // 32 bytes
 The same salt is available to the server because `ClientHello.Random` is
 in the raw bytes hook sees.
 
-### ClientHello `SessionID` layout (after REALITY rewrite)
+### ClientHello `SessionID` layout (after veiled-TLS rewrite)
 
 `SessionID` is a legacy TLS field carried in the ClientHello body at
 offset **39** from the start of the ClientHello handshake message
 (`msg_type[1] + length[3] + legacy_version[2] + random[32] +
 session_id_length[1] = 39`). TLS 1.3 ignores this field semantically
-(it's echoed back for compat), so REALITY reuses all 32 bytes.
+(it's echoed back for compat), so the veiled handshake reuses all 32
+bytes.
 
-Plaintext layout before sealing:
+The full 32-byte SessionID slot **is the AES-256-GCM output**
+(ciphertext + tag) of a 16-byte plaintext. There is no cleartext
+short-id on the wire; the SessionID looks indistinguishable from
+random to a probe.
+
+Plaintext layout (16 bytes, fed into AES-GCM as the message):
 
 ```
 offset  size   field
 0       3      Xray version triplet (x, y, z) — major, minor, patch
 3       1      reserved, set to 0
-4       4     Unix timestamp (BE uint32)
-8       8     ShortID (8 raw bytes)
-16      16    auth blob: AES-256-GCM(AuthKey) over placeholder material
+4       4      Unix timestamp (BE uint32)
+8       8      ShortID (8 raw bytes)
 ```
 
-The final 16 bytes are the AES-GCM **ciphertext+tag** of a plaintext
-chosen so that the full raw ClientHello (post-rewrite) satisfies the
-server check `HMAC-SHA512(AuthKey, cert.signature) == certs[0].Signature`
-after the server completes handshake with the target's real cert.
+Sealed output (16 bytes ciphertext + 16 bytes tag = 32 bytes) lands
+in `SessionID[0..32]`. Open parameters on the server:
+
+```
+key   = AuthKey                                    // 32 bytes
+nonce = ClientHello.Random[20..32]                 // 12 bytes
+ad    = entire ClientHello body, with SessionID slot zeroed
+ct    = SessionID[0..32]
+```
+
+Both sides compute AAD over the SessionID-zeroed ClientHello, so the
+check is symmetric. After the TLS handshake completes, the server
+also signs `cert.signature` with `HMAC-SHA512(AuthKey, ...)`; the
+client verifies that signature to defeat MITM (M3+).
 
 ### Server decision flow
 

@@ -818,6 +818,7 @@ name = "donut-veil"
 version = "0.0.1"
 dependencies = [
  "aes-gcm",
+ "ahash",
  "bytes",
  "donut-core",
  "donut-rustls",
@@ -825,6 +826,8 @@ dependencies = [
  "hkdf",
  "hmac",
  "rand 0.8.5",
+ "rcgen",
+ "rustls 0.23.38",
  "sha2",
  "thiserror 2.0.18",
  "tracing",

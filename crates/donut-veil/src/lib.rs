@@ -1,13 +1,37 @@
 //! donut-veil — veiled-TLS handshake glue on top of [`donut-rustls`].
 //!
-//! Byte spec: see `docs/PROTOCOLS.md` § "Veiled TLS handshake".
+//! The crate plugs three things into rustls:
 //!
-//! * AuthKey = HKDF-SHA256(salt = ClientHello.Random[:20], info = <7-byte tag>)
-//!   .expand( X25519(client_priv, server_pub) ) — 32 bytes.
-//! * SessionID layout (32 bytes): `version(4) | ts(4) | shortID(8) | sealed(16)`.
-//! * Sealed = AES-256-GCM(AuthKey) over ephemeral material.
-//! * Server validates `HMAC-SHA512(AuthKey, cert.signature)` → tunnel/forward.
+//! 1. A custom X25519 [`SupportedKxGroup`](rustls::crypto::SupportedKxGroup)
+//!    backed by `x25519-dalek` that supports a non-consuming
+//!    Diffie-Hellman so the same TLS 1.3 ephemeral can also derive
+//!    the auxiliary auth key.
+//! 2. A `ClientHelloMutator` factory that rewrites the legacy
+//!    `SessionID` field with an AES-256-GCM seal of `(version, ts,
+//!    short_id)` keyed by `HKDF-SHA256(salt = ClientHello.Random[..20],
+//!    info = "REALITY").expand(ECDH(client_priv, server_pub))`.
+//! 3. A `RawClientHelloHook` factory that, on the server, parses the
+//!    incoming ClientHello, opens the SessionID seal, and either
+//!    returns `Tunnel` (authenticated) or `Forward` (selfsteal probe).
 //!
-//! Status: **M0 stub.** Implementation in M3.
+//! Byte spec frozen in `docs/PROTOCOLS.md` § "Veiled TLS handshake".
+//!
+//! Status: **M3**, server + client side, end-to-end handshake test.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
+
+mod auth;
+mod client;
+mod config;
+mod error;
+mod kx;
+mod parse;
+mod server;
+
+#[cfg(test)]
+mod tests;
+
+pub use config::{VeilClientConfig, VeilServerConfig};
+pub use error::VeilError;
+pub use kx::{VeilX25519, VEIL_X25519};
+pub use {client::build_client_hello_mutator, server::build_raw_client_hello_hook};
