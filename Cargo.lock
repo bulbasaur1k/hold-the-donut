@@ -655,6 +655,7 @@ name = "donut-client"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "donut-carrier",
  "donut-config",
@@ -663,9 +664,11 @@ dependencies = [
  "donut-io",
  "donut-quic",
  "donut-routing",
+ "donut-server",
  "donut-socks",
  "donut-veil",
  "donut-wire",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

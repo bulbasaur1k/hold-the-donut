@@ -104,6 +104,7 @@ donut-wire = { path = "crates/donut-wire" }
 donut-carrier = { path = "crates/donut-carrier" }
 donut-quic = { path = "crates/donut-quic" }
 donut-socks = { path = "crates/donut-socks" }
+donut-server = { path = "crates/donut-server" }
 
 [patch.crates-io]
 # Route every `rustls = "0.23"` in the workspace (direct + transitive

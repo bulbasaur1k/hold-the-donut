@@ -16,15 +16,16 @@
 | M5 step 1 | ✅ done (request → response) | `e76b7e3` | 1 H3 e2e |
 | M5 step 2 | ✅ done — raw QUIC bidi, full bidirectional | `80dd0e7` | 1 bidi e2e (overlapping read+write) |
 | M5 step 3 | ⏳ pending — H3 framing wrapped on top of raw bidi (xray-compat) | — | — |
-| M6 step 1 | ✅ done — carrier proxy (stream-one + freedom outbound) | _next commit_ | 1 e2e (real TCP echo through proxy) |
+| M6 step 1 | ✅ done — carrier proxy (stream-one + freedom outbound) | `a2c4992` | 1 e2e (real TCP echo through proxy) |
 | M6 step 2 | ⏳ pending — veiled-TLS layer in front of carrier | — | — |
 | M6 step 3 | ⏳ pending — JSON config loader + routing + DNS resolver | — | — |
-| M7  | ⏳ pending | — | — |
+| M7 step 1 | ✅ done — SOCKS5 inbound + carrier outbound | _next commit_ | 1 e2e (curl-style SOCKS5 → donut-client → donut-server → echo) |
+| M7 step 2 | ⏳ pending — veiled-TLS dial from client side | — | — |
 | M8  | ⏳ pending | — | — |
 | M9  | ⏳ pending | — | — |
 | M10 | ⏳ pending — optional | — | — |
 
-Workspace test count: **43** (`cargo test --workspace` зелёное).
+Workspace test count: **44** (`cargo test --workspace` зелёное).
 Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` чисто.
 
 ---
