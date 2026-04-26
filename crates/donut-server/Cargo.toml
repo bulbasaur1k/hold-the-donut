@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "donut_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "donut-server"
 path = "src/main.rs"
@@ -21,7 +25,13 @@ donut-routing.workspace = true
 donut-dns.workspace = true
 donut-io.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
+bytes.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+bytes.workspace = true
