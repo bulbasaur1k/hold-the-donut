@@ -3,6 +3,30 @@
 > Живой документ. Milestones, deliverables, acceptance, зависимости.
 > Отмечаем в `[x]` сделанное по мере прогресса.
 
+## Текущий статус
+
+| ID  | Статус | Коммит | Тестов |
+|---|---|---|---|
+| M0  | ✅ done | `8b65360` | — |
+| Renames | ✅ done | `07fd583` | — |
+| M1  | ✅ done | `fd8341c` + `99a4ac2` | 17 unit + 1 doctest + criterion bench (encode 7ns / decode 20ns) |
+| M2  | ✅ done | `47e23ac` baseline + `eb5c887` patches | 2 e2e smoke (rustls hooks fire end-to-end) |
+| M3  | ✅ done | `4aca33d` | 3 auth unit + 3 veil e2e (handshake / unknown short_id / unauth → forward) |
+| M4  | ✅ done | `e608bb6` | 3 session unit + 4 e2e across stream-one / stream-up / packet-up |
+| M5 step 1 | ✅ done (request → response) | `e76b7e3` | 1 H3 e2e |
+| M5 step 2 | ✅ done — raw QUIC bidi, full bidirectional | _next commit_ | 1 bidi e2e (overlapping read+write) |
+| M5 step 3 | ⏳ pending — H3 framing wrapped on top of raw bidi (xray-compat) | — | — |
+| M6  | ⏳ pending | — | — |
+| M7  | ⏳ pending | — | — |
+| M8  | ⏳ pending | — | — |
+| M9  | ⏳ pending | — | — |
+| M10 | ⏳ pending — optional | — | — |
+
+Workspace test count: **42** (`cargo test --workspace` зелёное).
+Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` чисто.
+
+---
+
 ## Принципы
 
 - **Каждый milestone — самостоятельно работает и тестируется.** Не делаем "M3 закончим через полгода".

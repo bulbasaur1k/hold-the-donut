@@ -13,11 +13,13 @@
 
 mod error;
 
+pub mod bidi;
 pub mod client;
 pub mod server;
 
 #[cfg(test)]
 mod tests;
 
+pub use bidi::{BidiServer, BidiSession};
 pub use error::QuicError;
 pub use server::{QuicServer, QuicSession};
