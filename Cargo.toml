@@ -25,7 +25,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MPL-2.0"
-repository = "https://github.com/daniilkozin/hold-the-donut"
+repository = "https://github.com/bulbasaur1k/hold-the-donut"
 authors = ["hold-the-donut contributors"]
 
 [workspace.dependencies]
