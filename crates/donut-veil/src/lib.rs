@@ -26,12 +26,19 @@ mod config;
 mod error;
 mod kx;
 mod parse;
+mod proof;
 mod server;
+mod verifier;
 
 #[cfg(test)]
 mod tests;
 
 pub use config::{VeilClientConfig, VeilServerConfig};
 pub use error::VeilError;
-pub use kx::{VeilX25519, VEIL_X25519};
-pub use {client::build_client_hello_mutator, server::build_raw_client_hello_hook};
+pub use kx::{crypto_provider, VeilX25519, VEIL_X25519};
+pub use proof::{server_proof, PROOF_LEN};
+pub use verifier::NoCertVerification;
+pub use {
+    client::{build_client_hello_mutator, build_client_hello_mutator_capturing, AuthKeySink},
+    server::{build_raw_client_hello_hook, server_verdict, Verdict},
+};

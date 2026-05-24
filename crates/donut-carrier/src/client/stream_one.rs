@@ -14,7 +14,7 @@ use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::io::ReaderStream;
 
@@ -31,8 +31,21 @@ pub(super) async fn dial(
 ) -> Result<CarrierStream, CarrierError> {
     let tcp = TcpStream::connect(target).await?;
     tcp.set_nodelay(true).ok();
+    dial_over_io(tcp, config, sid).await
+}
 
-    let (mut sender, conn) = http1::handshake::<_, BoxedRequestBody>(TokioIo::new(tcp)).await?;
+/// `stream-one` dial over an **already-established** byte stream (e.g. a
+/// decrypted veiled-TLS stream). The transport-agnostic core of
+/// [`dial`].
+pub(super) async fn dial_over_io<IO>(
+    io: IO,
+    config: &ClientConfig,
+    sid: SessionId,
+) -> Result<CarrierStream, CarrierError>
+where
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut sender, conn) = http1::handshake::<_, BoxedRequestBody>(TokioIo::new(io)).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::trace!(?e, "stream-one client connection ended");

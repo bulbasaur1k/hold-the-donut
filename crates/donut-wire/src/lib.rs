@@ -34,7 +34,12 @@
 mod addons;
 mod error;
 mod request;
+mod vision;
 
 pub use addons::Addons;
 pub use error::WireError;
 pub use request::{Request, Response};
+pub use vision::{
+    VisionPadder, VisionUnpadder, CMD_PADDING_CONTINUE, CMD_PADDING_DIRECT, CMD_PADDING_END,
+    MAX_CONTENT,
+};

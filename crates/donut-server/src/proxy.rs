@@ -11,13 +11,21 @@
 //! source of `(stream, target)` pairs satisfies it.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use donut_core::{Address, Command, Endpoint};
+use donut_dns::Resolver;
+use donut_routing::Router;
+use donut_veil::VeilServerConfig;
 use donut_wire::{Request, Response, WireError};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+use crate::metrics::Metrics;
+use crate::veil_server::VeilServer;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -32,6 +40,9 @@ pub enum ProxyError {
 
     #[error("could not resolve target {0}")]
     Resolve(String),
+
+    #[error("tls config: {0}")]
+    Tls(String),
 }
 
 /// Bind a carrier server in `stream-one` mode on `bind_addr` and run
@@ -49,10 +60,20 @@ pub async fn run_carrier_proxy(bind_addr: SocketAddr) -> Result<SocketAddr, Prox
         },
     );
 
+    // Plain path has no routing table — everything goes direct (freedom).
+    let router = Arc::new(Router::new("freedom"));
+    let resolver =
+        Arc::new(Resolver::system().unwrap_or_else(|_| {
+            Resolver::doh(&["1.1.1.1".parse().unwrap()], "cloudflare-dns.com")
+        }));
+    let metrics = Metrics::new();
     tokio::spawn(async move {
         while let Some(session) = server.accept().await {
+            let router = router.clone();
+            let resolver = resolver.clone();
+            let metrics = metrics.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_session(session.stream).await {
+                if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
                     tracing::trace!(?e, "proxy session ended with error");
                 }
             });
@@ -62,7 +83,90 @@ pub async fn run_carrier_proxy(bind_addr: SocketAddr) -> Result<SocketAddr, Prox
     Ok(local)
 }
 
-async fn handle_session(stream: donut_carrier::CarrierStream) -> Result<(), ProxyError> {
+/// Bind a **veiled** proxy on `bind_addr`: every connection is triaged
+/// by the selfsteal front door; unauthenticated callers are relayed to
+/// `dest`, authenticated veil peers get their TLS terminated and the
+/// `stream-one` carrier served over the decrypted stream, then proxied
+/// via the freedom outbound. This is the full scenario-2 server path
+/// (`VLESS+REALITY+XHTTP`). Returns the bound local address.
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
+pub async fn run_veil_proxy(
+    bind_addr: SocketAddr,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    veil: VeilServerConfig,
+    dest: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+) -> Result<SocketAddr, ProxyError> {
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local = listener.local_addr()?;
+    let server = Arc::new(
+        VeilServer::new(cert_chain, key, veil, dest).map_err(|e| ProxyError::Tls(e.to_string()))?,
+    );
+
+    tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(?e, "veil proxy accept error");
+                    continue;
+                }
+            };
+            let server = server.clone();
+            let router = router.clone();
+            let resolver = resolver.clone();
+            let metrics = metrics.clone();
+            metrics.connection_accepted();
+            tokio::spawn(async move {
+                match server.handle(tcp).await {
+                    Ok(Some(tls)) => {
+                        // Hold the active gauge up for the connection's life.
+                        let _active = metrics.tunnel_started();
+                        let mut rx = donut_carrier::server::serve_connection(
+                            tls,
+                            donut_carrier::ServerConfig {
+                                mode: donut_carrier::Mode::StreamOne,
+                                ..donut_carrier::ServerConfig::default()
+                            },
+                            peer,
+                        );
+                        while let Some(session) = rx.recv().await {
+                            let router = router.clone();
+                            let resolver = resolver.clone();
+                            let metrics = metrics.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    handle_session(session.stream, router, resolver, metrics).await
+                                {
+                                    tracing::trace!(?e, "veil proxy session ended with error");
+                                }
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        metrics.forwarded();
+                        tracing::trace!("veil proxy: unauthenticated caller relayed to decoy");
+                    }
+                    Err(e) => {
+                        tracing::trace!(?e, "veil proxy: handshake/triage failed");
+                    }
+                }
+            });
+        }
+    });
+
+    Ok(local)
+}
+
+async fn handle_session(
+    stream: donut_carrier::CarrierStream,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+) -> Result<(), ProxyError> {
     let mut session = stream;
 
     // Read enough bytes to parse the inner-frame request header. The
@@ -94,7 +198,19 @@ async fn handle_session(stream: donut_carrier::CarrierStream) -> Result<(), Prox
         return Err(ProxyError::UnsupportedCommand);
     }
 
-    let target_addr = resolve(&target_endpoint).await?;
+    // Routing decision. A `block`/`blackhole` outbound drops the
+    // connection (the client sees its tunnel close); anything else falls
+    // through to the freedom (direct) outbound.
+    match router.route(&target_endpoint) {
+        "block" | "blackhole" => {
+            metrics.blackholed();
+            tracing::debug!(target = %target_endpoint, "routing: blackhole — dropping");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let target_addr = resolve(&resolver, &target_endpoint).await?;
     let mut upstream = tokio::net::TcpStream::connect(target_addr).await?;
 
     // Echo the response prefix back to the client so it can verify
@@ -109,25 +225,23 @@ async fn handle_session(stream: donut_carrier::CarrierStream) -> Result<(), Prox
         upstream.write_all(&leftover).await?;
     }
 
-    let _ = tokio::io::copy_bidirectional(&mut session, &mut upstream).await;
+    if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut session, &mut upstream).await {
+        metrics.add_bytes(up, down);
+    }
     let _ = upstream.shutdown().await;
     let _ = session.shutdown().await;
     Ok(())
 }
 
-/// Trivial synchronous resolver: IPs pass through unchanged, domains
-/// go through tokio's blocking `to_socket_addrs`.
-async fn resolve(ep: &Endpoint) -> Result<SocketAddr, ProxyError> {
+/// Resolve a target endpoint: IP literals pass through; domains go
+/// through the configured [`Resolver`] (system or DoH).
+async fn resolve(resolver: &Resolver, ep: &Endpoint) -> Result<SocketAddr, ProxyError> {
     match &ep.address {
         Address::Ip(ip) => Ok(SocketAddr::new(*ip, ep.port)),
-        Address::Domain(d) => {
-            let host = format!("{d}:{}", ep.port);
-            tokio::net::lookup_host(host.clone())
-                .await
-                .map_err(ProxyError::Io)?
-                .next()
-                .ok_or(ProxyError::Resolve(d.clone()))
-        }
+        Address::Domain(d) => resolver
+            .resolve_one(d, ep.port)
+            .await
+            .map_err(|e| ProxyError::Resolve(format!("{d}: {e}"))),
     }
 }
 

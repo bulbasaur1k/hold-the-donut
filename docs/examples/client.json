@@ -1,0 +1,29 @@
+{
+  "log": { "level": "info" },
+  "inbound": { "socks": "127.0.0.1:1080" },
+  "outbound": {
+    "server": "vpn.example.com:443",
+    "reality": {
+      "public_key": "REPLACE_WITH_BASE64URL_OR_HEX_X25519_PUBLIC_KEY",
+      "short_id": "deadbeef",
+      "server_name": "www.microsoft.com",
+      "version": [26, 4, 15]
+    }
+  },
+  "geo": {
+    "geoip": "/etc/donut/geoip.dat",
+    "geosite": "/etc/donut/geosite.dat"
+  },
+  "routing": {
+    "default": "proxy",
+    "rules": [
+      { "geoip": ["ru", "private"], "outbound": "direct" },
+      { "geosite": ["category-ru", "yandex", "vk"], "outbound": "direct" },
+      { "domain": [{ "suffix": "local" }], "outbound": "direct" }
+    ]
+  },
+  "dns": {
+    "doh": ["77.88.8.8"],
+    "doh_tls_name": "common.dot.dns.yandex.net"
+  }
+}

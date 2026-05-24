@@ -50,9 +50,11 @@ h3-quinn = "0.0.10"
 
 # TLS (rustls is the upstream; rustls-reality fork patches it — M2)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 webpki-roots = "0.26"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 
 # Crypto primitives for the masked-TLS handshake
 x25519-dalek = { version = "2", default-features = false, features = ["zeroize", "static_secrets"] }
@@ -82,7 +84,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 # DNS
-hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "dns-over-rustls"] }
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config", "dns-over-rustls", "dns-over-https-rustls"] }
 
 # Collections / concurrency
 arc-swap = "1"

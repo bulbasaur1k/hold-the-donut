@@ -1,6 +1,7 @@
 //! Build the [`ClientHelloMutator`] that performs the veil handshake
 //! sealing on the client side.
 
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::client::ClientHelloMutator;
@@ -11,12 +12,27 @@ use crate::auth::{
 };
 use crate::config::VeilClientConfig;
 
+/// Per-connection sink for the derived `AuthKey`. The capturing mutator
+/// writes it once; the caller reads it after the handshake to verify the
+/// server-auth proof.
+pub type AuthKeySink = Arc<OnceLock<[u8; 32]>>;
+
 /// Returns a [`ClientHelloMutator`] that, given the in-progress TLS
 /// 1.3 X25519 ephemeral, rewrites the 32-byte legacy SessionID with
 /// the AES-GCM-sealed `(version, ts, short_id)` plaintext keyed by
 /// `HKDF-SHA256(salt = ClientHello.Random[..20], info = "REALITY",
 /// IKM = ECDH(client_priv, server_pub))`.
 pub fn build_client_hello_mutator(config: VeilClientConfig) -> ClientHelloMutator {
+    build_client_hello_mutator_capturing(config, None)
+}
+
+/// Like [`build_client_hello_mutator`], but also writes the derived
+/// `AuthKey` into `sink` so the caller can verify the server-auth proof
+/// after the handshake (REALITY-hardening).
+pub fn build_client_hello_mutator_capturing(
+    config: VeilClientConfig,
+    sink: Option<AuthKeySink>,
+) -> ClientHelloMutator {
     let server_pub = config.server_pub;
     let short_id = config.short_id;
     let version = config.version;
@@ -62,6 +78,11 @@ pub fn build_client_hello_mutator(config: VeilClientConfig) -> ClientHelloMutato
         }
         auth_key.copy_from_slice(secret_bytes);
         derive_auth_key(&mut auth_key, &random_prefix);
+
+        // Surface the AuthKey for the post-handshake server-auth proof.
+        if let Some(sink) = &sink {
+            let _ = sink.set(auth_key);
+        }
 
         // Compose plaintext and seal.
         let unix_ts = SystemTime::now()

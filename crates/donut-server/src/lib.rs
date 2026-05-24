@@ -11,6 +11,12 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod metrics;
 mod proxy;
+mod selfsteal;
+mod veil_server;
 
-pub use proxy::{run_carrier_proxy, ProxyError};
+pub use metrics::Metrics;
+pub use proxy::{run_carrier_proxy, run_veil_proxy, ProxyError};
+pub use selfsteal::{triage, Triage};
+pub use veil_server::{PrefixedStream, VeilServer};

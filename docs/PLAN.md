@@ -16,16 +16,31 @@
 | M5 step 1 | ✅ done (request → response) | `e76b7e3` | 1 H3 e2e |
 | M5 step 2 | ✅ done — raw QUIC bidi, full bidirectional | `80dd0e7` | 1 bidi e2e (overlapping read+write) |
 | M5 step 3 | ⏳ pending — H3 framing wrapped on top of raw bidi (xray-compat) | — | — |
+| M5.5 step 1 | ✅ done — Vision padding-кодек (`donut-wire`: `VisionPadder`/`VisionUnpadder`, state-machine, сверено с v26.4.15) | _uncommitted_ | 5 unit (round-trip/chunked/UUID/End→direct/empty) |
+| M5.5 step 2 | ⏳ pending — trafficState TLS-детект + raw-TCP+REALITY carrier + `flow=vision` wiring | — | — |
+| REALITY-hardening | ✅ done — server-auth proof `HMAC(AuthKey)` в туннеле; клиент без `trusted_cert` (NoCertVerification), MITM-защита; снято M3-упрощение | _uncommitted_ | 1 unit (proof) + покрыт veil-tunnel e2e |
 | M6 step 1 | ✅ done — carrier proxy (stream-one + freedom outbound) | `a2c4992` | 1 e2e (real TCP echo through proxy) |
-| M6 step 2 | ⏳ pending — veiled-TLS layer in front of carrier | — | — |
-| M6 step 3 | ⏳ pending — JSON config loader + routing + DNS resolver | — | — |
+| M6 step 2a | ✅ done — selfsteal triage + REALITY-Forward relay (байт-прозрачный) | _uncommitted_ | 1 e2e (real ClientHello → relay to decoy, обе стороны) |
+| M6 step 2b | ✅ done — veiled-TLS терминация на Tunnel (`VeilServer` + `PrefixedStream`) | _uncommitted_ | 1 e2e (veil tunnel: рукопожатие + расшифрованное эхо) |
+| M6 step 2c | ✅ done — carrier-over-stream (`serve_connection`/`dial_over_stream`) поверх veiled-TLS | _uncommitted_ | 1 e2e (carrier поверх veil-туннеля, payload round-trip) |
+| M6/M7 veiled демоны | ✅ done — `run_veil_proxy` (server) + `run_veil_socks_proxy` (client) | _uncommitted_ | **капстоун e2e**: SOCKS5 → veil → carrier → freedom → echo |
+| M6 step 4 | ✅ done — JSON config loader (`donut-config`) + `main.rs` wiring обоих бинарей | _uncommitted_ | 3 config unit + примеры `docs/examples/` |
+| M6 step 3a | ✅ done — routing match-движок (`donut-routing`: domain/cidr/port → outbound) | _uncommitted_ | 7 unit (suffix/full/keyword, v4/v6 CIDR, ports, порядок) |
+| M6 step 3b | ✅ done — routing проведён в сервер (конфиг `routing` → `Router` → `handle_session`, `block`/`blackhole` дропает) | _uncommitted_ | 2 routing-config unit + 1 blackhole e2e |
+| M6 step 3c | ✅ done — geo `.dat` парсер (`donut-geo`: GeoIP/GeoSite parse + lookup/contains/matches) | _uncommitted_ | 2 unit (prost round-trip + contains/matches) |
+| M6 step 3d | ✅ done — `geoip:`/`geosite:` условия в routing (`donut-routing`×`donut-geo`, конфиг грузит `.dat`) | _uncommitted_ | 1 geo-routing unit |
+| M6 step 3e | ✅ done — DNS resolver (`donut-dns`: system + DoH) проведён в сервер (конфиг `dns`) | _uncommitted_ | 1 dns unit (IP short-circuit) |
+| donut-tools keygen | ✅ done — X25519 keypair + shortID (base64-url, xray-compat) | _uncommitted_ | unit (pub↔priv) |
+| donut-tools config-gen | ✅ done — согласованная пара server+client конфигов (свежий keypair) | _uncommitted_ | 1 unit (консистентность + serde round-trip) |
+| M9 metrics | ✅ done — Prometheus `/metrics` (English): connections/active/handshakes{tunnel,forward}/blackhole/bytes{up,down} | _uncommitted_ | 1 unit (render) + 1 e2e (GET /metrics) |
 | M7 step 1 | ✅ done — SOCKS5 inbound + carrier outbound | _next commit_ | 1 e2e (curl-style SOCKS5 → donut-client → donut-server → echo) |
-| M7 step 2 | ⏳ pending — veiled-TLS dial from client side | — | — |
+| M7 step 2 | ✅ done — veiled-TLS dial (`VeilClient`) | _uncommitted_ | покрыт тем же veil-tunnel e2e |
+| M7 split-tunnel | ✅ done — client-side routing: `direct`/`block`/proxy по domain/ip/port/geoip/geosite (RU/домашнее — мимо сервера, с локального IP) | _uncommitted_ | 1 e2e (direct минует недоступный сервер) |
 | M8  | ⏳ pending | — | — |
 | M9  | ⏳ pending | — | — |
 | M10 | ⏳ pending — optional | — | — |
 
-Workspace test count: **44** (`cargo test --workspace` зелёное).
+Workspace test count: **76** (`cargo test --workspace` зелёное).
 Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` чисто.
 
 ---
@@ -37,6 +52,92 @@ Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 - **CI с первого milestone** — GitHub Actions, `cargo fmt + clippy + test` в каждом PR.
 - **Golden path first:** сначала happy case proxy через REALITY+XHTTP, потом error paths, потом оптимизации.
 - **Interop-тест** против реального `xray-core` в Docker — обязательный gate для M4+.
+
+---
+
+## Целевые сценарии деплоя *(зафиксировано 2026-05-21)*
+
+Проект целится в **3 боевых сценария**. Все три используют общее ядро **VLESS + REALITY** (TLS-маскировка + auth) и различаются только транспортом поверх него:
+
+| # | Сценарий | Транспорт | Назначение | Milestone | Interop |
+|---|---|---|---|---|---|
+| 1 | **Reality** | VLESS+REALITY + **Vision** (`xtls-rprx-vision`) поверх raw TCP | Самый быстрый: без HTTP-обёртки и без TLS-in-TLS; классический Reality-сетап | **M5.5** | xray Vision-клиент ↔ наш сервер |
+| 2 | **XHTTP** | VLESS+REALITY + XHTTP (stream-one/up, packet-up) поверх **H1/H2** | CDN-дружелюбная HTTP-маскировка | **M4 ✅** | xray XHTTP ↔ наш сервер (обе стороны) |
+| 3 | **QUIC / HTTP-3** *(«Hysteria-like»)* | VLESS+REALITY + XHTTP поверх **H3 (QUIC/UDP)** | Низкая латентность, lossy/throttled сети | **M5** | xray H3 ↔ наш сервер |
+
+**Решения (2026-05-21):**
+- Сценарий 1 «Reality» = **Vision over raw TCP** — поднят из M10-опционального в **core** (новый **M5.5**). Vision несовместим с XHTTP (issue #5576), поэтому это отдельный TCP-путь, а не режим XHTTP.
+- Сценарий 3 «QUIC/HTTP3» = **текущий M5** (XHTTP-over-H3, xray-совместимый), а **не** отдельный протокол Hysteria. «Аналог Hysteria» — разговорное: берём от Hysteria только идею **опционального Brutal-CC** (фикс. полоса для lossy-сетей); masquerade неавторизованных уже даёт REALITY-Forward на QUIC-TLS handshake. **Не** делаем собственный H3-auth / Salamander / reverse-proxy — interop с xray важнее.
+
+---
+
+## Self-Steal и подложка — как REALITY прикрывает VPN-сервер *(исследование, 2026-05-21)*
+
+### Зачем это вообще
+
+REALITY защищается от **активного зондирования** (active probing) GFW. Любой
+может постучаться TLS-хендшейком на наш `IP:443`. Сервер обязан выглядеть как
+**настоящий веб-сайт**, иначе «TLS-сервер, который на всё отвечает странно» —
+сам по себе сигнатура. Механизм: на ClientHello без валидного REALITY-auth
+(чужой/зонд/браузер) сервер **байт-прозрачно проксирует** соединение к
+*реальному* TLS-сайту (`dest`/`target`). Зонд видит валидный сертификат и
+настоящий контент этого сайта и не может отличить нас от обычного reverse-proxy
+к этому сайту. Для авторизованных же клиентов (SessionID-seal сходится) идёт
+проксирование туннеля. Подробности байт-логики — `PROTOCOLS.md §2`.
+
+### Две стратегии `dest`
+
+| | **Borrowed (классика)** | **Self-Steal (selfSteal)** |
+|---|---|---|
+| `dest` | внешний популярный сайт (`www.microsoft.com:443`) | свой веб-сервер на **той же машине** (`127.0.0.1:8443`), отдающий **твой** домен |
+| SNI | чужой домен | твой домен |
+| Сертификат, что видит зонд | настоящий cert чужого сайта | настоящий cert твоего домена (Let's Encrypt) |
+| Контроль | нет (зависим от чужого поведения/аптайма) | полный |
+| Латентность forward | до внешнего сайта | localhost |
+| Слабые места | твой ASN/PTR/гео не совпадают с «чужим» доменом; чужой сайт должен держать TLS1.3+X25519+H2 и не быть с тобой в одной CDN; редиректы/гео-различия | домен и контент целиком на тебе → нужна **достоверная подложка**, иначе «пустой nginx» = палево |
+
+**Вывод:** для нашего деплоя целимся в **Self-Steal** (полный контроль,
+консистентный ASN/PTR/домен, localhost-латентность). Borrowed оставляем как
+поддерживаемый конфиг-вариант, но рекомендуем selfSteal.
+
+### Нужна ли подложка? — Да. Что именно «достоверный сайт»
+
+Пустая дефолтная страница nginx, `444`/обрыв соединения или голый `200 OK` —
+это **палево**: зонд и случайный браузер должны увидеть правдоподобный сайт.
+Требования к подложке:
+
+- реальный контент (несколько страниц, ассеты, favicon, `robots.txt`);
+- консистентные заголовки (`Server:`, HSTS, тип контента), TLS-стек —
+  распространённый (nginx/caddy/наш);
+- **ALPN совпадает** с тем, что реально умеет подложка (h2/http1.1) — forward
+  байт-прозрачный, поэтому ALPN = что договорит `dest`;
+- одинаковое поведение для «зонд» и «браузер» (никакой ветки «если не наш —
+  отдать другое»);
+- желательно правдоподобная причина трафика (страница загрузок/облако/статус —
+  объясняет полосу).
+
+### Что можем сделать (варианты подложки)
+
+1. **External nginx/caddy рядом** (рекомендуемый прод-дефолт): инструкция +
+   готовый конфиг, `dest=127.0.0.1:8443`, реальный домен + Let's Encrypt.
+   Наш бинарь не лезет в HTTP — только REALITY-forward.
+2. **Встроенный decoy-сервер** (`--decoy ./site`, feature `decoy`): минимальный
+   статик-HTTP+TLS на отдельном порту в `donut-server`, чтобы single-binary
+   деплой работал без nginx. Нужен **свой валидный cert** для SNI-домена.
+3. **`donut-tools gen-decoy`**: генератор статической подложки из шаблона
+   (`blog` / `landing` / `status` / `files`) + рекомендованный nginx/caddy конфиг.
+4. **Reverse-proxy-зеркало реального сайта** — не рекомендуем (правовые/
+   поведенческие риски), оставляем borrowed-dest как путь для этого кейса.
+
+### Дельта к плану (deliverables)
+
+- **M6** — REALITY-Forward relay: реализовать `VeilDecision::Forward` →
+  байт-прозрачный TCP-relay на конфигурируемый `dest` (selfSteal `127.0.0.1:N`
+  или внешний). Сейчас решение возвращается, но relay не подключён.
+- **M6 (опц., feature `decoy`)** — встроенный статик-HTTPS decoy-listener.
+- **M9 / donut-tools** — `gen-decoy` (генератор подложки + конфиг) и расширение
+  `check-reality`: проверка, что fallback ведёт себя идентично для зонда и
+  браузера, ALPN корректен, cert валиден, нет дефолт-страницы-палева.
 
 ---
 
@@ -153,9 +254,9 @@ Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 
 ---
 
-## M5 — QUIC / HTTP-3 *(1 неделя)*
+## M5 — QUIC / HTTP-3 *(1 неделя)* — сценарий 3 «QUIC/HTTP3 (Hysteria-like)»
 
-**Цель:** XHTTP поверх HTTP/3.
+**Цель:** XHTTP поверх HTTP/3 (xray-совместимый). Это и есть боевой сценарий 3; «Hysteria» — разговорное обозначение QUIC-транспорта, отдельный протокол не делаем.
 
 **Crate:** `donut-quic` + расширение `donut-carrier`.
 
@@ -163,11 +264,34 @@ Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 - [ ] `quinn` с custom `rustls-reality` как TLS provider
 - [ ] `h3` + `h3-quinn` сервер и клиент
 - [ ] Все 3 XHTTP mode работают поверх H3 (маршрутизация XHTTP-слоя абстрагирована от HTTP-версии)
-- [ ] Custom congestion: cubic default; TODO: BBR port из quiche — отдельный тикет
+- [ ] Custom congestion: cubic default; **опц. Brutal-CC** (фикс. целевая полоса, игнор loss-backoff — Hysteria-style для lossy/throttled сетей); TODO: BBR port из quiche — отдельный тикет
+- [ ] Masquerade неавторизованных: переиспользуем REALITY-Forward на QUIC-TLS handshake (как в M3); собственный H3-auth / reverse-proxy / Salamander **не** делаем
 - [ ] `allowInsecure=false` по-умолчанию
 - [ ] UDP-socket tuning: `SO_RCVBUF=8M`, GSO/GRO где есть
 
 **Acceptance:** xray-core client в `stream-one` over H3 → наш сервер; наш client over H3 → xray сервер.
+
+---
+
+## M5.5 — REALITY + Vision over raw TCP *(сценарий 1 «Reality», ~1 неделя)*
+
+**Цель:** самый быстрый сценарий — VLESS+REALITY с flow `xtls-rprx-vision` поверх голого TCP, без HTTP/XHTTP-обёртки и без видимого TLS-in-TLS. Поднят из M10-опционального в core (решение 2026-05-21). Зависит от M3 (REALITY) + M1 (VLESS), параллелен M4/M5.
+
+**Crates:** `donut-wire` (Vision flow + padding), `donut-veil` (переиспользует REALITY auth), TCP-carrier путь.
+
+**Deliverables:**
+- [ ] `docs/PROTOCOLS.md` — байт-спека Vision (сверить с `proxy/vless/encoding` xray-core при реализации): addon `flow="xtls-rprx-vision"`, padding-команды (`commandPaddingContinue=0x00` / `End=0x01` / `Direct=0x02`), `trafficState`, детект окончания inner TLS 1.3 handshake
+- [ ] `donut-wire`: Vision reader/writer — инъекция padding в первые записи, переключение в direct-copy (splice) после inner handshake
+- [ ] Server: VLESS+REALITY поверх raw TCP, ветка `flow=vision`; `flow="none"` поверх TCP по-прежнему работает
+- [ ] Client: dial Vision поверх REALITY+TCP
+- [ ] Валидатор конфига отвергает Vision вместе с XHTTP (issue #5576)
+
+**Тесты:**
+- [ ] Interop: стандартный xray-core client с `flow=xtls-rprx-vision` ↔ наш сервер, проходит трафик (iperf)
+- [ ] Interop: наш client ↔ xray-core server с Vision
+- [ ] Known-answer: padding-вектора из xray-capture
+
+**Acceptance:** xray Vision-клиент качает через наш сервер; в Wireshark — один TLS 1.3 поток на :443 без видимого double-wrap на установившемся соединении.
 
 ---
 
@@ -179,7 +303,9 @@ Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 
 **Deliverables:**
 - [ ] JSON config loader, compatible subset of Xray schema (inbounds, outbounds, routing, log)
-- [ ] Inbound: VLESS+REALITY+XHTTP(H1/H2/H3) — единственный поддерживаемый sign-in
+- [ ] Inbound: VLESS+REALITY все 3 сценария — Vision/raw-TCP (M5.5), XHTTP H1/H2 (M4), XHTTP H3 (M5); единственный поддерживаемый sign-in
+- [ ] **REALITY-Forward relay (selfsteal)**: на `VeilDecision::Forward` — байт-прозрачный TCP-relay на конфигурируемый `dest` (selfSteal `127.0.0.1:N` или внешний сайт). См. раздел «Self-Steal и подложка»
+- [ ] _(опц., feature `decoy`)_ встроенный статик-HTTPS decoy-listener (`--decoy ./site`) со своим cert — для single-binary деплоя без nginx
 - [ ] Outbound: `freedom` (direct), `blackhole` (drop) — минимум
 - [ ] DNS resolver: UDP + DoH (`https://1.1.1.1/dns-query`)
 - [ ] Routing: domain/ip/port/user match → outbound tag
@@ -201,8 +327,8 @@ Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 **Deliverables:**
 - [ ] SOCKS5 inbound (CONNECT+UDP ASSOCIATE)
 - [ ] HTTP CONNECT inbound
-- [ ] Outbound: VLESS+REALITY+XHTTP через все три режима и H1/H2/H3
-- [ ] Routing client-side (split-tunnel по geosite)
+- [ ] Outbound: VLESS+REALITY все 3 сценария — Vision/raw-TCP, XHTTP (3 режима) H1/H2, XHTTP H3
+- [x] Routing client-side split-tunnel: `geoip`/`geosite`/domain/ip/port → `direct` (минуя сервер, с локального IP) / `block` / `proxy`; client-side resolver для direct-dial ✅
 - [ ] uTLS Chrome fingerprint (минимум один, Chrome 120)
 - [ ] Mobile-friendly: single config file, no daemon complexity
 - [ ] Xray JSON config — импорт субсета
@@ -234,11 +360,12 @@ Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 ## M9 — Observability + прод-подготовка *(3-5 дней)*
 
 **Deliverables:**
-- [ ] Prometheus `/metrics` на сервере (отдельный listener)
-- [ ] Metrics: bytes_in/out per user, active_conns, handshakes{result=}, forward_events{reason=}
-- [ ] `donut-tools keygen` — генерация X25519 keypair + shortID
-- [ ] `donut-tools check-reality <host:port>` — проверяет что удалённый REALITY-сервер жив и selfsteal работает
-- [ ] `donut-tools config-gen --server|--client` — интерактивный генератор конфига
+- [x] Prometheus `/metrics` на сервере (отдельный listener), английские имена ✅
+- [x] Metrics: connections_total, active_connections, handshakes{tunnel,forward}, blackhole, bytes{up,down} ✅ (per-user — позже)
+- [x] `donut-tools keygen` — генерация X25519 keypair + shortID (base64-url xray-compat + hex) ✅
+- [ ] `donut-tools check-reality <host:port>` — проверяет что удалённый REALITY-сервер жив и selfsteal работает: fallback идентичен для зонда и браузера, ALPN корректен, cert валиден, нет дефолт-страницы-палева
+- [ ] `donut-tools gen-decoy --domain <d> --template <blog|landing|status|files>` — генератор статической подложки + рекомендованный nginx/caddy конфиг
+- [x] `donut-tools config-gen` — генератор согласованной пары server+client конфигов (свежий keypair+shortID, флаги для домена/адресов/путей) ✅
 - [ ] Docker images: `ghcr.io/<user>/donut-server`, `donut-client`
 - [ ] Release CI: `cargo-dist` или ручной `scripts/release.sh` → бинари под 5 таргетов
 
@@ -246,11 +373,11 @@ Lint gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 
 ---
 
-## M10 (опционально) — Post-quantum / fingerprints / Vision *(отложено)*
+## M10 (опционально) — Post-quantum / fingerprints *(отложено)*
 
 - ML-DSA-65 post-quantum (xray v25.7.26+): подписывает certSignature в `ExtraExtensions`, 3309 байт; требует RSA-target или fat cert chain.
 - Дополнительные uTLS fingerprints: Firefox, Safari, Safari iOS
-- Vision flow (`xtls-rprx-vision`) для TCP+REALITY (не XHTTP) — если будет спрос
+- _Vision flow (`xtls-rprx-vision`) перенесён в core → **M5.5** (решение 2026-05-21)._
 
 ---
 
@@ -266,7 +393,7 @@ M0 ─┬─ M1 ─────────────────┐
     └─ *crates dns/routing/geo* ───────────────┴── M9 (obs)
 ```
 
-**Критический путь:** M0 → M2 → M3 → M4 → M6. Всё остальное ответвляется.
+**Критический путь:** M0 → M2 → M3 → M4 → M6. Всё остальное ответвляется. M5 (QUIC/H3) и M5.5 (Vision/TCP) — параллельные транспортные ответвления от M3, не на критическом пути.
 
 ---
 
@@ -278,6 +405,7 @@ M0 ─┬─ M1 ─────────────────┐
 | M3 | REALITY test-vectors несходятся с xray | pair-debug через tcpdump+wireshark-keylog |
 | M4 | XHTTP spec поменялся | ежемесячная сверка `git log transport/internet/splithttp` |
 | M5 | quinn + custom rustls несовместимы | downgrade на H2-only, H3 → M10 |
+| M5.5 | Vision padding / trafficState spec drift | сверка `proxy/vless/encoding` при реализации + known-answer vectors из xray-capture |
 | M8 | MIPS tier-3 не собирается | downgrade: поддерживаем только armv7+aarch64 на v1.0 |
 
 ---

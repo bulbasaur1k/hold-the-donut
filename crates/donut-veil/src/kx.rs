@@ -11,8 +11,9 @@
 //! added to the trait — see the trait definition).
 
 use std::fmt;
+use std::sync::Arc;
 
-use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
+use rustls::crypto::{ActiveKeyExchange, CryptoProvider, SharedSecret, SupportedKxGroup};
 use rustls::Error;
 use rustls::{NamedGroup, SupportedProtocolVersion};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -20,6 +21,25 @@ use zeroize::Zeroizing;
 
 /// Sentinel value representing the X25519 named group.
 pub static VEIL_X25519: VeilX25519 = VeilX25519;
+
+/// A rustls [`CryptoProvider`] (ring-backed) whose standard X25519 key
+/// exchange is swapped for [`VEIL_X25519`]. The veil ClientHello
+/// sealing reuses the TLS ephemeral via the non-consuming
+/// [`ActiveKeyExchange::diffie_hellman`], so **both** the veil client
+/// and server must build their `rustls` configs with this provider —
+/// otherwise the client cannot derive the AuthKey and the seal fails
+/// (the server then sees garbage and forwards instead of tunnelling).
+pub fn crypto_provider() -> Arc<CryptoProvider> {
+    let mut provider = rustls::crypto::ring::default_provider();
+    let mut kxs: Vec<&'static dyn SupportedKxGroup> = vec![&VEIL_X25519];
+    for g in provider.kx_groups.iter().copied() {
+        if g.name() != NamedGroup::X25519 {
+            kxs.push(g);
+        }
+    }
+    provider.kx_groups = kxs;
+    Arc::new(provider)
+}
 
 /// Marker type for the custom X25519 group.
 #[derive(Debug, Clone, Copy)]

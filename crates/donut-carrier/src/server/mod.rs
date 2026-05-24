@@ -18,6 +18,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -55,21 +56,46 @@ impl Server {
     pub fn serve(listener: TcpListener, config: ServerConfig) -> Self {
         let (tx, rx) = mpsc::channel::<Session>(64);
         let cfg = Arc::new(config);
-        let dispatcher = match cfg.mode {
-            Mode::StreamOne => SharedDispatcher::StreamOne,
-            Mode::StreamUp => {
-                SharedDispatcher::StreamUp(stream_up::Dispatcher::new(cfg.clone(), tx.clone()))
-            }
-            Mode::PacketUp => {
-                SharedDispatcher::PacketUp(packet_up::Dispatcher::new(cfg.clone(), tx.clone()))
-            }
-        };
+        let dispatcher = build_dispatcher(&cfg, &tx);
         tokio::spawn(accept_loop(listener, cfg, tx, dispatcher));
         Self { rx }
     }
 
     pub async fn accept(&mut self) -> Option<Session> {
         self.rx.recv().await
+    }
+}
+
+/// Serve the carrier protocol over an **already-established** byte
+/// stream (e.g. a decrypted veiled-TLS stream from the server's TLS
+/// termination). Sessions opened on the connection are delivered
+/// through the returned receiver; the hyper connection is driven on a
+/// background task. This is the transport-agnostic counterpart to
+/// [`Server::serve`], which owns its own `TcpListener`.
+pub fn serve_connection<IO>(
+    io: IO,
+    config: ServerConfig,
+    remote: SocketAddr,
+) -> mpsc::Receiver<Session>
+where
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Session>(64);
+    let cfg = Arc::new(config);
+    let dispatcher = build_dispatcher(&cfg, &tx);
+    tokio::spawn(drive_connection(io, cfg, tx, dispatcher, remote));
+    rx
+}
+
+fn build_dispatcher(cfg: &Arc<ServerConfig>, tx: &mpsc::Sender<Session>) -> SharedDispatcher {
+    match cfg.mode {
+        Mode::StreamOne => SharedDispatcher::StreamOne,
+        Mode::StreamUp => {
+            SharedDispatcher::StreamUp(stream_up::Dispatcher::new(cfg.clone(), tx.clone()))
+        }
+        Mode::PacketUp => {
+            SharedDispatcher::PacketUp(packet_up::Dispatcher::new(cfg.clone(), tx.clone()))
+        }
     }
 }
 
@@ -87,54 +113,68 @@ async fn accept_loop(
                 continue;
             }
         };
+        tokio::spawn(drive_connection(
+            sock,
+            config.clone(),
+            tx.clone(),
+            dispatcher.clone(),
+            remote,
+        ));
+    }
+}
 
-        let config = config.clone();
-        let tx = tx.clone();
-        let dispatcher = dispatcher.clone();
-        tokio::spawn(async move {
-            match dispatcher {
-                SharedDispatcher::StreamOne => {
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let config = config.clone();
-                        let tx = tx.clone();
-                        async move { stream_one::handle(req, config, tx, remote).await }
-                    });
-                    if let Err(e) = http1::Builder::new()
-                        .keep_alive(true)
-                        .serve_connection(TokioIo::new(sock), svc)
-                        .await
-                    {
-                        tracing::trace!(?e, "carrier server: connection ended");
-                    }
-                }
-                SharedDispatcher::StreamUp(d) => {
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let d = d.clone();
-                        async move { d.handle(req, remote).await }
-                    });
-                    if let Err(e) = http1::Builder::new()
-                        .keep_alive(true)
-                        .serve_connection(TokioIo::new(sock), svc)
-                        .await
-                    {
-                        tracing::trace!(?e, "carrier server (stream-up): connection ended");
-                    }
-                }
-                SharedDispatcher::PacketUp(d) => {
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let d = d.clone();
-                        async move { d.handle(req, remote).await }
-                    });
-                    if let Err(e) = http1::Builder::new()
-                        .keep_alive(true)
-                        .serve_connection(TokioIo::new(sock), svc)
-                        .await
-                    {
-                        tracing::trace!(?e, "carrier server (packet-up): connection ended");
-                    }
-                }
+/// Drive the carrier protocol over a single connection's byte stream.
+/// Shared by the `TcpListener` accept loop and [`serve_connection`].
+async fn drive_connection<IO>(
+    io: IO,
+    config: Arc<ServerConfig>,
+    tx: mpsc::Sender<Session>,
+    dispatcher: SharedDispatcher,
+    remote: SocketAddr,
+) where
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    match dispatcher {
+        SharedDispatcher::StreamOne => {
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let config = config.clone();
+                let tx = tx.clone();
+                async move { stream_one::handle(req, config, tx, remote).await }
+            });
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(io), svc)
+                .await
+            {
+                tracing::trace!(?e, "carrier server: connection ended");
             }
-        });
+        }
+        SharedDispatcher::StreamUp(d) => {
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let d = d.clone();
+                async move { d.handle(req, remote).await }
+            });
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(io), svc)
+                .await
+            {
+                tracing::trace!(?e, "carrier server (stream-up): connection ended");
+            }
+        }
+        SharedDispatcher::PacketUp(d) => {
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let d = d.clone();
+                async move { d.handle(req, remote).await }
+            });
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(io), svc)
+                .await
+            {
+                tracing::trace!(?e, "carrier server (packet-up): connection ended");
+            }
+        }
     }
 }
 

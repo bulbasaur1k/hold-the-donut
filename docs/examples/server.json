@@ -1,0 +1,27 @@
+{
+  "log": { "level": "info" },
+  "inbound": {
+    "listen": "0.0.0.0:443",
+    "reality": {
+      "private_key": "REPLACE_WITH_BASE64URL_OR_HEX_X25519_PRIVATE_KEY",
+      "short_ids": ["deadbeef"],
+      "dest": "127.0.0.1:8443",
+      "cert": "/etc/donut/fullchain.pem",
+      "key": "/etc/donut/privkey.pem"
+    }
+  },
+  "geo": {
+    "geoip": "/etc/donut/geoip.dat",
+    "geosite": "/etc/donut/geosite.dat"
+  },
+  "metrics": { "listen": "127.0.0.1:9090" },
+  "routing": {
+    "default": "freedom",
+    "rules": [
+      { "domain": [{ "suffix": "doubleclick.net" }, { "keyword": "ads" }], "outbound": "block" },
+      { "geosite": ["category-ads-all"], "outbound": "block" },
+      { "geoip": ["private"], "ip": ["10.0.0.0/8", "192.168.0.0/16"], "outbound": "block" },
+      { "port": ["25"], "outbound": "block" }
+    ]
+  }
+}

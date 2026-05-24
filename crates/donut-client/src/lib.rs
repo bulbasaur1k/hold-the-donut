@@ -8,5 +8,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 mod local_proxy;
+mod veil_dial;
 
-pub use local_proxy::{run_local_socks_proxy, LocalProxyError};
+pub use local_proxy::{run_local_socks_proxy, run_veil_socks_proxy, LocalProxyError};
+pub use veil_dial::VeilClient;

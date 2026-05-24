@@ -13,3 +13,7 @@ thiserror.workspace = true
 tracing.workspace = true
 smallvec.workspace = true
 arc-swap.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

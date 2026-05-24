@@ -26,6 +26,8 @@ donut-dns.workspace = true
 donut-socks.workspace = true
 donut-io.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
+rustls.workspace = true
+tokio-rustls.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -34,6 +36,7 @@ clap.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
 donut-server.workspace = true
+rcgen.workspace = true
