@@ -3,6 +3,36 @@
 > Живой документ. Milestones, deliverables, acceptance, зависимости.
 > Отмечаем в `[x]` сделанное по мере прогресса.
 
+## 📍 Где мы сейчас (snapshot 2026-05-24)
+
+**Готово — сценарий 2 (VLESS + REALITY + XHTTP) полностью рабочий и развёртываемый**,
+`cargo test --workspace` зелёное (**76 тестов**), `fmt` + `clippy -D warnings` чисто.
+Не закоммичено (рабочее дерево на ревью).
+
+Сделано end-to-end:
+- **Selfsteal anti-probing** — triage + байт-прозрачный Forward на подложку (`dest`).
+- **Veiled-TLS + REALITY-hardening** — терминация (сервер) / dial (клиент); сервер-auth
+  через `HMAC(AuthKey)`-proof внутри туннеля → **MITM-защита и без раздачи cert
+  клиенту** (`trusted_cert` убран).
+- **Carrier-over-stream** — XHTTP stream-one поверх расшифрованного TLS.
+- **Демоны** `donut-server` / `donut-client` (JSON-конфиг, graceful shutdown).
+- **Routing**: domain/ip/port/**geoip/geosite**/blackhole. **Client split-tunnel**:
+  `geoip:ru → direct` (мимо сервера, с локального IP).
+- **DNS** system + DoH · **geo** `.dat`-парсер · **keygen** + **config-gen** ·
+  **Prometheus `/metrics`** (English).
+- Полный комплект docs (`TECHNOLOGIES/SCENARIOS/CRATES/REALITY-SELFSTEAL/PROTOCOLS`),
+  примеры `docs/examples/`.
+
+**Следующие шаги (TODO, по убыванию приоритета):**
+1. **M5.5 step 2 — Vision-транспорт** (сценарий 1, raw-TCP, самый быстрый): trafficState
+   TLS-детект + splice + `flow=vision` поверх готового кодека (`donut-wire::vision`).
+2. **M5 step 3 — H3-framing** на raw-bidi QUIC (добить сценарий 3).
+3. **M8 — OpenWrt** cross-compile (musl aarch64/armv7/mipsel, feature `openwrt-minimal`, UPX).
+4. Опц.: `donut-tools probe`, per-user метрики, uTLS-фингерпринт, commit + interop-gate
+   когда будет сеть к Docker Hub.
+
+---
+
 ## Текущий статус
 
 | ID  | Статус | Коммит | Тестов |
