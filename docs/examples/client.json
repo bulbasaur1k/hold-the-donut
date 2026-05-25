@@ -7,7 +7,8 @@
       "public_key": "REPLACE_WITH_BASE64URL_OR_HEX_X25519_PUBLIC_KEY",
       "short_id": "deadbeef",
       "server_name": "www.microsoft.com",
-      "version": [26, 4, 15]
+      "version": [26, 4, 15],
+      "fingerprint": "randomized"
     }
   },
   "geo": {

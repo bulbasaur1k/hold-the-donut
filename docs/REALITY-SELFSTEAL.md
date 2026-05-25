@@ -200,7 +200,11 @@ TCP :443 ──► donut-server: selfsteal::triage()
 - [ ] нет дефолт-страницы nginx / пустого 200 / обрыва;
 - [ ] TLS 1.3 only; TLS 1.2 ClientHello → Forward;
 - [ ] метки с устаревшим `unix_ts` отбраковываются (anti-replay);
-- [ ] фингерпринт ClientHello клиента похож на реальный браузер (uTLS, M7).
+- [~] фингерпринт ClientHello клиента не выдаёт rustls по JA3: режим
+      `randomized` рандомизирует порядок cipher suites/extensions
+      (`donut-veil/fingerprint.rs`, см. [FINGERPRINT.md](FINGERPRINT.md)).
+      Parrot-пресеты (Chrome/Firefox) и GREASE требуют расширения хука
+      форка и отложены (M7/M10).
 
 ---
 

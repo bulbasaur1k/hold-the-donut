@@ -67,6 +67,11 @@ impl VeilClient {
             self.veil.clone(),
             Some(sink.clone()),
         ));
+        // No TLS resumption: REALITY connections are fresh, and a PSK
+        // ticket would (a) be its own fingerprint and (b) carry binders
+        // the fingerprint mutator would have to leave un-shuffled. This
+        // config is already per-connection, but pin it explicitly.
+        config.resumption = rustls::client::Resumption::disabled();
         let connector = TlsConnector::from(Arc::new(config));
 
         let tcp = TcpStream::connect(addr).await?;

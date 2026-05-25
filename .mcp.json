@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "xtls-docs": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "mcpdoc",
+        "mcpdoc",
+        "--urls",
+        "XTLS:https://xtls.github.io/llms.txt",
+        "--allowed-domains",
+        "xtls.github.io",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}

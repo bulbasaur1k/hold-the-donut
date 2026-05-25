@@ -36,6 +36,7 @@ pub fn build_client_hello_mutator_capturing(
     let server_pub = config.server_pub;
     let short_id = config.short_id;
     let version = config.version;
+    let fingerprint = config.fingerprint;
 
     ClientHelloMutator::new(move |buf, kx| {
         let Some(kx) = kx else {
@@ -54,6 +55,13 @@ pub fn build_client_hello_mutator_capturing(
             );
             return;
         }
+
+        // Apply the uTLS-style fingerprint first: it only reorders the
+        // cipher-suite and extension lists (length-preserving, all after
+        // the SessionID slot), so the REALITY seal computed below — whose
+        // AAD is the whole ClientHello with the SessionID zeroed — stays
+        // consistent with what the server reconstructs on the wire.
+        fingerprint.apply(buf);
 
         // Stash Random[:20] as the HKDF salt, and Random[20..32] as the
         // AEAD nonce, both before we touch the SessionID slot.

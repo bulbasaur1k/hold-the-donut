@@ -21,6 +21,8 @@
 
 - [PROTOCOLS.md](PROTOCOLS.md) — байт-точные спеки (VLESS §1, REALITY §2,
   XHTTP §3, Vision §4). Сверяется с xray-core при ежемесячном diff.
+- [FINGERPRINT.md](FINGERPRINT.md) — TLS-фингерпринт ClientHello (uTLS-style):
+  что такое JA3 и режим `randomized`, что реализовано и какие ограничения.
 - [ANALYSIS.md](ANALYSIS.md) — технический анализ: что оставляем и что выкидываем,
   выбор крейтов, форки, архитектура, риски.
 - [PLAN.md](PLAN.md) — этапы M0..M10, целевые сценарии, стратегия Self-Steal,
@@ -33,6 +35,7 @@
 | TCP/UDP/IP, TLS 1.3, QUIC, HTTP/x, крипто | TECHNOLOGIES.md | — | — |
 | VLESS | TECHNOLOGIES.md §8 | PROTOCOLS.md §1 | `donut-wire` |
 | REALITY / Self-Steal | REALITY-SELFSTEAL.md | PROTOCOLS.md §2 | `donut-veil`, `donut-server/selfsteal.rs` |
+| TLS-фингерпринт (uTLS) | FINGERPRINT.md | — | `donut-veil/fingerprint.rs` |
 | XHTTP | TECHNOLOGIES.md §6,§8 | PROTOCOLS.md §3 | `donut-carrier`, `donut-quic` |
 | Vision | TECHNOLOGIES.md §8 | PROTOCOLS.md §4 | `donut-wire` (M5.5) |
 | Сценарии/маскировка | SCENARIOS.md | — | — |

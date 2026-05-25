@@ -128,6 +128,72 @@ fn full_handshake_through_veil_hooks() {
 }
 
 #[test]
+fn randomized_fingerprint_handshake_still_authenticates() {
+    // Same as `full_handshake_through_veil_hooks`, but the client enables
+    // the uTLS-style `randomized` fingerprint, which shuffles the
+    // cipher-suite and extension order inside the ClientHello mutator. The
+    // server must still open the SessionID seal (its AAD is reconstructed
+    // from the reordered bytes it actually receives) and choose Tunnel.
+    let provider = provider();
+
+    let priv_bytes = [0x42u8; 32];
+    let short_id: ShortId = "deadbeef".parse().unwrap();
+
+    let veil_server = VeilServerConfig::new(priv_bytes, [short_id]).unwrap();
+    let server_pub = veil_server.public_key_bytes();
+    let veil_client = VeilClientConfig::new(server_pub, short_id, [26, 4, 15])
+        .with_fingerprint(crate::Fingerprint::Randomized);
+
+    let (cert, key) = gen_cert();
+
+    let server_cfg = {
+        let mut c = ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        c.raw_client_hello_hook = Some(build_raw_client_hello_hook(veil_server));
+        Arc::new(c)
+    };
+
+    let client_cfg = {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut c = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        c.client_hello_mutator = Some(build_client_hello_mutator(veil_client));
+        // Disable TLS resumption so every iteration is a fresh full
+        // handshake (a PSK would carry binders the reorder must not — and
+        // does not — touch), exercising the shuffle each time.
+        c.resumption = rustls::client::Resumption::disabled();
+        Arc::new(c)
+    };
+
+    // Run several times: the shuffle is random per connection, so this
+    // guards against any ordering that would trip the server parser.
+    for _ in 0..16 {
+        let mut c = ClientConnection::new(
+            client_cfg.clone(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut s = ServerConnection::new(server_cfg.clone()).unwrap();
+        assert!(
+            drive(&mut c, &mut s),
+            "handshake must complete with a randomized ClientHello"
+        );
+        assert!(
+            s.take_forwarded().is_none(),
+            "randomized fingerprint must still authenticate (Tunnel)"
+        );
+    }
+}
+
+#[test]
 fn unknown_short_id_is_forwarded() {
     let provider = provider();
 

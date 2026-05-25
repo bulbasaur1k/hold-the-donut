@@ -24,6 +24,7 @@ mod auth;
 mod client;
 mod config;
 mod error;
+mod fingerprint;
 mod kx;
 mod parse;
 mod proof;
@@ -35,6 +36,7 @@ mod tests;
 
 pub use config::{VeilClientConfig, VeilServerConfig};
 pub use error::VeilError;
+pub use fingerprint::{Fingerprint, UnknownFingerprint};
 pub use kx::{crypto_provider, VeilX25519, VEIL_X25519};
 pub use proof::{server_proof, PROOF_LEN};
 pub use verifier::NoCertVerification;

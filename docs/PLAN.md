@@ -242,7 +242,10 @@ REALITY защищается от **активного зондирования*
 - [ ] Client-side: `build_client_hello_mutator()` — делает HKDF + AES-GCM + пишет SessionID
 - [ ] Server-side: `build_raw_ch_hook()` — читает ShortID, проверяет AEAD, возвращает `Tunnel` / `Forward(target)`
 - [ ] HMAC-SHA512(AuthKey, cert.signature) проверка
-- [ ] Fingerprint presets: Chrome120 (первый), на уровне TLS extensions ordering
+- [~] Fingerprint: `randomized` (порядок cipher suites/extensions) реализован
+      в `donut-veil/fingerprint.rs` + `VeilClientConfig::with_fingerprint` +
+      конфиг `outbound.reality.fingerprint`. Parrot-пресеты (Chrome120) и
+      GREASE требуют resizing-хука форка → M10. См. [FINGERPRINT.md](FINGERPRINT.md).
 
 **Тесты:**
 - [ ] Known-answer tests: фиксированный private_key + short_id + timestamp → expected SessionID bytes (собираем из xray-сервера через wireshark+private-key-dump)
