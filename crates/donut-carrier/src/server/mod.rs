@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -134,47 +134,39 @@ async fn drive_connection<IO>(
 ) where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    match dispatcher {
+    // Auto-detect HTTP/1.1 vs HTTP/2 (h2c). The veil path speaks h1 over
+    // the decrypted TLS stream; a reverse proxy (Caddy) in front of the
+    // carrier backend speaks h2c, which — unlike Go's h1 reverse proxy —
+    // streams the request and response bodies concurrently (full duplex),
+    // as `stream-one` requires.
+    let io = TokioIo::new(io);
+    let builder = auto::Builder::new(TokioExecutor::new());
+    let result = match dispatcher {
         SharedDispatcher::StreamOne => {
             let svc = service_fn(move |req: Request<Incoming>| {
                 let config = config.clone();
                 let tx = tx.clone();
                 async move { stream_one::handle(req, config, tx, remote).await }
             });
-            if let Err(e) = http1::Builder::new()
-                .keep_alive(true)
-                .serve_connection(TokioIo::new(io), svc)
-                .await
-            {
-                tracing::trace!(?e, "carrier server: connection ended");
-            }
+            builder.serve_connection(io, svc).await
         }
         SharedDispatcher::StreamUp(d) => {
             let svc = service_fn(move |req: Request<Incoming>| {
                 let d = d.clone();
                 async move { d.handle(req, remote).await }
             });
-            if let Err(e) = http1::Builder::new()
-                .keep_alive(true)
-                .serve_connection(TokioIo::new(io), svc)
-                .await
-            {
-                tracing::trace!(?e, "carrier server (stream-up): connection ended");
-            }
+            builder.serve_connection(io, svc).await
         }
         SharedDispatcher::PacketUp(d) => {
             let svc = service_fn(move |req: Request<Incoming>| {
                 let d = d.clone();
                 async move { d.handle(req, remote).await }
             });
-            if let Err(e) = http1::Builder::new()
-                .keep_alive(true)
-                .serve_connection(TokioIo::new(io), svc)
-                .await
-            {
-                tracing::trace!(?e, "carrier server (packet-up): connection ended");
-            }
+            builder.serve_connection(io, svc).await
         }
+    };
+    if let Err(e) = result {
+        tracing::trace!(?e, "carrier server: connection ended");
     }
 }
 

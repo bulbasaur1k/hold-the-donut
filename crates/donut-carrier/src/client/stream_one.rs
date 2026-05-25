@@ -61,17 +61,27 @@ where
     let upload_body: BoxedRequestBody = StreamBody::new(upload_stream).boxed();
 
     let req = build_request(config, sid, upload_body)?;
-    let resp = sender.send_request(req).await?;
 
-    if !resp.status().is_success() {
-        return Err(CarrierError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            format!("server returned status {}", resp.status()),
-        )));
-    }
-
-    // Pump the response body into bridge_wr (so user_side reads it).
+    // Do NOT block on the response here. The server's response (the
+    // downlink) depends on the uplink the caller writes *after* we
+    // return, so awaiting `send_request` would deadlock — most visibly
+    // behind an HTTP reverse proxy that won't surface the response while
+    // the request body is still open. Instead send the request and pump
+    // the response on a background task, full-duplex like the QUIC
+    // carrier; the caller detects failure when its first read (the
+    // Response prefix) hits EOF.
     tokio::spawn(async move {
+        let resp = match sender.send_request(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(?e, "stream-one client send_request failed");
+                return;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::trace!(status = ?resp.status(), "stream-one client non-success response");
+            return;
+        }
         let mut body = resp.into_body();
         while let Some(Ok(frame)) = body.frame().await {
             if let Ok(data) = frame.into_data() {
