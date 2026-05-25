@@ -17,16 +17,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use donut_core::{Address, Command, FlowKind, UserId};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserId};
 use donut_dns::Resolver;
 use donut_routing::Router;
-use donut_socks::{handshake_connect, SocksError};
+use donut_socks::{handshake_connect, PendingConnect, SocksError};
 use donut_wire::{Request, Response, WireError};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::h3_dial::H3Client;
 use crate::veil_dial::VeilClient;
+use crate::xhttp_dial::XhttpClient;
 
 #[derive(Debug, Error)]
 pub enum LocalProxyError {
@@ -156,65 +158,70 @@ pub async fn run_veil_socks_proxy(
     Ok(local)
 }
 
-async fn handle_veil_socks_session(
-    sock: tokio::net::TcpStream,
-    veil_client: Arc<VeilClient>,
-    server_addr: SocketAddr,
-    router: Arc<Router>,
-    resolver: Arc<Resolver>,
-) -> Result<(), LocalProxyError> {
-    let pending = handshake_connect(sock).await?;
-    let target = pending.target.clone();
+/// Split-tunnel route classes the client acts on.
+enum Route {
+    /// Drop the connection.
+    Block,
+    /// Dial straight from the client (bypass the server — keeps e.g.
+    /// domestic `geoip:`/`geosite:` traffic on the local IP).
+    Direct,
+    /// Send through the tunnel to the server.
+    Proxy,
+}
 
-    // Split-tunnel decision. `direct`/`freedom` dials straight from the
-    // client (so e.g. domestic `geoip:` traffic keeps the local IP and
-    // never reveals itself to the remote server); `block` drops;
-    // everything else (default `proxy`) goes through the veiled tunnel.
-    match router.route(&target) {
-        "block" | "blackhole" => {
-            tracing::debug!(%target, "split-tunnel: blocked, dropping");
-            return Ok(());
-        }
-        "direct" | "freedom" => {
-            tracing::debug!(%target, "split-tunnel: direct dial (bypassing server)");
-            let addr = match &target.address {
-                Address::Ip(ip) => SocketAddr::new(*ip, target.port),
-                Address::Domain(d) => resolver
-                    .resolve_one(d, target.port)
-                    .await
-                    .map_err(|e| LocalProxyError::Resolve(format!("{d}: {e}")))?,
-            };
-            let mut upstream = tokio::net::TcpStream::connect(addr).await?;
-            let bound: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
-            let mut sock = pending.accept(bound).await?;
-            let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
-            return Ok(());
-        }
-        _ => {}
+fn classify_route(router: &Router, target: &Endpoint) -> Route {
+    match router.route(target) {
+        "block" | "blackhole" => Route::Block,
+        "direct" | "freedom" => Route::Direct,
+        _ => Route::Proxy,
     }
+}
 
-    // Proxy path: veiled-TLS dial, then carrier over the decrypted stream.
-    tracing::trace!(%target, "split-tunnel: via veiled tunnel");
-    let tls = veil_client.connect(server_addr).await?;
-    let carrier_cfg = donut_carrier::ClientConfig {
-        mode: donut_carrier::Mode::StreamOne,
-        ..donut_carrier::ClientConfig::default()
+/// Direct (split-tunnel) dial: connect to `target` from the local host
+/// and bridge the SOCKS client to it. Never touches the server — this is
+/// what keeps RU `geoip`/`geosite` traffic on the local IP.
+async fn handle_direct_dial(
+    pending: PendingConnect,
+    resolver: &Resolver,
+) -> Result<(), LocalProxyError> {
+    let target = &pending.target;
+    tracing::debug!(%target, "split-tunnel: direct dial (bypassing server)");
+    let addr = match &target.address {
+        Address::Ip(ip) => SocketAddr::new(*ip, target.port),
+        Address::Domain(d) => resolver
+            .resolve_one(d, target.port)
+            .await
+            .map_err(|e| LocalProxyError::Resolve(format!("{d}: {e}")))?,
     };
-    let mut carrier = donut_carrier::client::dial_over_stream(tls, &carrier_cfg)
-        .await
-        .map_err(|e| LocalProxyError::Carrier(format!("{e}")))?;
+    let mut upstream = tokio::net::TcpStream::connect(addr).await?;
+    let bound: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
+    let mut sock = pending.accept(bound).await?;
+    let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
+    Ok(())
+}
 
+/// Bridge a SOCKS5 CONNECT to an already-opened carrier stream: push the
+/// VLESS inner-frame Request, drain the Response prefix, accept the SOCKS
+/// client, then pipe bytes both ways. Generic over the carrier stream
+/// type, so it serves the veil, xhttp and h3 transports alike.
+async fn bridge_carrier_to_socks<C>(
+    pending: PendingConnect,
+    mut carrier: C,
+) -> Result<(), LocalProxyError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let request = Request {
         user: UserId::new_v4(),
         flow: FlowKind::None,
         command: Command::Tcp,
-        target: Some(target),
+        target: Some(pending.target.clone()),
         seed: vec![],
     };
     let mut framed = BytesMut::with_capacity(request.encoded_len());
     request.encode(&mut framed);
-    tokio::io::AsyncWriteExt::write_all(&mut carrier, &framed).await?;
-    tokio::io::AsyncWriteExt::flush(&mut carrier).await?;
+    carrier.write_all(&framed).await?;
+    carrier.flush().await?;
 
     let mut prefix = [0u8; 2];
     carrier.read_exact(&mut prefix).await?;
@@ -223,7 +230,152 @@ async fn handle_veil_socks_session(
 
     let bound: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
     let mut sock = pending.accept(bound).await?;
-
     let _ = tokio::io::copy_bidirectional(&mut sock, &mut carrier).await;
     Ok(())
+}
+
+async fn handle_veil_socks_session(
+    sock: tokio::net::TcpStream,
+    veil_client: Arc<VeilClient>,
+    server_addr: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+) -> Result<(), LocalProxyError> {
+    let pending = handshake_connect(sock).await?;
+    match classify_route(&router, &pending.target) {
+        Route::Block => {
+            tracing::debug!(target = %pending.target, "split-tunnel: blocked, dropping");
+            Ok(())
+        }
+        Route::Direct => handle_direct_dial(pending, &resolver).await,
+        Route::Proxy => {
+            tracing::trace!(target = %pending.target, "split-tunnel: via veiled tunnel");
+            let tls = veil_client.connect(server_addr).await?;
+            let carrier_cfg = donut_carrier::ClientConfig {
+                mode: donut_carrier::Mode::StreamOne,
+                ..donut_carrier::ClientConfig::default()
+            };
+            let carrier = donut_carrier::client::dial_over_stream(tls, &carrier_cfg)
+                .await
+                .map_err(|e| LocalProxyError::Carrier(format!("{e}")))?;
+            bridge_carrier_to_socks(pending, carrier).await
+        }
+    }
+}
+
+/// Bind a SOCKS5 listener and, for each CONNECT, dial the donut-server
+/// through a **cert-based XHTTP** tunnel ([`XhttpClient`]): plain TLS to
+/// the reverse-proxy front + `stream-one` carrier at the secret path. No
+/// REALITY — the front holds a real certificate and self-steals
+/// everything else. Split-tunnel routing is identical to the veil path.
+/// Returns the bound local address.
+pub async fn run_xhttp_socks_proxy(
+    local_addr: SocketAddr,
+    xhttp_client: XhttpClient,
+    server_addr: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+) -> Result<SocketAddr, LocalProxyError> {
+    let listener = TcpListener::bind(local_addr).await?;
+    let local = listener.local_addr()?;
+    let xhttp_client = Arc::new(xhttp_client);
+    tokio::spawn(async move {
+        loop {
+            let (sock, _peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let xhttp_client = xhttp_client.clone();
+            let router = router.clone();
+            let resolver = resolver.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_xhttp_socks_session(sock, xhttp_client, server_addr, router, resolver)
+                        .await
+                {
+                    tracing::trace!(?e, "local xhttp socks proxy session ended");
+                }
+            });
+        }
+    });
+    Ok(local)
+}
+
+async fn handle_xhttp_socks_session(
+    sock: tokio::net::TcpStream,
+    xhttp_client: Arc<XhttpClient>,
+    server_addr: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+) -> Result<(), LocalProxyError> {
+    let pending = handshake_connect(sock).await?;
+    match classify_route(&router, &pending.target) {
+        Route::Block => {
+            tracing::debug!(target = %pending.target, "split-tunnel: blocked, dropping");
+            Ok(())
+        }
+        Route::Direct => handle_direct_dial(pending, &resolver).await,
+        Route::Proxy => {
+            tracing::trace!(target = %pending.target, "split-tunnel: via xhttp tunnel");
+            let carrier = xhttp_client.connect(server_addr).await?;
+            bridge_carrier_to_socks(pending, carrier).await
+        }
+    }
+}
+
+/// Bind a SOCKS5 listener and, for each CONNECT, dial the donut-server
+/// through a **cert-based H3 (HTTP/3)** tunnel ([`H3Client`]). Same
+/// model as [`run_xhttp_socks_proxy`] but over QUIC. Split-tunnel
+/// routing identical. Returns the bound local address.
+pub async fn run_h3_socks_proxy(
+    local_addr: SocketAddr,
+    h3_client: H3Client,
+    server_addr: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+) -> Result<SocketAddr, LocalProxyError> {
+    let listener = TcpListener::bind(local_addr).await?;
+    let local = listener.local_addr()?;
+    let h3_client = Arc::new(h3_client);
+    tokio::spawn(async move {
+        loop {
+            let (sock, _peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let h3_client = h3_client.clone();
+            let router = router.clone();
+            let resolver = resolver.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_h3_socks_session(sock, h3_client, server_addr, router, resolver).await
+                {
+                    tracing::trace!(?e, "local h3 socks proxy session ended");
+                }
+            });
+        }
+    });
+    Ok(local)
+}
+
+async fn handle_h3_socks_session(
+    sock: tokio::net::TcpStream,
+    h3_client: Arc<H3Client>,
+    server_addr: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+) -> Result<(), LocalProxyError> {
+    let pending = handshake_connect(sock).await?;
+    match classify_route(&router, &pending.target) {
+        Route::Block => {
+            tracing::debug!(target = %pending.target, "split-tunnel: blocked, dropping");
+            Ok(())
+        }
+        Route::Direct => handle_direct_dial(pending, &resolver).await,
+        Route::Proxy => {
+            tracing::trace!(target = %pending.target, "split-tunnel: via h3 tunnel");
+            let carrier = h3_client.connect(server_addr).await?;
+            bridge_carrier_to_socks(pending, carrier).await
+        }
+    }
 }

@@ -37,3 +37,4 @@ anyhow.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
+rcgen.workspace = true

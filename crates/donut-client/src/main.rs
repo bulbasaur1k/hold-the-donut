@@ -39,25 +39,83 @@ async fn main() -> anyhow::Result<()> {
         .next()
         .with_context(|| format!("no addresses for {}", cfg.outbound.server))?;
 
-    let public_key = cfg.outbound.reality.public_key_bytes()?;
-    let short_id = cfg.outbound.reality.short_id_value()?;
-    let veil_cfg =
-        donut_veil::VeilClientConfig::new(public_key, short_id, cfg.outbound.reality.version);
-    let server_name = ServerName::try_from(cfg.outbound.reality.server_name.clone())
-        .with_context(|| format!("invalid server_name {}", cfg.outbound.reality.server_name))?;
-
     let router = std::sync::Arc::new(cfg.router()?);
     let resolver = std::sync::Arc::new(cfg.resolver()?);
 
-    let veil_client = donut_client::VeilClient::new(veil_cfg, server_name);
-    let bound = donut_client::run_veil_socks_proxy(socks, veil_client, server, router, resolver)
-        .await
-        .context("starting veil socks proxy")?;
-    tracing::info!(%bound, %server, "donut-client SOCKS5 listening (VLESS+REALITY+XHTTP)");
+    match cfg.outbound.transport.as_str() {
+        // REALITY veiled-TLS over TCP.
+        "veil" => {
+            let reality = cfg
+                .outbound
+                .reality
+                .as_ref()
+                .context("outbound.reality is required for transport=\"veil\"")?;
+            let public_key = reality.public_key_bytes()?;
+            let short_id = reality.short_id_value()?;
+            let fingerprint = reality
+                .fingerprint
+                .parse::<donut_veil::Fingerprint>()
+                .with_context(|| format!("parsing fingerprint {:?}", reality.fingerprint))?;
+            let veil_cfg = donut_veil::VeilClientConfig::new(public_key, short_id, reality.version)
+                .with_fingerprint(fingerprint);
+            let server_name = ServerName::try_from(reality.server_name.clone())
+                .with_context(|| format!("invalid server_name {}", reality.server_name))?;
+            let veil_client = donut_client::VeilClient::new(veil_cfg, server_name);
+            let bound =
+                donut_client::run_veil_socks_proxy(socks, veil_client, server, router, resolver)
+                    .await
+                    .context("starting veil socks proxy")?;
+            tracing::info!(%bound, %server, "donut-client SOCKS5 listening (VLESS+REALITY+XHTTP/TCP)");
+        }
+        // Cert-based XHTTP over plain TLS to a reverse-proxy front.
+        "xhttp" => {
+            let name = cert_server_name(&cfg.outbound)?;
+            let server_name = ServerName::try_from(name.clone())
+                .with_context(|| format!("invalid server_name {name}"))?;
+            let xhttp = donut_client::XhttpClient::new(server_name, cfg.outbound.path.clone());
+            let bound = donut_client::run_xhttp_socks_proxy(socks, xhttp, server, router, resolver)
+                .await
+                .context("starting xhttp socks proxy")?;
+            tracing::info!(%bound, %server, path = %cfg.outbound.path, "donut-client SOCKS5 listening (XHTTP/TLS, cert-based)");
+        }
+        // Cert-based XHTTP over HTTP/3 (full-duplex QUIC carrier).
+        "h3" => {
+            let name = cert_server_name(&cfg.outbound)?;
+            let h3 = donut_client::H3Client::new(name, cfg.outbound.path.clone());
+            let bound = donut_client::run_h3_socks_proxy(socks, h3, server, router, resolver)
+                .await
+                .context("starting h3 socks proxy")?;
+            tracing::info!(%bound, %server, path = %cfg.outbound.path, "donut-client SOCKS5 listening (XHTTP over HTTP/3, cert-based)");
+        }
+        other => anyhow::bail!(
+            "unknown outbound.transport {other:?} (expected \"veil\", \"xhttp\" or \"h3\")"
+        ),
+    }
 
     shutdown_signal().await;
     tracing::info!("donut-client shutting down");
     Ok(())
+}
+
+/// Derive the TLS SNI / certificate name for cert-based transports:
+/// explicit `outbound.server_name`, else the host part of
+/// `outbound.server` (port stripped).
+fn cert_server_name(outbound: &donut_config::ClientOutbound) -> anyhow::Result<String> {
+    if !outbound.server_name.is_empty() {
+        return Ok(outbound.server_name.clone());
+    }
+    let host = outbound
+        .server
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(outbound.server.as_str());
+    if host.is_empty() {
+        anyhow::bail!(
+            "cannot derive server_name from outbound.server {:?}; set outbound.server_name",
+            outbound.server
+        );
+    }
+    Ok(host.to_string())
 }
 
 fn init_tracing(level: &str) {

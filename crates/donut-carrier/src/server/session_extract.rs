@@ -23,10 +23,16 @@ pub(super) fn session_id<B>(
 
     match config.session_placement {
         Placement::Path => {
+            // Tolerate a leading slash between the prefix and the session
+            // id: clients append "/<hex>" to the prefix, so whether the
+            // configured prefix ends with a slash or not, the hex segment
+            // is the same. (Without this, a prefix like "/store/sync"
+            // leaves "/<hex>" and the first segment parses as empty.)
+            let rest = after_prefix.strip_prefix('/').unwrap_or(after_prefix);
             // First path segment after the prefix is the hex session id.
-            let (segment, tail) = match after_prefix.find('/') {
-                Some(slash) => (&after_prefix[..slash], &after_prefix[slash..]),
-                None => (after_prefix, ""),
+            let (segment, tail) = match rest.find('/') {
+                Some(slash) => (&rest[..slash], &rest[slash..]),
+                None => (rest, ""),
             };
             let sid: SessionId = segment.parse()?;
             Ok((sid, tail.to_string()))

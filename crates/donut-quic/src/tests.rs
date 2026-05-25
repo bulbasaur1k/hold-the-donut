@@ -53,9 +53,11 @@ async fn h3_stream_one_round_trip() {
         session.stream.shutdown().await.unwrap();
     });
 
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
     let mut stream = timeout(
         Duration::from_secs(5),
-        dial_stream_one(addr, "localhost", vec![cert], "/"),
+        dial_stream_one(addr, "localhost", roots, "/"),
     )
     .await
     .expect("dial timeout")
@@ -72,6 +74,78 @@ async fn h3_stream_one_round_trip() {
         .unwrap();
 
     assert_eq!(downlink, b"echo:hi-h3");
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn h3_full_duplex_round_trip() {
+    // Proves the H3 carrier (QuicServer + dial_stream_one) overlaps both
+    // directions on one request stream: the server writes a prefix
+    // *before* the client has finished its uplink, and the client reads
+    // it concurrently with writing. This is what the half-duplex
+    // request→response shape could not do.
+    install_provider();
+
+    let (cert, key) = gen_cert();
+
+    let mut server = QuicServer::bind("127.0.0.1:0".parse().unwrap(), vec![cert.clone()], key)
+        .expect("bind QUIC server");
+    let addr = server.addr;
+
+    let server_task = tokio::spawn(async move {
+        let mut session = server.accept().await.expect("server accepts session");
+        // Write a downlink prefix immediately, before reading any uplink.
+        session.stream.write_all(b"hi-from-server:").await.unwrap();
+        session.stream.flush().await.unwrap();
+        // Read the uplink up to the "END" sentinel, then echo it.
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = session.stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if got.ends_with(b"END") {
+                break;
+            }
+        }
+        session.stream.write_all(&got).await.unwrap();
+        session.stream.flush().await.unwrap();
+        session.stream.shutdown().await.unwrap();
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let stream = timeout(
+        Duration::from_secs(5),
+        dial_stream_one(addr, "localhost", roots, "/"),
+    )
+    .await
+    .expect("dial timeout")
+    .expect("dial succeeds");
+
+    let (mut rd, mut wr) = tokio::io::split(stream);
+
+    // Read the server prefix concurrently with writing the uplink.
+    let mut prefix = vec![0u8; b"hi-from-server:".len()];
+    let read_first = rd.read_exact(&mut prefix);
+    let write = async {
+        wr.write_all(b"client-payload-END").await.unwrap();
+        wr.flush().await.unwrap();
+    };
+    let (read_res, _) = tokio::join!(read_first, write);
+    read_res.expect("read prefix");
+    assert_eq!(prefix, b"hi-from-server:");
+
+    wr.shutdown().await.unwrap();
+    let mut tail = Vec::new();
+    timeout(Duration::from_secs(5), rd.read_to_end(&mut tail))
+        .await
+        .expect("tail read timeout")
+        .unwrap();
+    assert_eq!(tail, b"client-payload-END");
+
     server_task.await.unwrap();
 }
 

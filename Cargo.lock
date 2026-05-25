@@ -675,6 +675,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -814,6 +815,7 @@ dependencies = [
  "donut-routing",
  "donut-veil",
  "donut-wire",
+ "rcgen",
  "rustls 0.23.38",
  "thiserror 2.0.18",
  "tokio",

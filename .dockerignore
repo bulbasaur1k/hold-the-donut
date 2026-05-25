@@ -1,0 +1,7 @@
+target
+fuzz/target
+.git
+.github
+docs
+**/*.rs.bk
+*.log

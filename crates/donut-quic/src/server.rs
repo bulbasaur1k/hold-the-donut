@@ -148,11 +148,49 @@ async fn handle_request(
         .await
         .map_err(|e| QuicError::H3Stream(format!("send_response: {e}")))?;
 
-    // Bridge the H3 BiDi stream into a duplex pipe.
+    // Full-duplex bridge: split the H3 request stream so the uplink
+    // (request body → user) and downlink (user → response body) pump
+    // concurrently on separate tasks. This lets the server start sending
+    // the downlink before the client has finished its uplink — required
+    // to carry an interactive proxy tunnel (the VLESS Response prefix
+    // must reach the client while it is still uploading).
+    let (mut send, mut recv) = stream.split();
     let (user_side, bridge_side) = tokio::io::duplex(PIPE_CAPACITY);
-    let (bridge_rd, bridge_wr) = tokio::io::split(bridge_side);
+    let (mut bridge_rd, mut bridge_wr) = tokio::io::split(bridge_side);
 
-    bridge_h3_to_duplex(stream, bridge_rd, bridge_wr).await;
+    // Uplink: H3 request body → user side.
+    tokio::spawn(async move {
+        while let Ok(Some(mut data)) = recv.recv_data().await {
+            while data.has_remaining() {
+                let chunk = data.chunk().to_vec();
+                if bridge_wr.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                data.advance(chunk.len());
+            }
+        }
+        let _ = bridge_wr.shutdown().await;
+    });
+
+    // Downlink: user side → H3 response body.
+    tokio::spawn(async move {
+        let mut read_buf = vec![0u8; PIPE_CAPACITY];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut bridge_rd, &mut read_buf[..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if send
+                        .send_data(Bytes::copy_from_slice(&read_buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = send.finish().await;
+    });
 
     // Hand the user-facing duplex to the accept channel.
     if tx
@@ -169,61 +207,6 @@ async fn handle_request(
     Ok(())
 }
 
-/// Drive the H3 stream as a request → response exchange:
-/// 1. Drain the request body fully (uplink) into `bridge_wr`.
-/// 2. Once the user-side reader has finished consuming its read +
-///    has shut down its write half (signalling the response is
-///    ready), send the bytes that were written to `bridge_rd` as
-///    response data and `finish()` the stream.
-///
-/// This is a simplification of the upstream `stream-one` framing —
-/// h3 0.0.8's `RequestStream` does not let us interleave send_data
-/// with recv_data on the same task without splitting (see PROTOCOLS
-/// note). M5 step 2 switches to raw QUIC bidi streams to recover
-/// full overlapping bidirectional flow.
-async fn bridge_h3_to_duplex(
-    stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    bridge_rd: tokio::io::ReadHalf<DuplexStream>,
-    bridge_wr: tokio::io::WriteHalf<DuplexStream>,
-) {
-    tokio::spawn(async move {
-        let mut stream = stream;
-        let mut bridge_wr = bridge_wr;
-        let mut bridge_rd = bridge_rd;
-
-        // Phase 1 — drain uplink into bridge_wr.
-        while let Ok(Some(mut data)) = stream.recv_data().await {
-            while data.has_remaining() {
-                let chunk = data.chunk().to_vec();
-                if bridge_wr.write_all(&chunk).await.is_err() {
-                    return;
-                }
-                data.advance(chunk.len());
-            }
-        }
-        let _ = bridge_wr.shutdown().await;
-
-        // Phase 2 — drain bridge_rd (user's response writes) onto
-        // the H3 send half.
-        let mut read_buf = vec![0u8; PIPE_CAPACITY];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut bridge_rd, &mut read_buf[..]).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stream
-                        .send_data(Bytes::copy_from_slice(&read_buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-        let _ = stream.finish().await;
-    });
-}
-
 // `bytes::Buf` is needed for the `chunk()` / `has_remaining()` /
-// `advance()` calls inside `bridge_h3_to_duplex`.
+// `advance()` calls in the uplink pump.
 use bytes::Buf;

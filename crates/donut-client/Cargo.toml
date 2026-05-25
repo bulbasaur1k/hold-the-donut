@@ -25,9 +25,10 @@ donut-routing.workspace = true
 donut-dns.workspace = true
 donut-socks.workspace = true
 donut-io.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "time"] }
 rustls.workspace = true
 tokio-rustls.workspace = true
+webpki-roots.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -17,6 +17,8 @@ mod selfsteal;
 mod veil_server;
 
 pub use metrics::Metrics;
-pub use proxy::{run_carrier_proxy, run_veil_proxy, ProxyError};
+pub use proxy::{
+    run_carrier_backend, run_carrier_proxy, run_quic_proxy, run_veil_proxy, ProxyError,
+};
 pub use selfsteal::{triage, Triage};
 pub use veil_server::{PrefixedStream, VeilServer};

@@ -21,7 +21,7 @@ use donut_veil::VeilServerConfig;
 use donut_wire::{Request, Response, WireError};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::metrics::Metrics;
@@ -75,6 +75,86 @@ pub async fn run_carrier_proxy(bind_addr: SocketAddr) -> Result<SocketAddr, Prox
             tokio::spawn(async move {
                 if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
                     tracing::trace!(?e, "proxy session ended with error");
+                }
+            });
+        }
+    });
+
+    Ok(local)
+}
+
+/// Bind a **plain carrier backend** on `bind_addr` (no REALITY, no TLS):
+/// a reverse proxy (e.g. Caddy) terminates TLS/HTTP-3 and forwards the
+/// secret-path requests here over HTTP/1.1. Each carrier `stream-one`
+/// session is decoded as a VLESS inner frame and proxied to the routed
+/// outbound. `path_prefix` must match the path the front proxy forwards
+/// (and the client's `ClientConfig.path_prefix`). Returns the bound
+/// local address.
+pub async fn run_carrier_backend(
+    bind_addr: SocketAddr,
+    path_prefix: String,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+) -> Result<SocketAddr, ProxyError> {
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local = listener.local_addr()?;
+
+    let mut server = donut_carrier::server::Server::serve(
+        listener,
+        donut_carrier::ServerConfig {
+            mode: donut_carrier::Mode::StreamOne,
+            path_prefix,
+            ..donut_carrier::ServerConfig::default()
+        },
+    );
+
+    tokio::spawn(async move {
+        while let Some(session) = server.accept().await {
+            let router = router.clone();
+            let resolver = resolver.clone();
+            let metrics = metrics.clone();
+            metrics.connection_accepted();
+            tokio::spawn(async move {
+                let _active = metrics.tunnel_started();
+                if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
+                    tracing::trace!(?e, "carrier backend session ended with error");
+                }
+            });
+        }
+    });
+
+    Ok(local)
+}
+
+/// Bind a **QUIC / HTTP-3 proxy** on `bind_addr` (UDP): terminates H3
+/// directly with `cert_chain`/`key` (no reverse proxy in front) and
+/// proxies each carrier session to the routed outbound. Used for the
+/// `transport = "quic"` server mode — direct H3, e.g. for exercising the
+/// server-side QUIC stack with Caddy disabled, or for clients that speak
+/// H3 straight to us.
+pub async fn run_quic_proxy(
+    bind_addr: SocketAddr,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+) -> Result<SocketAddr, ProxyError> {
+    let mut server = donut_quic::QuicServer::bind(bind_addr, cert_chain, key)
+        .map_err(|e| ProxyError::Tls(e.to_string()))?;
+    let local = server.addr;
+
+    tokio::spawn(async move {
+        while let Some(session) = server.accept().await {
+            let router = router.clone();
+            let resolver = resolver.clone();
+            let metrics = metrics.clone();
+            metrics.connection_accepted();
+            tokio::spawn(async move {
+                let _active = metrics.tunnel_started();
+                if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
+                    tracing::trace!(?e, "quic proxy session ended with error");
                 }
             });
         }
@@ -161,14 +241,15 @@ pub async fn run_veil_proxy(
     Ok(local)
 }
 
-async fn handle_session(
-    stream: donut_carrier::CarrierStream,
+async fn handle_session<S>(
+    mut session: S,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
-) -> Result<(), ProxyError> {
-    let mut session = stream;
-
+) -> Result<(), ProxyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Read enough bytes to parse the inner-frame request header. The
     // header is short (≤ ~280 bytes), so a single buffered read is
     // usually enough — fall through to a small loop if not.

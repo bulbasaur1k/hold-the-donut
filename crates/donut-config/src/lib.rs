@@ -35,7 +35,8 @@
 //!       "short_id": "deadbeef",
 //!       "server_name": "www.microsoft.com",
 //!       "trusted_cert": "/etc/donut/server-cert.pem", // M3 simplification
-//!       "version": [26, 4, 15]                          // optional
+//!       "version": [26, 4, 15],                         // optional
+//!       "fingerprint": "randomized"                     // optional, uTLS-style
 //!     }
 //!   }
 //! }
@@ -215,7 +216,53 @@ fn load_geosite(path: &str) -> Result<GeoSiteDb, ConfigError> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInbound {
     pub listen: String,
-    pub reality: RealityServer,
+    /// Inbound transport: `"veil"` (REALITY veiled-TLS, default) or
+    /// `"carrier"` (plain HTTP/1.1 carrier backend behind a TLS/HTTP-3
+    /// reverse proxy such as Caddy — cert-based, no REALITY).
+    #[serde(default = "default_server_transport")]
+    pub transport: String,
+    /// REALITY parameters. Required for `transport = "veil"`; ignored
+    /// (and optional) for `"carrier"`.
+    #[serde(default)]
+    pub reality: Option<RealityServer>,
+    /// Secret path prefix the front proxy forwards to this backend
+    /// (`transport = "carrier"`). Must match the client's path.
+    #[serde(default = "default_carrier_path")]
+    pub path: String,
+    /// PEM certificate chain. Required for `transport = "quic"` (direct
+    /// H3 termination); ignored for `"carrier"` (front holds the cert)
+    /// and `"veil"` (uses `reality.cert`).
+    #[serde(default)]
+    pub cert: Option<String>,
+    /// PEM private key matching `cert`. Required for `transport = "quic"`.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl ServerInbound {
+    /// Load the PEM certificate chain (`transport = "quic"`).
+    pub fn cert_chain(&self) -> Result<Vec<CertificateDer<'static>>, ConfigError> {
+        let path = self.cert.as_deref().ok_or_else(|| {
+            ConfigError::Pem("inbound.cert is required for transport=quic".into())
+        })?;
+        load_cert_chain(path)
+    }
+    /// Load the PEM private key (`transport = "quic"`).
+    pub fn private_key_pem(&self) -> Result<PrivateKeyDer<'static>, ConfigError> {
+        let path = self
+            .key
+            .as_deref()
+            .ok_or_else(|| ConfigError::Pem("inbound.key is required for transport=quic".into()))?;
+        load_private_key(path)
+    }
+}
+
+fn default_server_transport() -> String {
+    "veil".to_string()
+}
+
+fn default_carrier_path() -> String {
+    "/".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,7 +344,28 @@ pub struct ClientInbound {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientOutbound {
     pub server: String,
-    pub reality: RealityClient,
+    /// Client transport: `"veil"` (REALITY veiled-TLS, default),
+    /// `"xhttp"` (carrier over plain TLS to a cert-based front), or
+    /// `"h3"` (carrier over HTTP/3). The latter two use a real
+    /// certificate + self-steal instead of REALITY.
+    #[serde(default = "default_client_transport")]
+    pub transport: String,
+    /// REALITY parameters. Required for `transport = "veil"`; ignored
+    /// (and optional) for `"xhttp"`/`"h3"`.
+    #[serde(default)]
+    pub reality: Option<RealityClient>,
+    /// TLS SNI / certificate name of the front proxy (`xhttp`/`h3`).
+    /// Empty ⇒ derived from the host part of `server`.
+    #[serde(default)]
+    pub server_name: String,
+    /// Secret path prefix the front routes to the carrier backend
+    /// (`xhttp`/`h3`). Must match the server's `inbound.path`.
+    #[serde(default = "default_carrier_path")]
+    pub path: String,
+}
+
+fn default_client_transport() -> String {
+    "veil".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +375,12 @@ pub struct RealityClient {
     pub server_name: String,
     #[serde(default = "default_version")]
     pub version: [u8; 3],
+    /// TLS ClientHello fingerprint to mimic (uTLS-style). Accepts
+    /// `"native"` (default), `"randomized"`, `"randomizedalpn"`,
+    /// `"randomizednoalpn"`. Parsed by `donut_veil::Fingerprint` at
+    /// startup; an empty value means native.
+    #[serde(default)]
+    pub fingerprint: String,
     // No `trusted_cert`: the server is authenticated by the in-tunnel
     // AuthKey proof (REALITY-hardening), not WebPKI. Legacy configs that
     // still carry the field parse fine — it's ignored.
@@ -427,11 +501,13 @@ mod tests {
         let cfg: ServerConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.inbound.listen, "0.0.0.0:443");
         assert_eq!(cfg.log.level, "info"); // default
+        let reality = cfg.inbound.reality.as_ref().unwrap();
         assert_eq!(
-            cfg.inbound.reality.private_key_bytes().unwrap()[..4],
+            reality.private_key_bytes().unwrap()[..4],
             [0xde, 0xad, 0xbe, 0xef]
         );
-        assert_eq!(cfg.inbound.reality.short_id_set().unwrap().len(), 2);
+        assert_eq!(reality.short_id_set().unwrap().len(), 2);
+        assert_eq!(cfg.inbound.transport, "veil"); // default
     }
 
     #[test]
@@ -449,11 +525,13 @@ mod tests {
             }
         }"#;
         let cfg: ClientConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.outbound.reality.version, [26, 4, 15]);
+        let reality = cfg.outbound.reality.as_ref().unwrap();
+        assert_eq!(reality.version, [26, 4, 15]);
         assert_eq!(
-            cfg.outbound.reality.short_id_value().unwrap(),
+            reality.short_id_value().unwrap(),
             "deadbeef".parse::<donut_core::ShortId>().unwrap()
         );
+        assert_eq!(cfg.outbound.transport, "veil"); // default
     }
 
     #[test]
