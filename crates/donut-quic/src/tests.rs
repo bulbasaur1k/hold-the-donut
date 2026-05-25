@@ -28,8 +28,14 @@ async fn h3_stream_one_round_trip() {
 
     let (cert, key) = gen_cert();
 
-    let mut server = QuicServer::bind("127.0.0.1:0".parse().unwrap(), vec![cert.clone()], key)
-        .expect("bind QUIC server");
+    let mut server = QuicServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![cert.clone()],
+        key,
+        "/".to_string(),
+        None,
+    )
+    .expect("bind QUIC server");
     let addr = server.addr;
 
     // Server task: accept one session, drain the uplink, echo the
@@ -88,8 +94,14 @@ async fn h3_full_duplex_round_trip() {
 
     let (cert, key) = gen_cert();
 
-    let mut server = QuicServer::bind("127.0.0.1:0".parse().unwrap(), vec![cert.clone()], key)
-        .expect("bind QUIC server");
+    let mut server = QuicServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![cert.clone()],
+        key,
+        "/".to_string(),
+        None,
+    )
+    .expect("bind QUIC server");
     let addr = server.addr;
 
     let server_task = tokio::spawn(async move {
@@ -147,6 +159,75 @@ async fn h3_full_duplex_round_trip() {
     assert_eq!(tail, b"client-payload-END");
 
     server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn h3_non_secret_path_self_steals_to_decoy() {
+    // A request whose path is NOT the secret tunnel path must be
+    // reverse-proxied to the decoy backend, so an H3 probe to this port
+    // sees the file site, not the tunnel.
+    install_provider();
+    let (cert, key) = gen_cert();
+
+    // Minimal HTTP/1.1 decoy backend.
+    let decoy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let decoy_addr = decoy.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = match decoy.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).await; // consume the request
+                let body = b"DECOY-FILE-SITE";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+
+    let server = QuicServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![cert.clone()],
+        key,
+        "/tunnel".to_string(),
+        Some(decoy_addr),
+    )
+    .expect("bind QUIC server");
+    let addr = server.addr;
+    // Keep the server (and its endpoint) alive for the duration.
+    let _keep = &server;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        dial_stream_one(addr, "localhost", roots, "/index.html"),
+    )
+    .await
+    .expect("dial timeout")
+    .expect("dial succeeds");
+
+    // No tunnel payload: just finish the (empty) uplink and read the
+    // decoy response off the downlink.
+    stream.shutdown().await.unwrap();
+    let mut got = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut got))
+        .await
+        .expect("read timeout")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&got).contains("DECOY-FILE-SITE"),
+        "expected decoy body, got: {:?}",
+        String::from_utf8_lossy(&got)
+    );
 }
 
 #[tokio::test]

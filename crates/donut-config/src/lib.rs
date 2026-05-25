@@ -237,6 +237,12 @@ pub struct ServerInbound {
     /// PEM private key matching `cert`. Required for `transport = "quic"`.
     #[serde(default)]
     pub key: Option<String>,
+    /// Decoy HTTP backend for self-steal (`transport = "quic"`):
+    /// non-secret-path H3 requests are reverse-proxied here (e.g. the
+    /// local filebrowser `127.0.0.1:8080`). Absent ⇒ non-secret requests
+    /// get a 404.
+    #[serde(default)]
+    pub dest: Option<String>,
 }
 
 impl ServerInbound {

@@ -57,6 +57,8 @@ async fn quic_proxy_relays_payload_over_h3() {
         "127.0.0.1:0".parse().unwrap(),
         vec![cert.clone()],
         key,
+        "/".to_string(),
+        None,
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],

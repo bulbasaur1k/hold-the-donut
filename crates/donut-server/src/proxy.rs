@@ -133,15 +133,18 @@ pub async fn run_carrier_backend(
 /// `transport = "quic"` server mode — direct H3, e.g. for exercising the
 /// server-side QUIC stack with Caddy disabled, or for clients that speak
 /// H3 straight to us.
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
 pub async fn run_quic_proxy(
     bind_addr: SocketAddr,
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    secret_path: String,
+    decoy: Option<SocketAddr>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
 ) -> Result<SocketAddr, ProxyError> {
-    let mut server = donut_quic::QuicServer::bind(bind_addr, cert_chain, key)
+    let mut server = donut_quic::QuicServer::bind(bind_addr, cert_chain, key, secret_path, decoy)
         .map_err(|e| ProxyError::Tls(e.to_string()))?;
     let local = server.addr;
 

@@ -10,8 +10,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::error::QuicError;
@@ -32,21 +35,29 @@ pub struct QuicServer {
 }
 
 impl QuicServer {
-    /// Bind a QUIC endpoint to `addr` with the given certificate
-    /// chain and private key, install it as a server, and start the
-    /// accept loop. Returns the bound local address (useful when
-    /// `addr` had port 0).
+    /// Bind a QUIC endpoint to `addr` with the given certificate chain
+    /// and private key, install it as a server, and start the accept
+    /// loop. Returns the bound local address (useful when `addr` had
+    /// port 0).
+    ///
+    /// `secret_path` gates the tunnel: only requests whose path starts
+    /// with it become carrier sessions. Everything else is reverse-
+    /// proxied to `decoy` (a local HTTP backend such as filebrowser) so
+    /// the QUIC port self-steals like a normal H3 site; if `decoy` is
+    /// `None`, non-secret requests get a 404.
     pub fn bind(
         addr: SocketAddr,
         cert_chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
+        secret_path: String,
+        decoy: Option<SocketAddr>,
     ) -> Result<Self, QuicError> {
         let server_config = build_server_config(cert_chain, key)?;
         let endpoint = quinn::Endpoint::server(server_config, addr)
             .map_err(|e| QuicError::Endpoint(e.to_string()))?;
         let local = endpoint.local_addr()?;
         let (tx, rx) = mpsc::channel::<QuicSession>(64);
-        tokio::spawn(accept_loop(endpoint, tx));
+        tokio::spawn(accept_loop(endpoint, tx, Arc::from(secret_path), decoy));
         Ok(Self { rx, addr: local })
     }
 
@@ -73,9 +84,15 @@ fn build_server_config(
     Ok(quinn::ServerConfig::with_crypto(Arc::new(qc)))
 }
 
-async fn accept_loop(endpoint: quinn::Endpoint, tx: mpsc::Sender<QuicSession>) {
+async fn accept_loop(
+    endpoint: quinn::Endpoint,
+    tx: mpsc::Sender<QuicSession>,
+    secret_path: Arc<str>,
+    decoy: Option<SocketAddr>,
+) {
     while let Some(incoming) = endpoint.accept().await {
         let tx = tx.clone();
+        let secret_path = secret_path.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
@@ -92,7 +109,7 @@ async fn accept_loop(endpoint: quinn::Endpoint, tx: mpsc::Sender<QuicSession>) {
                     return;
                 }
             };
-            handle_h3_connection(h3_conn, remote, tx).await;
+            handle_h3_connection(h3_conn, remote, tx, secret_path, decoy).await;
         });
     }
 }
@@ -101,13 +118,16 @@ async fn handle_h3_connection(
     mut conn: h3::server::Connection<h3_quinn::Connection, Bytes>,
     remote: SocketAddr,
     tx: mpsc::Sender<QuicSession>,
+    secret_path: Arc<str>,
+    decoy: Option<SocketAddr>,
 ) {
     loop {
         match conn.accept().await {
             Ok(Some(resolver)) => {
                 let tx = tx.clone();
+                let secret_path = secret_path.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_request(resolver, remote, tx).await {
+                    if let Err(e) = handle_request(resolver, remote, tx, secret_path, decoy).await {
                         tracing::trace!(?e, "H3 request handling error");
                     }
                 });
@@ -125,16 +145,31 @@ async fn handle_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     remote: SocketAddr,
     tx: mpsc::Sender<QuicSession>,
+    secret_path: Arc<str>,
+    decoy: Option<SocketAddr>,
 ) -> Result<(), QuicError> {
     let (req, mut stream) = resolver
         .resolve_request()
         .await
         .map_err(|e| QuicError::H3Stream(format!("resolve request: {e}")))?;
 
-    // The session id itself is opaque to the M5 step-1 handler; M5
-    // step-2 will pull it through the shared `session_extract` once
-    // we wire the carrier-mode trait.
-    let _ = req;
+    // Self-steal gate: only the secret path is the tunnel. Anything else
+    // is reverse-proxied to the decoy (so an H3 probe to this port sees
+    // the real file site, not the tunnel), or 404 if no decoy is set.
+    if !req.uri().path().starts_with(&*secret_path) {
+        return match decoy {
+            Some(addr) => proxy_to_decoy(req, stream, addr).await,
+            None => {
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(())
+                    .unwrap();
+                let _ = stream.send_response(resp).await;
+                let _ = stream.finish().await;
+                Ok(())
+            }
+        };
+    }
 
     // Send 200 OK response headers immediately so the client can start
     // reading the downlink.
@@ -207,6 +242,103 @@ async fn handle_request(
     Ok(())
 }
 
+/// Reverse-proxy a non-secret H3 request to the `decoy` HTTP/1.1 backend
+/// (e.g. filebrowser on localhost) and relay the response back over H3,
+/// so the QUIC port self-steals like an ordinary file site. The response
+/// is buffered (decoy pages are small).
+async fn proxy_to_decoy(
+    req: http::Request<()>,
+    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    decoy: SocketAddr,
+) -> Result<(), QuicError> {
+    // Drain the H3 request body (probes are usually GET; stay general).
+    let mut body = Vec::new();
+    while let Ok(Some(mut data)) = stream.recv_data().await {
+        while data.has_remaining() {
+            let chunk = data.chunk().to_vec();
+            body.extend_from_slice(&chunk);
+            data.advance(chunk.len());
+        }
+    }
+
+    // Open HTTP/1.1 to the decoy and forward the request.
+    let tcp = TcpStream::connect(decoy)
+        .await
+        .map_err(|e| QuicError::Endpoint(format!("decoy connect: {e}")))?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .map_err(|e| QuicError::H3Stream(format!("decoy handshake: {e}")))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let mut builder = hyper::Request::builder()
+        .method(req.method())
+        .uri(pq)
+        .header(
+            http::header::HOST,
+            req.uri()
+                .authority()
+                .map(|a| a.as_str())
+                .unwrap_or("localhost"),
+        );
+    for (k, v) in req.headers() {
+        // Host is set above; skip hop-by-hop headers.
+        if k == http::header::HOST
+            || k == http::header::CONNECTION
+            || k == http::header::TRANSFER_ENCODING
+        {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    let h1_req = builder
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|e| QuicError::H3Stream(format!("decoy build req: {e}")))?;
+    let resp = sender
+        .send_request(h1_req)
+        .await
+        .map_err(|e| QuicError::H3Stream(format!("decoy send: {e}")))?;
+
+    let (parts, resp_body) = resp.into_parts();
+    let collected = resp_body
+        .collect()
+        .await
+        .map_err(|e| QuicError::H3Stream(format!("decoy body: {e}")))?
+        .to_bytes();
+
+    let mut rb = http::Response::builder().status(parts.status);
+    for (k, v) in &parts.headers {
+        if k == http::header::CONNECTION || k == http::header::TRANSFER_ENCODING {
+            continue;
+        }
+        rb = rb.header(k, v);
+    }
+    let h3_resp = rb
+        .body(())
+        .map_err(|e| QuicError::H3Stream(format!("decoy resp: {e}")))?;
+    stream
+        .send_response(h3_resp)
+        .await
+        .map_err(|e| QuicError::H3Stream(format!("decoy send_response: {e}")))?;
+    if !collected.is_empty() {
+        stream
+            .send_data(collected)
+            .await
+            .map_err(|e| QuicError::H3Stream(format!("decoy send_data: {e}")))?;
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|e| QuicError::H3Stream(format!("decoy finish: {e}")))?;
+    Ok(())
+}
+
 // `bytes::Buf` is needed for the `chunk()` / `has_remaining()` /
-// `advance()` calls in the uplink pump.
+// `advance()` calls in the uplink and decoy pumps.
 use bytes::Buf;

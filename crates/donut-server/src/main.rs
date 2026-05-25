@@ -65,11 +65,27 @@ async fn main() -> anyhow::Result<()> {
         "quic" => {
             let cert_chain = cfg.inbound.cert_chain()?;
             let key = cfg.inbound.private_key_pem()?;
-            let bound =
-                donut_server::run_quic_proxy(listen, cert_chain, key, router, resolver, metrics)
-                    .await
-                    .context("starting quic proxy")?;
-            tracing::info!(%bound, "donut-server listening (QUIC/HTTP-3, direct, cert-based)");
+            let path = cfg.inbound.path.clone();
+            let decoy: Option<SocketAddr> = match cfg.inbound.dest.as_deref() {
+                Some(d) => Some(
+                    d.parse()
+                        .with_context(|| format!("parsing inbound.dest {d}"))?,
+                ),
+                None => None,
+            };
+            let bound = donut_server::run_quic_proxy(
+                listen,
+                cert_chain,
+                key,
+                path.clone(),
+                decoy,
+                router,
+                resolver,
+                metrics,
+            )
+            .await
+            .context("starting quic proxy")?;
+            tracing::info!(%bound, %path, ?decoy, "donut-server listening (QUIC/HTTP-3, cert-based, self-steal)");
         }
         // REALITY veiled-TLS front door + selfsteal forward to `dest`.
         "veil" => {
