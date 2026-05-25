@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,13 @@ pub struct ServerConfig {
     /// Inclusive range for the random `stream-up` server-side
     /// keepalive timeout.
     pub stream_up_secs: (u32, u32),
+
+    /// Self-steal decoy: requests that are **not** the secret tunnel
+    /// (wrong path / unparseable session) are reverse-proxied here (e.g.
+    /// the local filebrowser) instead of getting a 404, so the endpoint
+    /// looks like an ordinary site. `None` ⇒ 404 on non-tunnel requests.
+    #[serde(default)]
+    pub decoy: Option<SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -58,6 +66,7 @@ impl Default for ServerConfig {
             min_post_interval: Duration::from_millis(30),
             max_buffered_posts: 30,
             stream_up_secs: (20, 80),
+            decoy: None,
         }
     }
 }

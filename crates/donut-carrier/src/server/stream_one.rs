@@ -42,6 +42,13 @@ pub(super) async fn handle(
     let (sid, _tail) = match session_extract::session_id(&req, &config) {
         Ok(v) => v,
         Err(e) => {
+            // Not a valid tunnel request (wrong path / bad session). If a
+            // self-steal decoy is configured, reverse-proxy there so the
+            // endpoint looks like an ordinary site; otherwise 404.
+            if let Some(decoy) = config.decoy {
+                tracing::trace!(?e, %decoy, "stream-one: non-tunnel request → decoy");
+                return super::proxy_to_decoy(req, decoy).await;
+            }
             tracing::debug!(?e, "stream-one: session extraction failed");
             return Ok(empty_response(StatusCode::NOT_FOUND));
         }

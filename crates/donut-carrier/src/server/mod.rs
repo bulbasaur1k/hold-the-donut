@@ -184,3 +184,38 @@ pub(crate) fn empty_response(code: StatusCode) -> Response<ResponseBody> {
         .body(body)
         .expect("static empty body")
 }
+
+/// Reverse-proxy a non-tunnel request to the self-steal `decoy` backend
+/// (e.g. local filebrowser) over HTTP/1.1 and return its response, so the
+/// carrier endpoint looks like an ordinary site to a probe.
+pub(crate) async fn proxy_to_decoy(
+    req: Request<Incoming>,
+    decoy: std::net::SocketAddr,
+) -> Result<Response<ResponseBody>> {
+    use http_body_util::BodyExt;
+    let tcp = tokio::net::TcpStream::connect(decoy).await?;
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake::<_, Incoming>(TokioIo::new(tcp)).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let (parts, body) = req.into_parts();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let mut builder = Request::builder().method(parts.method).uri(path);
+    for (k, v) in parts.headers.iter() {
+        if k == http::header::CONNECTION || k == http::header::TRANSFER_ENCODING {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    let fwd = builder.body(body)?;
+    let resp = sender.send_request(fwd).await?;
+    let (rparts, rbody) = resp.into_parts();
+    let boxed = rbody.map_err(std::io::Error::other).boxed();
+    Ok(Response::from_parts(rparts, boxed))
+}

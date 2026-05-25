@@ -23,6 +23,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 use crate::metrics::Metrics;
 use crate::veil_server::VeilServer;
@@ -158,6 +159,93 @@ pub async fn run_quic_proxy(
                 let _active = metrics.tunnel_started();
                 if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
                     tracing::trace!(?e, "quic proxy session ended with error");
+                }
+            });
+        }
+    });
+
+    Ok(local)
+}
+
+/// Bind a **cert-based TLS carrier proxy** on `bind_addr` (TCP): donut-
+/// server terminates TLS itself with a real certificate (no REALITY, no
+/// reverse proxy in front), serves the `stream-one` carrier directly over
+/// the decrypted stream (full-duplex, no Caddy in the path), and
+/// self-steals every non-tunnel request to the `decoy` backend (e.g.
+/// filebrowser). The client connects straight to this port. This is the
+/// recommended TCP transport for a direct VPS.
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
+pub async fn run_tls_carrier_proxy(
+    bind_addr: SocketAddr,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    secret_path: String,
+    decoy: Option<SocketAddr>,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+) -> Result<SocketAddr, ProxyError> {
+    let mut tls = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|e| ProxyError::Tls(e.to_string()))?
+    .with_no_client_auth()
+    .with_single_cert(cert_chain, key)
+    .map_err(|e| ProxyError::Tls(e.to_string()))?;
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(tls));
+
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local = listener.local_addr()?;
+
+    let carrier_cfg = Arc::new(donut_carrier::ServerConfig {
+        mode: donut_carrier::Mode::StreamOne,
+        path_prefix: secret_path,
+        decoy,
+        ..donut_carrier::ServerConfig::default()
+    });
+
+    tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(?e, "tls-carrier accept error");
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let carrier_cfg = carrier_cfg.clone();
+            let router = router.clone();
+            let resolver = resolver.clone();
+            let metrics = metrics.clone();
+            metrics.connection_accepted();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(tcp).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::trace!(?e, "tls-carrier handshake failed");
+                        return;
+                    }
+                };
+                let mut rx = donut_carrier::server::serve_connection(
+                    tls_stream,
+                    (*carrier_cfg).clone(),
+                    peer,
+                );
+                while let Some(session) = rx.recv().await {
+                    let router = router.clone();
+                    let resolver = resolver.clone();
+                    let metrics = metrics.clone();
+                    tokio::spawn(async move {
+                        let _active = metrics.tunnel_started();
+                        if let Err(e) =
+                            handle_session(session.stream, router, resolver, metrics).await
+                        {
+                            tracing::trace!(?e, "tls-carrier session ended with error");
+                        }
+                    });
                 }
             });
         }

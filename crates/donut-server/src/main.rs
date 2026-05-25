@@ -87,6 +87,34 @@ async fn main() -> anyhow::Result<()> {
             .context("starting quic proxy")?;
             tracing::info!(%bound, %path, ?decoy, "donut-server listening (QUIC/HTTP-3, cert-based, self-steal)");
         }
+        // Cert-based TLS carrier on TCP: donut-server terminates TLS
+        // itself (no reverse proxy in the tunnel path), secret path →
+        // full-duplex carrier tunnel, everything else → decoy self-steal.
+        "tls" => {
+            let cert_chain = cfg.inbound.cert_chain()?;
+            let key = cfg.inbound.private_key_pem()?;
+            let path = cfg.inbound.path.clone();
+            let decoy: Option<SocketAddr> = match cfg.inbound.dest.as_deref() {
+                Some(d) => Some(
+                    d.parse()
+                        .with_context(|| format!("parsing inbound.dest {d}"))?,
+                ),
+                None => None,
+            };
+            let bound = donut_server::run_tls_carrier_proxy(
+                listen,
+                cert_chain,
+                key,
+                path.clone(),
+                decoy,
+                router,
+                resolver,
+                metrics,
+            )
+            .await
+            .context("starting tls carrier proxy")?;
+            tracing::info!(%bound, %path, ?decoy, "donut-server listening (TLS carrier, cert-based, self-steal)");
+        }
         // REALITY veiled-TLS front door + selfsteal forward to `dest`.
         "veil" => {
             let reality = cfg
@@ -112,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%bound, %dest, "donut-server listening (VLESS+REALITY+XHTTP)");
         }
         other => anyhow::bail!(
-            "unknown inbound.transport {other:?} (expected \"veil\", \"carrier\" or \"quic\")"
+            "unknown inbound.transport {other:?} (expected \"veil\", \"carrier\", \"quic\" or \"tls\")"
         ),
     }
 
