@@ -7,22 +7,48 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rustls::pki_types::ServerName;
+
+mod download;
+mod imports;
+mod link;
 
 #[derive(Debug, Parser)]
 #[command(name = "donut-client", version, about = "hold-the-donut local agent")]
-struct Args {
-    /// Path to JSON config.
+struct Cli {
+    /// Path to config (JSON or TOML). Used in run mode (no subcommand).
     #[arg(short, long, default_value = "/etc/donut/client.json")]
     config: String,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Run the SOCKS5 proxy (the default when no subcommand is given).
+    Run,
+    /// Import a `vless://` link into a ready-to-use client config (TOML),
+    /// with Russia→direct split-tunnel rules on by default.
+    Import(imports::ImportArgs),
+    /// Download geoip.dat + geosite.dat for split-tunnel routing.
+    GeoUpdate(imports::GeoArgs),
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let cfg = donut_config::load_client(&args.config)
-        .with_context(|| format!("loading client config {}", args.config))?;
+    let cli = Cli::parse();
+    match cli.cmd {
+        Some(Cmd::Import(args)) => return imports::cmd_import(args),
+        Some(Cmd::GeoUpdate(args)) => return imports::cmd_geo_update(args).await,
+        None | Some(Cmd::Run) => {}
+    }
+    run(&cli.config).await
+}
+
+async fn run(config: &str) -> anyhow::Result<()> {
+    let cfg = donut_config::load_client(config)
+        .with_context(|| format!("loading client config {config}"))?;
 
     init_tracing(&cfg.log.level, &cfg.log.format);
 
