@@ -7,9 +7,87 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// Why a tunnel session ended badly — kept low-cardinality for Prometheus.
+#[derive(Debug, Clone, Copy)]
+pub enum SessErr {
+    Reset,
+    Timeout,
+    Eof,
+    Unsupported,
+    Dial,
+    Tls,
+    Other,
+}
+
+impl SessErr {
+    /// Classify a std::io error into a low-cardinality bucket.
+    pub fn from_io(e: &std::io::Error) -> Self {
+        use std::io::ErrorKind::*;
+        match e.kind() {
+            ConnectionReset | ConnectionAborted | BrokenPipe => SessErr::Reset,
+            TimedOut => SessErr::Timeout,
+            UnexpectedEof => SessErr::Eof,
+            _ => SessErr::Other,
+        }
+    }
+}
+
+/// Fixed-bucket latency histogram backed by atomics (Prometheus histogram).
+#[derive(Debug)]
+struct Histogram {
+    buckets: [AtomicU64; Self::BOUNDS.len() + 1],
+    sum_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Histogram {
+    /// Upper bounds (`le`) in seconds — tuned for proxy dial latency.
+    const BOUNDS: [f64; 9] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+
+    fn observe(&self, d: Duration) {
+        let secs = d.as_secs_f64();
+        self.sum_micros
+            .fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let idx = Self::BOUNDS
+            .iter()
+            .position(|&b| secs <= b)
+            .unwrap_or(Self::BOUNDS.len());
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render(&self, name: &str, help: &str) -> String {
+        let mut out = format!(
+            "# HELP {name} {help}\n# TYPE {name} histogram\n"
+        );
+        let mut cum = 0u64;
+        for (i, b) in Self::BOUNDS.iter().enumerate() {
+            cum += self.buckets[i].load(Ordering::Relaxed);
+            out.push_str(&format!("{name}_bucket{{le=\"{b}\"}} {cum}\n"));
+        }
+        cum += self.buckets[Self::BOUNDS.len()].load(Ordering::Relaxed);
+        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cum}\n"));
+        let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1.0e6;
+        let count = self.count.load(Ordering::Relaxed);
+        out.push_str(&format!("{name}_sum {sum}\n{name}_count {count}\n"));
+        out
+    }
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Atomic server counters.
 #[derive(Debug, Default)]
@@ -22,6 +100,18 @@ pub struct Metrics {
     blackhole_total: AtomicU64,
     bytes_up: AtomicU64,
     bytes_down: AtomicU64,
+    // session outcomes + error breakdown (connection quality)
+    sessions_ok: AtomicU64,
+    sessions_error: AtomicU64,
+    err_reset: AtomicU64,
+    err_timeout: AtomicU64,
+    err_eof: AtomicU64,
+    err_unsupported: AtomicU64,
+    err_dial: AtomicU64,
+    err_tls: AtomicU64,
+    err_other: AtomicU64,
+    // upstream dial latency (connection quality)
+    dial: Histogram,
 }
 
 impl Metrics {
@@ -66,6 +156,31 @@ impl Metrics {
         self.bytes_down.fetch_add(down, Ordering::Relaxed);
     }
 
+    /// A tunnel session completed cleanly.
+    pub fn session_ok(&self) {
+        self.sessions_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A tunnel session ended with an error (also bumps the per-kind counter).
+    pub fn session_error(&self, kind: SessErr) {
+        self.sessions_error.fetch_add(1, Ordering::Relaxed);
+        let c = match kind {
+            SessErr::Reset => &self.err_reset,
+            SessErr::Timeout => &self.err_timeout,
+            SessErr::Eof => &self.err_eof,
+            SessErr::Unsupported => &self.err_unsupported,
+            SessErr::Dial => &self.err_dial,
+            SessErr::Tls => &self.err_tls,
+            SessErr::Other => &self.err_other,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how long it took to dial the upstream target (connection quality).
+    pub fn observe_dial(&self, d: Duration) {
+        self.dial.observe(d);
+    }
+
     /// Render the current values in Prometheus text-exposition format.
     pub fn render(&self) -> String {
         let connections = self.connections_total.load(Ordering::Relaxed);
@@ -76,7 +191,16 @@ impl Metrics {
         let blackhole = self.blackhole_total.load(Ordering::Relaxed);
         let up = self.bytes_up.load(Ordering::Relaxed);
         let down = self.bytes_down.load(Ordering::Relaxed);
-        format!(
+        let s_ok = self.sessions_ok.load(Ordering::Relaxed);
+        let s_err = self.sessions_error.load(Ordering::Relaxed);
+        let e_reset = self.err_reset.load(Ordering::Relaxed);
+        let e_timeout = self.err_timeout.load(Ordering::Relaxed);
+        let e_eof = self.err_eof.load(Ordering::Relaxed);
+        let e_unsup = self.err_unsupported.load(Ordering::Relaxed);
+        let e_dial = self.err_dial.load(Ordering::Relaxed);
+        let e_tls = self.err_tls.load(Ordering::Relaxed);
+        let e_other = self.err_other.load(Ordering::Relaxed);
+        let mut out = format!(
             "# HELP donut_connections_total Total connections accepted on the public listener.\n\
              # TYPE donut_connections_total counter\n\
              donut_connections_total {connections}\n\
@@ -96,8 +220,26 @@ impl Metrics {
              # HELP donut_bytes_total Proxied bytes by direction.\n\
              # TYPE donut_bytes_total counter\n\
              donut_bytes_total{{direction=\"up\"}} {up}\n\
-             donut_bytes_total{{direction=\"down\"}} {down}\n"
-        )
+             donut_bytes_total{{direction=\"down\"}} {down}\n\
+             # HELP donut_sessions_total Tunnel session outcomes.\n\
+             # TYPE donut_sessions_total counter\n\
+             donut_sessions_total{{outcome=\"ok\"}} {s_ok}\n\
+             donut_sessions_total{{outcome=\"error\"}} {s_err}\n\
+             # HELP donut_session_errors_total Tunnel session errors by kind.\n\
+             # TYPE donut_session_errors_total counter\n\
+             donut_session_errors_total{{kind=\"reset\"}} {e_reset}\n\
+             donut_session_errors_total{{kind=\"timeout\"}} {e_timeout}\n\
+             donut_session_errors_total{{kind=\"eof\"}} {e_eof}\n\
+             donut_session_errors_total{{kind=\"unsupported_command\"}} {e_unsup}\n\
+             donut_session_errors_total{{kind=\"dial_failed\"}} {e_dial}\n\
+             donut_session_errors_total{{kind=\"tls_handshake\"}} {e_tls}\n\
+             donut_session_errors_total{{kind=\"other\"}} {e_other}\n"
+        );
+        out.push_str(&self.dial.render(
+            "donut_upstream_dial_seconds",
+            "Time to establish the upstream (target) TCP connection.",
+        ));
+        out
     }
 }
 
@@ -162,6 +304,9 @@ mod tests {
         m.rejected_unauthorized();
         m.blackholed();
         m.add_bytes(100, 250);
+        m.session_ok();
+        m.session_error(SessErr::Unsupported);
+        m.observe_dial(Duration::from_millis(30));
 
         let out = m.render();
         assert!(out.contains("donut_connections_total 2"));
@@ -172,7 +317,11 @@ mod tests {
         assert!(out.contains("donut_blackhole_total 1"));
         assert!(out.contains("donut_bytes_total{direction=\"up\"} 100"));
         assert!(out.contains("donut_bytes_total{direction=\"down\"} 250"));
-        assert!(out.contains("# TYPE donut_connections_total counter"));
+        assert!(out.contains("donut_sessions_total{outcome=\"ok\"} 1"));
+        assert!(out.contains("donut_session_errors_total{kind=\"unsupported_command\"} 1"));
+        assert!(out.contains("donut_upstream_dial_seconds_count 1"));
+        assert!(out.contains("donut_upstream_dial_seconds_bucket{le=\"+Inf\"} 1"));
+        assert!(out.contains("# TYPE donut_upstream_dial_seconds histogram"));
 
         drop(guard);
         assert!(m.render().contains("donut_active_connections 0"));
