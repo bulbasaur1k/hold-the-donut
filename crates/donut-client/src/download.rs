@@ -45,12 +45,11 @@ fn parse_https(url: &str) -> anyhow::Result<Url> {
 fn tls_connector() -> TlsConnector {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg =
-        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-            .with_safe_default_protocol_versions()
-            .expect("default protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let cfg = ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     TlsConnector::from(Arc::new(cfg))
 }
 
@@ -119,12 +118,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn parse_status(head: &str) -> Option<u16> {
-    head.lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    head.lines().next()?.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn header_value(head: &str, name: &str) -> Option<String> {

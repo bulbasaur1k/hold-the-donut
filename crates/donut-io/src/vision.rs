@@ -207,8 +207,9 @@ mod tests {
         let payload = b"hi".to_vec();
         let (mut enc_dst, mut dec_src) = tokio::io::duplex(4096);
         let mut src = std::io::Cursor::new(payload.clone());
-        let writer =
-            tokio::spawn(async move { encode_copy(&mut src, &mut enc_dst, VisionConfig::default()).await });
+        let writer = tokio::spawn(async move {
+            encode_copy(&mut src, &mut enc_dst, VisionConfig::default()).await
+        });
         let mut sink: Vec<u8> = Vec::new();
         decode_copy(&mut dec_src, &mut sink).await.unwrap();
         writer.await.unwrap().unwrap();

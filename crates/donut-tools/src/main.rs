@@ -174,7 +174,14 @@ fn main() -> anyhow::Result<()> {
             };
             println!(
                 "{}",
-                vless_link(&args.uuid, &args.server_addr, &args.sni, &args.fp, &args.flow, &label)
+                vless_link(
+                    &args.uuid,
+                    &args.server_addr,
+                    &args.sni,
+                    &args.fp,
+                    &args.flow,
+                    &label
+                )
             );
         }
     }
@@ -280,7 +287,10 @@ fn vless_link(uuid: &str, addr: &str, sni: &str, fp: &str, flow: &str, label: &s
 
 /// Host portion of a `host:port` address (for a default link label).
 fn host_of(addr: &str) -> String {
-    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr).to_string()
+    addr.rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(addr)
+        .to_string()
 }
 
 /// Percent-encode an RFC 3986 query/fragment value (encode everything that
@@ -518,7 +528,10 @@ mod tests {
         assert!(server.inbound.reality.is_none());
         assert!(client.outbound.reality.is_none());
 
-        assert_eq!(server.inbound.cert.as_deref(), Some("/etc/donut/fullchain.pem"));
+        assert_eq!(
+            server.inbound.cert.as_deref(),
+            Some("/etc/donut/fullchain.pem")
+        );
         assert_eq!(server.inbound.dest.as_deref(), Some("127.0.0.1:8443"));
         assert_eq!(server.inbound.path, client.outbound.path);
 
@@ -572,7 +585,10 @@ mod tests {
     /// server's allowed-user set — config-gen must produce a pair that
     /// actually authenticates.
     fn assert_shared_uuid(server: &ServerConfig, client: &ClientConfig) {
-        let auth = server.inbound.user_auth().expect("server users materialise");
+        let auth = server
+            .inbound
+            .user_auth()
+            .expect("server users materialise");
         let user = client.outbound.user_id().expect("client uuid materialises");
         assert!(
             auth.is_authorized(&user),

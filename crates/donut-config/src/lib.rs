@@ -300,7 +300,10 @@ impl ServerInbound {
         let users = self
             .users
             .iter()
-            .map(|s| s.parse::<UserId>().map_err(|_| ConfigError::User(s.clone())))
+            .map(|s| {
+                s.parse::<UserId>()
+                    .map_err(|_| ConfigError::User(s.clone()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(UserAuth::new(users))
     }
@@ -674,10 +677,7 @@ mod tests {
         }"#;
         let cfg: ServerConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.inbound.users.is_empty());
-        assert!(matches!(
-            cfg.inbound.user_auth(),
-            Err(ConfigError::NoUsers)
-        ));
+        assert!(matches!(cfg.inbound.user_auth(), Err(ConfigError::NoUsers)));
     }
 
     #[test]
