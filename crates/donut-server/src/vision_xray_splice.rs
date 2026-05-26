@@ -307,7 +307,11 @@ pub async fn vision_udp_relay(
     leftover: Vec<u8>,
     metrics: &Metrics,
 ) -> io::Result<()> {
-    let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let bind = if target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(target).await?;
 
@@ -376,7 +380,11 @@ async fn read_uplink(
 ) -> io::Result<UplinkRead> {
     if spliced {
         let n = tunnel.read_raw(rawbuf).await?;
-        Ok(if n == 0 { UplinkRead::Eof } else { UplinkRead::Raw(n) })
+        Ok(if n == 0 {
+            UplinkRead::Eof
+        } else {
+            UplinkRead::Raw(n)
+        })
     } else {
         match tunnel.read_record_opt().await? {
             None => Ok(UplinkRead::Eof),

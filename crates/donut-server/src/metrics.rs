@@ -12,6 +12,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// Tunnel-session transport, for the per-kind active-session gauge. Lets a
+/// leak (sessions/tasks that never terminate) be localised to a subsystem —
+/// e.g. a runaway `mux` relay shows as a climbing `kind="mux"` series.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionKind {
+    Tcp,
+    Udp,
+    Mux,
+}
+
 /// Why a tunnel session ended badly — kept low-cardinality for Prometheus.
 #[derive(Debug, Clone, Copy)]
 pub enum SessErr {
@@ -62,9 +72,7 @@ impl Histogram {
     }
 
     fn render(&self, name: &str, help: &str) -> String {
-        let mut out = format!(
-            "# HELP {name} {help}\n# TYPE {name} histogram\n"
-        );
+        let mut out = format!("# HELP {name} {help}\n# TYPE {name} histogram\n");
         let mut cum = 0u64;
         for (i, b) in Self::BOUNDS.iter().enumerate() {
             cum += self.buckets[i].load(Ordering::Relaxed);
@@ -94,6 +102,10 @@ impl Default for Histogram {
 pub struct Metrics {
     connections_total: AtomicU64,
     active_connections: AtomicI64,
+    // active sessions split by transport (leak localisation)
+    active_tcp: AtomicI64,
+    active_udp: AtomicI64,
+    active_mux: AtomicI64,
     handshakes_tunnel: AtomicU64,
     handshakes_forward: AtomicU64,
     rejected_unauthorized: AtomicU64,
@@ -124,13 +136,29 @@ impl Metrics {
         self.connections_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// An authenticated peer was tunnelled. Returns an RAII guard that
-    /// holds the `active_connections` gauge up for the session's life.
+    /// An authenticated peer was tunnelled (TCP transport). Returns an RAII
+    /// guard that holds the active-session gauges up for the session's life.
     pub fn tunnel_started(self: &Arc<Self>) -> ActiveGuard {
+        self.tunnel_started_kind(SessionKind::Tcp)
+    }
+
+    /// As [`tunnel_started`], tagging the session's transport so the
+    /// `donut_active_sessions{kind}` gauge can localise a leak.
+    pub fn tunnel_started_kind(self: &Arc<Self>, kind: SessionKind) -> ActiveGuard {
         self.handshakes_tunnel.fetch_add(1, Ordering::Relaxed);
         self.active_connections.fetch_add(1, Ordering::Relaxed);
+        self.kind_gauge(kind).fetch_add(1, Ordering::Relaxed);
         ActiveGuard {
             metrics: self.clone(),
+            kind,
+        }
+    }
+
+    fn kind_gauge(&self, kind: SessionKind) -> &AtomicI64 {
+        match kind {
+            SessionKind::Tcp => &self.active_tcp,
+            SessionKind::Udp => &self.active_udp,
+            SessionKind::Mux => &self.active_mux,
         }
     }
 
@@ -185,6 +213,9 @@ impl Metrics {
     pub fn render(&self) -> String {
         let connections = self.connections_total.load(Ordering::Relaxed);
         let active = self.active_connections.load(Ordering::Relaxed);
+        let a_tcp = self.active_tcp.load(Ordering::Relaxed);
+        let a_udp = self.active_udp.load(Ordering::Relaxed);
+        let a_mux = self.active_mux.load(Ordering::Relaxed);
         let tunnel = self.handshakes_tunnel.load(Ordering::Relaxed);
         let forward = self.handshakes_forward.load(Ordering::Relaxed);
         let unauthorized = self.rejected_unauthorized.load(Ordering::Relaxed);
@@ -207,6 +238,11 @@ impl Metrics {
              # HELP donut_active_connections Currently active tunnelled connections.\n\
              # TYPE donut_active_connections gauge\n\
              donut_active_connections {active}\n\
+             # HELP donut_active_sessions Currently active tunnel sessions by transport (leak localisation).\n\
+             # TYPE donut_active_sessions gauge\n\
+             donut_active_sessions{{kind=\"tcp\"}} {a_tcp}\n\
+             donut_active_sessions{{kind=\"udp\"}} {a_udp}\n\
+             donut_active_sessions{{kind=\"mux\"}} {a_mux}\n\
              # HELP donut_handshakes_total Connection triage outcomes (tunnel vs decoy self-steal).\n\
              # TYPE donut_handshakes_total counter\n\
              donut_handshakes_total{{result=\"tunnel\"}} {tunnel}\n\
@@ -239,20 +275,80 @@ impl Metrics {
             "donut_upstream_dial_seconds",
             "Time to establish the upstream (target) TCP connection.",
         ));
+        out.push_str(&proc_metrics());
         out
     }
 }
 
-/// Holds the `active_connections` gauge up for a tunnel session; the
-/// gauge is decremented when the guard drops (any return path).
+/// Process self-metrics for leak detection: open file descriptors (socket
+/// leaks), the FD ceiling, and resident memory (memory leaks). Read lazily
+/// from `/proc` at render time, so they cost nothing on the data plane.
+/// Linux-only; an empty string elsewhere (e.g. a macOS dev box).
+#[cfg(target_os = "linux")]
+fn proc_metrics() -> String {
+    let mut out = String::new();
+    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+        // `read_dir` itself holds one fd while iterating, so this overcounts
+        // by ~1 — fine for a leak trend.
+        let n = rd.count();
+        out.push_str(&format!(
+            "# HELP donut_open_fds Open file descriptors held by the process.\n\
+             # TYPE donut_open_fds gauge\n\
+             donut_open_fds {n}\n"
+        ));
+    }
+    if let Ok(limits) = std::fs::read_to_string("/proc/self/limits") {
+        if let Some(max) = limits.lines().find_map(|l| {
+            l.strip_prefix("Max open files")?
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+        }) {
+            out.push_str(&format!(
+                "# HELP donut_max_fds Soft RLIMIT_NOFILE (file-descriptor ceiling).\n\
+                 # TYPE donut_max_fds gauge\n\
+                 donut_max_fds {max}\n"
+            ));
+        }
+    }
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(kb) = status.lines().find_map(|l| {
+            l.strip_prefix("VmRSS:")?
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+        }) {
+            let bytes = kb * 1024;
+            out.push_str(&format!(
+                "# HELP donut_resident_memory_bytes Resident set size (RSS) of the process.\n\
+                 # TYPE donut_resident_memory_bytes gauge\n\
+                 donut_resident_memory_bytes {bytes}\n"
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_metrics() -> String {
+    String::new()
+}
+
+/// Holds the active-session gauges up for a tunnel session; both the total
+/// and the per-kind gauge are decremented when the guard drops (any return
+/// path), so a session that never ends shows as a stuck gauge.
 pub struct ActiveGuard {
     metrics: Arc<Metrics>,
+    kind: SessionKind,
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.metrics
             .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .kind_gauge(self.kind)
             .fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -300,6 +396,7 @@ mod tests {
         m.connection_accepted();
         m.connection_accepted();
         let guard = m.tunnel_started();
+        let mux_guard = m.tunnel_started_kind(SessionKind::Mux);
         m.forwarded();
         m.rejected_unauthorized();
         m.blackholed();
@@ -310,8 +407,10 @@ mod tests {
 
         let out = m.render();
         assert!(out.contains("donut_connections_total 2"));
-        assert!(out.contains("donut_active_connections 1"));
-        assert!(out.contains("donut_handshakes_total{result=\"tunnel\"} 1"));
+        assert!(out.contains("donut_active_connections 2"));
+        assert!(out.contains("donut_active_sessions{kind=\"tcp\"} 1"));
+        assert!(out.contains("donut_active_sessions{kind=\"mux\"} 1"));
+        assert!(out.contains("donut_handshakes_total{result=\"tunnel\"} 2"));
         assert!(out.contains("donut_handshakes_total{result=\"forward\"} 1"));
         assert!(out.contains("donut_rejected_unauthorized_total 1"));
         assert!(out.contains("donut_blackhole_total 1"));
@@ -324,6 +423,10 @@ mod tests {
         assert!(out.contains("# TYPE donut_upstream_dial_seconds histogram"));
 
         drop(guard);
-        assert!(m.render().contains("donut_active_connections 0"));
+        drop(mux_guard);
+        let out = m.render();
+        assert!(out.contains("donut_active_connections 0"));
+        assert!(out.contains("donut_active_sessions{kind=\"tcp\"} 0"));
+        assert!(out.contains("donut_active_sessions{kind=\"mux\"} 0"));
     }
 }

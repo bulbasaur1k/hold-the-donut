@@ -136,7 +136,9 @@ fn parse_frame(buf: &mut BytesMut) -> io::Result<Option<Frame>> {
             .join(" ");
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("bad mux meta length {meta_len} (vision-wrapped Mux not un-padded?) head=[{head}]"),
+            format!(
+                "bad mux meta length {meta_len} (vision-wrapped Mux not un-padded?) head=[{head}]"
+            ),
         ));
     }
     if buf.len() < 2 + meta_len {
@@ -149,11 +151,14 @@ fn parse_frame(buf: &mut BytesMut) -> io::Result<Option<Frame>> {
     let mut off = 4;
     let mut target = None;
     // New, or Keep with a UDP network flag, carries network + address.
-    let has_addr = status == STATUS_NEW
-        || (status == STATUS_KEEP && meta.len() > 4 && meta[4] == NET_UDP);
+    let has_addr =
+        status == STATUS_NEW || (status == STATUS_KEEP && meta.len() > 4 && meta[4] == NET_UDP);
     if has_addr {
         if meta.len() < off + 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "mux meta truncated"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mux meta truncated",
+            ));
         }
         off += 1; // network byte
         match read_addr(&meta[off..]) {
@@ -364,7 +369,20 @@ mod tests {
     #[test]
     fn parse_new_udp_frame_roundtrip() {
         // meta: sid=7, status=New, option=Data, network=UDP, port=53, IPv4 8.8.8.8
-        let mut meta = vec![0x00, 0x07, STATUS_NEW, OPTION_DATA, NET_UDP, 0x00, 0x35, 0x01, 8, 8, 8, 8];
+        let mut meta = vec![
+            0x00,
+            0x07,
+            STATUS_NEW,
+            OPTION_DATA,
+            NET_UDP,
+            0x00,
+            0x35,
+            0x01,
+            8,
+            8,
+            8,
+            8,
+        ];
         // New+UDP+Data also carries an 8-byte global id
         meta.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let payload = b"hello-udp";
