@@ -15,12 +15,14 @@
 //! buffer at the splice point is cleanly raw inner-TLS, ready to forward.
 
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use rustls::{ServerConfig, ServerConnection};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 use donut_io::vision_xray::{
     is_complete_record, xtls_padding, FilterState, Unpadder, COMMAND_PADDING_CONTINUE,
@@ -250,6 +252,91 @@ pub async fn tls_plain_relay(
             break;
         }
     }
+    Ok(())
+}
+
+/// Idle timeout for a UDP association (no activity → close), matching how
+/// proxies reap UDP flows so associations don't leak.
+const UDP_IDLE: Duration = Duration::from_secs(120);
+
+/// Pull one length-prefixed VLESS-UDP datagram (`[len:2 BE][payload]`) out of
+/// `buf` if a complete one is buffered.
+fn take_datagram(buf: &mut BytesMut) -> Option<Vec<u8>> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let len = ((buf[0] as usize) << 8) | buf[1] as usize;
+    if buf.len() < 2 + len {
+        return None;
+    }
+    buf.advance(2);
+    Some(buf.split_to(len).to_vec())
+}
+
+enum UdpEvent {
+    Tunnel(io::Result<Vec<u8>>),
+    Sock(io::Result<usize>),
+}
+
+/// Basic VLESS-UDP relay (`Command::Udp`): the inner body is length-prefixed
+/// datagrams (`[len:2][payload]`) to the single `target` from the VLESS request
+/// — Vision never applies to UDP, so this stays inside the outer TLS (no
+/// splice). Bridges those datagrams to a connected UDP socket. `leftover` is
+/// plaintext already read past the VLESS request (start of the UDP body).
+pub async fn vision_udp_relay(
+    mut tunnel: RecordTlsServer,
+    target: SocketAddr,
+    leftover: Vec<u8>,
+    metrics: &Metrics,
+) -> io::Result<()> {
+    let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = UdpSocket::bind(bind).await?;
+    sock.connect(target).await?;
+
+    let mut inbuf = BytesMut::from(&leftover[..]);
+    let mut udpbuf = vec![0u8; 65535];
+    let mut tunnel_done = false;
+
+    loop {
+        // Flush any complete datagrams already buffered → upstream UDP.
+        while let Some(dg) = take_datagram(&mut inbuf) {
+            if !dg.is_empty() {
+                sock.send(&dg).await?;
+                metrics.add_bytes(dg.len() as u64, 0);
+            }
+        }
+        if tunnel_done {
+            break;
+        }
+        let ev = tokio::time::timeout(UDP_IDLE, async {
+            tokio::select! {
+                r = tunnel.read_record() => UdpEvent::Tunnel(r),
+                r = sock.recv(&mut udpbuf) => UdpEvent::Sock(r),
+            }
+        })
+        .await;
+        match ev {
+            Err(_) => break, // idle timeout
+            Ok(UdpEvent::Tunnel(r)) => {
+                let pt = r?;
+                if pt.is_empty() {
+                    tunnel_done = true;
+                } else {
+                    inbuf.extend_from_slice(&pt);
+                }
+            }
+            Ok(UdpEvent::Sock(r)) => {
+                let n = r?;
+                let mut frame = Vec::with_capacity(2 + n);
+                frame.push((n >> 8) as u8);
+                frame.push(n as u8);
+                frame.extend_from_slice(&udpbuf[..n]);
+                tunnel.write_plaintext(&frame).await?;
+                metrics.add_bytes(0, n as u64);
+            }
+        }
+    }
+    let _ = tunnel.shutdown().await;
     Ok(())
 }
 
