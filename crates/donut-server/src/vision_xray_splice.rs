@@ -27,6 +27,8 @@ use donut_io::vision_xray::{
     COMMAND_PADDING_DIRECT, COMMAND_PADDING_END, DEFAULT_SEED,
 };
 
+use crate::metrics::Metrics;
+
 const TLS_APP_DATA_START: [u8; 3] = [0x17, 0x03, 0x03];
 const READ_CHUNK: usize = 16 * 1024;
 
@@ -203,13 +205,19 @@ impl RecordTlsServer {
 /// — used for `flow=none` clients (no Vision/splice) and for self-stealing a
 /// non-VLESS probe to the decoy. Everything stays inside the outer TLS.
 /// `initial_to_target` is any plaintext already read that belongs to `target`.
+/// `metrics` counts proxied bytes when `Some` (the flow=none tunnel path);
+/// pass `None` for decoy/self-steal relays so they don't inflate tunnel bytes.
 pub async fn tls_plain_relay(
     mut tunnel: RecordTlsServer,
     mut target: TcpStream,
     initial_to_target: Vec<u8>,
+    metrics: Option<&Metrics>,
 ) -> io::Result<()> {
     if !initial_to_target.is_empty() {
         target.write_all(&initial_to_target).await?;
+        if let Some(m) = metrics {
+            m.add_bytes(initial_to_target.len() as u64, 0);
+        }
     }
     let mut tunnel_done = false;
     let mut target_done = false;
@@ -224,6 +232,7 @@ pub async fn tls_plain_relay(
                     continue;
                 }
                 target.write_all(&pt).await?;
+                if let Some(m) = metrics { m.add_bytes(pt.len() as u64, 0); }
             }
             r = target.read(&mut buf), if !target_done => {
                 let n = r?;
@@ -233,6 +242,7 @@ pub async fn tls_plain_relay(
                     continue;
                 }
                 tunnel.write_plaintext(&buf[..n]).await?;
+                if let Some(m) = metrics { m.add_bytes(0, n as u64); }
             }
             else => break,
         }
@@ -277,6 +287,7 @@ pub async fn vision_server_splice(
     mut upstream: TcpStream,
     leftover: Vec<u8>,
     uuid: [u8; 16],
+    metrics: &Metrics,
 ) -> io::Result<()> {
     let mut filter = FilterState::default();
 
@@ -299,6 +310,7 @@ pub async fn vision_server_splice(
                 filter.filter(&content);
             }
             upstream.write_all(&content).await?;
+            metrics.add_bytes(content.len() as u64, 0);
         }
         if unp.direct() {
             uplink_spliced = true;
@@ -328,6 +340,7 @@ pub async fn vision_server_splice(
                                 filter.filter(&content);
                             }
                             upstream.write_all(&content).await?;
+                            metrics.add_bytes(content.len() as u64, 0);
                         }
                         if unp.direct() {
                             uplink_spliced = true;
@@ -340,6 +353,7 @@ pub async fn vision_server_splice(
                             continue;
                         }
                         upstream.write_all(&ubuf[..n]).await?;
+                        metrics.add_bytes(n as u64, 0);
                     }
                 }
             }
@@ -351,6 +365,7 @@ pub async fn vision_server_splice(
                     let _ = tunnel.shutdown().await;
                     continue;
                 }
+                metrics.add_bytes(0, n as u64);
                 let chunk = &dbuf[..n];
                 if downlink_spliced {
                     tunnel.write_raw(chunk).await?;
@@ -401,8 +416,11 @@ pub async fn vision_server_splice(
         let (mut tcp, leftover) = tunnel.into_raw();
         if !leftover.is_empty() {
             upstream.write_all(&leftover).await?;
+            metrics.add_bytes(leftover.len() as u64, 0);
         }
-        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut upstream).await;
+        if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut tcp, &mut upstream).await {
+            metrics.add_bytes(up, down);
+        }
         let _ = tcp.shutdown().await;
         let _ = upstream.shutdown().await;
     }

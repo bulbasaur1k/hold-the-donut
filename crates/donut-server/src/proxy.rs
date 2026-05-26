@@ -53,7 +53,7 @@ impl VisionDialect {
     }
 }
 
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, SessErr};
 use crate::veil_server::VeilServer;
 use crate::vision_xray_splice;
 
@@ -550,7 +550,8 @@ async fn handle_xray_vision_session(
                     let probe = buf.to_vec();
                     match TcpStream::connect(d).await {
                         Ok(up) => {
-                            let _ = vision_xray_splice::tls_plain_relay(tunnel, up, probe).await;
+                            // decoy traffic — don't count it as tunnelled bytes
+                            let _ = vision_xray_splice::tls_plain_relay(tunnel, up, probe, None).await;
                         }
                         Err(e) => tracing::trace!(?e, %d, "raw xray decoy connect failed"),
                     }
@@ -578,10 +579,15 @@ async fn handle_xray_vision_session(
     }
     let user_uuid = *request.user.as_bytes();
     let flow = request.flow;
-    let target_endpoint = request.target.ok_or(ProxyError::UnsupportedCommand)?;
-    if !matches!(request.command, Command::Tcp) {
-        return Err(ProxyError::UnsupportedCommand);
-    }
+    // UDP/Mux aren't supported by the freedom outbound — count it (this is the
+    // common "client sent VLESS UDP" case) and drop.
+    let target_endpoint = match request.target {
+        Some(t) if matches!(request.command, Command::Tcp) => t,
+        _ => {
+            metrics.session_error(SessErr::Unsupported);
+            return Err(ProxyError::UnsupportedCommand);
+        }
+    };
     if let "block" | "blackhole" = router.route(&target_endpoint) {
         metrics.blackholed();
         tracing::debug!(target = %target_endpoint, "routing: blackhole — dropping");
@@ -589,7 +595,17 @@ async fn handle_xray_vision_session(
     }
 
     let target_addr = resolve(&resolver, &target_endpoint).await?;
-    let upstream = tokio::net::TcpStream::connect(target_addr).await?;
+    let dial_start = std::time::Instant::now();
+    let upstream = match tokio::net::TcpStream::connect(target_addr).await {
+        Ok(u) => {
+            metrics.observe_dial(dial_start.elapsed());
+            u
+        }
+        Err(e) => {
+            metrics.session_error(SessErr::Dial);
+            return Err(e.into());
+        }
+    };
     let _ = upstream.set_nodelay(true);
 
     // VLESS response prefix — raw, through the outer TLS, before any payload.
@@ -598,22 +614,28 @@ async fn handle_xray_vision_session(
     tunnel.write_plaintext(&response_buf).await?;
 
     let _active = metrics.tunnel_started();
-    match flow {
+    let result = match flow {
         FlowKind::Extended => {
             vision_xray_splice::vision_server_splice(
                 tunnel,
                 upstream,
                 leftover.to_vec(),
                 user_uuid,
+                &metrics,
             )
-            .await?;
+            .await
         }
         // A flow=none client never splices — relay plaintext through the outer TLS.
         FlowKind::None => {
-            vision_xray_splice::tls_plain_relay(tunnel, upstream, leftover.to_vec()).await?;
+            vision_xray_splice::tls_plain_relay(tunnel, upstream, leftover.to_vec(), Some(&metrics))
+                .await
         }
+    };
+    match &result {
+        Ok(()) => metrics.session_ok(),
+        Err(e) => metrics.session_error(SessErr::from_io(e)),
     }
-    Ok(())
+    result.map_err(ProxyError::from)
 }
 
 /// Resolve a target endpoint: IP literals pass through; domains go
@@ -697,6 +719,7 @@ pub async fn run_raw_proxy(
                         }
                     };
                     if let Err(e) = tunnel.handshake().await {
+                        metrics.session_error(SessErr::Tls);
                         tracing::trace!(?e, "raw tls handshake failed (xray path)");
                         return;
                     }
