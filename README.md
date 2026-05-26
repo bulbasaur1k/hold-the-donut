@@ -120,6 +120,20 @@ cargo build --release -p donut-client
 ./target/release/donut-client --config ~/.donut/client.toml   # SOCKS5 127.0.0.1:1080
 ```
 
+### Добавить ещё пользователя
+
+UUID = отдельный credential на устройство (можно отзывать независимо). На VPS
+добавь новый UUID в массив `users` в `/etc/donut/server.toml` и перезапусти:
+
+```sh
+NEW=$(uuidgen)
+sed -i "s#^users = \[\(.*\)\]#users = [\1, \"$NEW\"]#" /etc/donut/server.toml
+systemctl restart donut-server
+# ссылка для нового юзера (на машине сборки):
+cargo run -p donut-tools -- link --uuid "$NEW" --server-addr <DOMAIN>:443 --sni <DOMAIN>
+```
+Отозвать = убрать UUID из `users` + `systemctl restart donut-server`.
+
 ## Структура
 
 Cargo-воркспейс, крейты в `crates/`:
