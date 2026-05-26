@@ -588,7 +588,9 @@ async fn handle_xray_vision_session(
         Response::default().encode(&mut response_buf);
         tunnel.write_plaintext(&response_buf).await?;
         let _active = metrics.tunnel_started();
-        let result = crate::mux::mux_relay(tunnel, leftover.to_vec(), &metrics).await;
+        // flow=vision wraps the Mux stream in Vision padding (e.g. HAPP XUDP).
+        let vision_uuid = matches!(flow, FlowKind::Extended).then_some(user_uuid);
+        let result = crate::mux::mux_relay(tunnel, leftover.to_vec(), &metrics, vision_uuid).await;
         match &result {
             Ok(()) => metrics.session_ok(),
             Err(e) => metrics.session_error(SessErr::from_io(e)),
@@ -599,8 +601,13 @@ async fn handle_xray_vision_session(
     // TCP and UDP both carry a target; a missing target we don't serve.
     let target_endpoint = match (request.target, command) {
         (Some(t), Command::Tcp) | (Some(t), Command::Udp) => t,
-        _ => {
+        (target, cmd) => {
             metrics.session_error(SessErr::Unsupported);
+            tracing::debug!(
+                command = ?cmd,
+                has_target = target.is_some(),
+                "vless: unsupported command — dropping (only Tcp/Udp/Mux are served)"
+            );
             return Err(ProxyError::UnsupportedCommand);
         }
     };
@@ -710,9 +717,11 @@ pub async fn run_raw_proxy(
     .with_no_client_auth()
     .with_single_cert(cert_chain, key)
     .map_err(|e| ProxyError::Tls(e.to_string()))?;
-    // Offer http/1.1 so a probing browser negotiates a protocol the decoy
-    // (filebrowser, HTTP/1.1) can answer; our own client offers the same.
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // Offer h2 + http/1.1 like a real HTTPS site: matches what clients/browsers
+    // expect and avoids NoApplicationProtocol handshake failures for peers
+    // negotiating h2. (The decoy is http/1.1; an h2 probe to it is an accepted
+    // edge case — the tunnel itself doesn't depend on the negotiated ALPN.)
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let tls_config = Arc::new(tls);
     let acceptor = TlsAcceptor::from(tls_config.clone());
 
@@ -721,7 +730,7 @@ pub async fn run_raw_proxy(
 
     tokio::spawn(async move {
         loop {
-            let (tcp, _peer) = match listener.accept().await {
+            let (tcp, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(?e, "raw accept error");
@@ -752,21 +761,24 @@ pub async fn run_raw_proxy(
                     };
                     if let Err(e) = tunnel.handshake().await {
                         metrics.session_error(SessErr::Tls);
-                        tracing::trace!(?e, "raw tls handshake failed (xray path)");
+                        // Most failures here are probes/scanners (old TLS1.2,
+                        // missing extensions, mismatched ALPN); a real client's
+                        // peer here means a config mismatch worth chasing.
+                        tracing::debug!(%peer, ?e, "raw tls handshake failed (xray path)");
                         return;
                     }
                     if let Err(e) =
                         handle_xray_vision_session(tunnel, decoy, auth, router, resolver, metrics)
                             .await
                     {
-                        tracing::trace!(?e, "raw xray-vision session ended with error");
+                        tracing::debug!(%peer, ?e, "raw xray-vision session ended with error");
                     }
                     return;
                 }
                 let mut tls = match acceptor.accept(tcp).await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::trace!(?e, "raw tls handshake failed");
+                        tracing::debug!(%peer, ?e, "raw tls handshake failed");
                         return;
                     }
                 };
