@@ -115,7 +115,39 @@ UserUUID = the VLESS user's 16-byte UUID
   Carries the inner ServerHello → this is where the server's filter detects TLS 1.3
   and emits `CommandPaddingDirect` to splice.
 
-## Interop status (vs real Xray 26.5.9) — debugging notes
+## Interop status (vs real Xray 26.5.9) — RESOLVED ✅ (2026-05-26)
+
+**Faithful raw splice implemented and verified.** A real Xray 26.5.9 client
+(`flow: xtls-rprx-vision`, `network: tcp`, `security: tls`) now works end-to-end
+against our `raw` + `vision:"xray"` server, both directions, any size:
+- ✅ HTTPS GET — HTTP 200, byte-exact body (downlink splice).
+- ✅ 5 MB bulk download — exact SHA-256 (raw `copy_bidirectional`).
+- ✅ 3 MB POST upload — upstream receives exact bytes/SHA (this exercises the
+  client's *uplink* splice → raw inner-TLS that the no-splice workaround would
+  have choked on).
+- ✅ plaintext HTTP through the tunnel — still relays via Continue padding (no
+  splice, non-TLS inner).
+
+Implementation (`crates/donut-server/src/vision_xray_splice.rs`, wired from
+`run_raw_proxy` → `handle_xray_vision_session`):
+- `RecordTlsServer` drives `rustls::ServerConnection` manually **one outer-TLS
+  record at a time** (parse the 5-byte plaintext header → feed exactly that
+  record), so rustls never over-reads past the Direct record.
+- `vision_server_splice` is a single `select!` task: uplink `Unpadder`, downlink
+  `xtls_padding`/`FilterState`. When a direction hits `CommandPaddingDirect` it
+  switches to the **raw TCP socket** (bypassing rustls). Once *both* directions
+  splice, it hands off to `tokio::io::copy_bidirectional` on the raw socket
+  (full-duplex + the XTLS no-double-encryption win). The leftover `inbuf` at the
+  splice is already-read raw inner-TLS and is forwarded before the handoff.
+- No modification to the vendored rustls fork (`crates/donut-tls`) was needed —
+  the public `read_tls`/`process_new_packets`/`reader`/`writer`/`write_tls` API
+  plus record-boundary feeding is enough.
+
+Below: the original debugging notes that led here (kept for the record).
+
+---
+
+## Interop debugging notes (historical — how the root cause was found)
 
 Tested: `teddysun/xray` client (`vless` + `network: tcp` + `tls` allowInsecure
 + `flow: xtls-rprx-vision`) → local `donut-server` `transport: raw`,
@@ -132,21 +164,48 @@ What works ✅
   +`17 03 03`(Finished) → `17 03 03`(appdata); downlink `16 03 03 .. 02`
   (ServerHello flight) → `17 03 03`(appdata).
 
-What's broken ❌ (the only remaining bug)
-- **HTTPS resets post-splice** (`curl` rc=56, no response). It is isolated
-  to the **raw-splice data phase** (after `CommandPaddingDirect`): the
-  padding relay is fine (HTTP works), the handshake is byte-exact and the
-  splice negotiates, but the inner TLS doesn't complete. Suspect a
-  drop/dup/ordering byte in the raw passthrough that the head logs don't
-  reveal. `try_join!`→`join!` did **not** fix it (so it's not premature
-  cancellation).
+ROOT CAUSE (confirmed 2026-05-26) ✅ — outer-TLS double-encryption, NOT a lost byte
+- The earlier "drop/dup byte in raw passthrough" hypothesis was **wrong**.
+- **XTLS Vision's splice bypasses the outer TLS layer.** `UnwrapRawConn`
+  (xray `proxy/proxy.go:690-700`) unwraps `tls.Conn`/`tls.UConn`/`reality.Conn`
+  down to the **raw TCP** socket. After `CommandPaddingDirect`, the real Xray
+  client (and server) stop using the outer TLS and read/write the *raw* TCP —
+  the inner TLS records flow as-is, with no outer re-encryption (the whole
+  point of "X"TLS: avoid TLS-in-TLS double encryption).
+- Our `donut-server` terminates the outer TLS with **rustls** and keeps
+  writing through it after the splice. So post-splice the client reads raw
+  TCP expecting bare inner-TLS records, but we send rustls-encrypted bytes →
+  the client's inner TLS sees garbage → `curl` rc=56.
 
-Next debugging step
-- Byte-level diff of the raw phase: point the donut upstream at a **local,
-  inspectable** inner-TLS target (or pcap) instead of opaque Cloudflare, and
-  compare the exact bytes our server relays vs a direct connection — find the
-  lost/extra byte at/after the Direct transition. Check the `Unpadder`
-  leftover handling and the downlink `direct` branch around the transition.
+Bisection that proved it (repro `/tmp/donut-interop`, local inspectable
+TLS upstream `upstream.py` on `127.0.0.1:9443`, body_len=2030):
+- **uplink is intact**: the local upstream logged the full `GET /` — the inner
+  handshake completed and the request reached upstream. The request fits
+  entirely in the padded phase (before the Direct block), so the client's own
+  uplink splice (which it does independently once it detects inner TLS 1.3)
+  has nothing left to send → no raw uplink bytes to choke our rustls.
+- **downlink breaks**: ServerHello flight + first app-data went out in
+  Continue/Direct padded blocks (through the outer TLS, client still reading
+  via TLS), but the response body (`read=2233`, `direct=true`) is written
+  through rustls while the client now reads raw TCP → mismatch.
+- **Positive confirmation**: temporarily forcing `CommandPaddingEnd` instead of
+  `Direct` on the downlink (so the client never splices the downlink, keeps
+  reading through the outer TLS) makes HTTPS work end-to-end: HTTP 200, exact
+  2030-byte body. (This is the "no-splice" workaround — see below.)
+
+Fix options that were weighed (the faithful one was chosen & shipped — see the
+RESOLVED section above):
+- **No-splice workaround** (send `End`, never `Direct`): ~10 lines, fixes the
+  downlink, works for typical browsing. But it double-encrypts and **breaks
+  large uploads** — the client splices its *uplink* on its own (driven by its
+  own `EnableXtls` from filtering our ServerHello, independent of what we
+  send), and post-splice raw uplink bytes choke our rustls. Not byte-faithful.
+  **Rejected**: the goal is off-the-shelf App Store clients (HAPP), which need
+  full interop, not just browsing.
+- **Faithful raw splice** — **CHOSEN & implemented.** At `CommandPaddingDirect`,
+  switch both directions to the **raw TCP socket**, bypassing rustls. Done
+  without modifying the vendored rustls fork by driving
+  `rustls::ServerConnection` one outer-TLS record at a time.
 
 ## Byte-stream adaptation notes (Rust port)
 

@@ -15,6 +15,7 @@ pub mod metrics;
 mod proxy;
 mod selfsteal;
 mod veil_server;
+mod vision_xray_splice;
 
 pub use metrics::Metrics;
 pub use proxy::{

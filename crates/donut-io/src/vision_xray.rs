@@ -7,18 +7,12 @@
 //! state machines). The stream orchestration that wires it into the RAW
 //! transport lives alongside (`VisionStream`).
 
-#![allow(dead_code)] // wired into the raw transport in a follow-up step
-
-use std::sync::{Arc, Mutex};
-
 use rand::Rng;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const COMMAND_PADDING_CONTINUE: u8 = 0x00;
 pub const COMMAND_PADDING_END: u8 = 0x01;
 pub const COMMAND_PADDING_DIRECT: u8 = 0x02;
 
-const TLS_APP_DATA_START: [u8; 3] = [0x17, 0x03, 0x03];
 const TLS_SERVER_HS_START: [u8; 3] = [0x16, 0x03, 0x03];
 const TLS_CLIENT_HS_START: [u8; 2] = [0x16, 0x03];
 const TLS13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
@@ -261,14 +255,6 @@ impl FilterState {
     }
 }
 
-fn hex16(b: &[u8]) -> String {
-    b.iter()
-        .take(16)
-        .map(|x| format!("{x:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
@@ -295,109 +281,11 @@ pub fn is_complete_record(mut b: &[u8]) -> bool {
     true
 }
 
-/// Server-side faithful Vision data-plane (RAW inbound). Bridges the
-/// Vision-framed `tunnel` (donut↔Xray) to the plaintext `upstream`:
-/// - **uplink** (client→server): un-pads via [`Unpadder`], filters the inner
-///   ClientHello, writes plaintext to `upstream`.
-/// - **downlink** (server→client): pads upstream bytes (UUID-prefixed first
-///   block), filters the inner ServerHello → on inner TLS 1.3 it emits
-///   `CommandPaddingDirect` and splices raw.
-///
-/// `uuid` is the authenticated VLESS user (`TrafficState.UserUUID`). Call
-/// **after** the VLESS request is read and the VLESS response prefix written
-/// (both raw, outside Vision).
-pub async fn vision_server_copy<T, U>(tunnel: T, upstream: U, uuid: [u8; 16]) -> std::io::Result<()>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut tr, mut tw) = tokio::io::split(tunnel);
-    let (mut ur, mut uw) = tokio::io::split(upstream);
-    let shared = Arc::new(Mutex::new(FilterState::default()));
-
-    // uplink: tunnel (padded by client) -> unpad + filter -> upstream
-    let s_up = shared.clone();
-    let uplink = async move {
-        let mut unp = Unpadder::new(uuid);
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            let n = tr.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            let content = unp.push(&buf[..n]);
-            tracing::debug!(read = n, content = content.len(), direct = unp.direct(),
-                head = %hex16(&content), "vision uplink -> upstream");
-            if !content.is_empty() {
-                {
-                    let mut f = s_up.lock().expect("vision filter lock");
-                    if f.number_to_filter > 0 {
-                        f.filter(&content);
-                    }
-                }
-                uw.write_all(&content).await?;
-            }
-        }
-        let _ = uw.shutdown().await;
-        Ok::<(), std::io::Error>(())
-    };
-
-    // downlink: upstream -> pad (UUID first) + filter (ServerHello -> Direct) -> tunnel
-    let s_down = shared.clone();
-    let downlink = async move {
-        let mut uuid_once = Some(uuid);
-        let mut is_padding = true;
-        let mut direct = false;
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            let n = ur.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            let chunk = &buf[..n];
-            tracing::debug!(read = n, direct, head = %hex16(chunk), "vision downlink <- upstream");
-            if direct {
-                tw.write_all(chunk).await?;
-                continue;
-            }
-            let (is_tls, enable_xtls) = {
-                let mut f = s_down.lock().expect("vision filter lock");
-                if f.number_to_filter > 0 {
-                    f.filter(chunk);
-                }
-                (f.is_tls, f.enable_xtls)
-            };
-            if is_padding {
-                let app_data = is_tls
-                    && chunk.len() >= 6
-                    && chunk.starts_with(&TLS_APP_DATA_START)
-                    && is_complete_record(chunk);
-                let command = if app_data {
-                    is_padding = false;
-                    if enable_xtls {
-                        direct = true;
-                        COMMAND_PADDING_DIRECT
-                    } else {
-                        COMMAND_PADDING_END
-                    }
-                } else {
-                    COMMAND_PADDING_CONTINUE
-                };
-                let block = xtls_padding(chunk, command, &mut uuid_once, is_tls, &DEFAULT_SEED);
-                tw.write_all(&block).await?;
-            } else {
-                tw.write_all(chunk).await?;
-            }
-        }
-        let _ = tw.shutdown().await;
-        Ok::<(), std::io::Error>(())
-    };
-
-    // join (not try_join): a half-close / error on one direction must not
-    // cancel the other mid-flight, or the peer sees a premature reset.
-    let (_up, _down) = tokio::join!(uplink, downlink);
-    Ok(())
-}
+// The server-side data-plane that wires these primitives into the `raw`
+// transport — including the faithful raw-socket splice after
+// `CommandPaddingDirect` — lives in `donut-server` (`vision_xray_splice`),
+// because it needs the rustls server connection and the TCP socket, neither of
+// which `donut-io` depends on. This module stays I/O-light: just the codec.
 
 #[cfg(test)]
 mod tests {
@@ -445,6 +333,41 @@ mod tests {
         assert_eq!(got, b"first-secondRAWTAIL");
         assert!(un.finished());
         assert!(un.direct());
+    }
+
+    /// Regression for xray-core #5961 (`panic: slice bounds out of range` in
+    /// XtlsPadding/Unpadding when a block header declares a content/padding
+    /// length larger than the bytes actually delivered). Our [`Unpadder`]
+    /// consumes `min(declared_remaining, available)` per `push`, so a lying or
+    /// truncated header must never panic — it just streams what's there and
+    /// waits for the rest.
+    #[test]
+    fn unpadder_never_panics_on_oversized_declared_lengths() {
+        let uuid = [3u8; 16];
+        // Hand-craft a first block: [uuid][cmd=Continue][contentLen=0xFFFF]
+        // [padLen=0xFFFF] but then only a few content bytes — far fewer than
+        // the header claims.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&uuid);
+        wire.push(COMMAND_PADDING_CONTINUE);
+        wire.extend_from_slice(&[0xFF, 0xFF]); // contentLen = 65535
+        wire.extend_from_slice(&[0xFF, 0xFF]); // padLen = 65535
+        wire.extend_from_slice(b"only-a-little"); // 13 bytes, not 65535
+
+        let mut un = Unpadder::new(uuid);
+        // Feed byte-by-byte (worst-case fragmentation): must not panic.
+        let mut out = Vec::new();
+        for chunk in wire.chunks(1) {
+            out.extend(un.push(chunk));
+        }
+        // It emits exactly the content bytes that arrived, still expecting more.
+        assert_eq!(out, b"only-a-little");
+        assert!(!un.finished(), "block not complete — header promised more");
+
+        // A non-Vision stream (no UUID prefix) must pass through, not panic.
+        let mut un2 = Unpadder::new([1u8; 16]);
+        let pass = un2.push(&[2u8; 64]); // 64 bytes, first 16 != uuid
+        assert_eq!(pass, vec![2u8; 64]);
     }
 
     #[test]

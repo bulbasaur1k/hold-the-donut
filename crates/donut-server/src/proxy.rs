@@ -55,6 +55,7 @@ impl VisionDialect {
 
 use crate::metrics::Metrics;
 use crate::veil_server::VeilServer;
+use crate::vision_xray_splice;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -433,7 +434,6 @@ where
     };
     let (request, leftover) = request;
     let flow = request.flow;
-    let user_uuid = *request.user.as_bytes();
 
     // Credential check — the real VLESS auth. This is the single choke
     // point every transport funnels through, so an unknown UUID is
@@ -467,6 +467,7 @@ where
 
     let target_addr = resolve(&resolver, &target_endpoint).await?;
     let mut upstream = tokio::net::TcpStream::connect(target_addr).await?;
+    let _ = upstream.set_nodelay(true);
 
     // Echo the response prefix back to the client so it can verify
     // the version byte and addons-len before payload starts.
@@ -481,14 +482,12 @@ where
         FlowKind::Extended => {
             let tunnel = Prefixed::new(leftover.to_vec(), session);
             match vision_dialect {
-                // Byte-faithful Xray Vision — interop with a real Xray client.
-                VisionDialect::Xray => {
-                    if let Err(e) =
-                        donut_io::vision_xray::vision_server_copy(tunnel, upstream, user_uuid).await
-                    {
-                        tracing::trace!(?e, "xray-vision session ended with error");
-                    }
-                }
+                // Faithful Xray Vision needs raw-socket splice, so it runs on a
+                // manually-driven TLS conn (handle_xray_vision_session) and is
+                // routed there before reaching this opaque-stream path.
+                VisionDialect::Xray => unreachable!(
+                    "vision:xray is handled by handle_xray_vision_session before handle_session"
+                ),
                 // donut's own simpler padding (donut-client ↔ donut-server).
                 VisionDialect::Donut => {
                     if let Err(e) = donut_io::vision::copy_bidirectional(
@@ -515,6 +514,103 @@ where
             }
             let _ = upstream.shutdown().await;
             let _ = session.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+/// Faithful Xray-Vision session over a manually-driven outer-TLS connection
+/// (`vision: "xray"`). Unlike [`handle_session`] (which copies through an
+/// opaque TLS stream), this owns the rustls session so the Vision data phase
+/// can splice to the raw TCP socket — exactly what a real Xray client does
+/// after `CommandPaddingDirect`, bypassing the outer TLS to avoid double
+/// encryption. See [`crate::vision_xray_splice`].
+async fn handle_xray_vision_session(
+    mut tunnel: vision_xray_splice::RecordTlsServer,
+    decoy: Option<SocketAddr>,
+    auth: Arc<UserAuth>,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+) -> Result<(), ProxyError> {
+    // Accumulate decrypted plaintext until the VLESS request header decodes.
+    let mut buf = BytesMut::with_capacity(512);
+    let (request, leftover) = loop {
+        let pt = tunnel.read_record().await?;
+        if pt.is_empty() {
+            return Ok(()); // EOF before a full request
+        }
+        buf.extend_from_slice(&pt);
+        // Triage: a first byte that isn't the VLESS version is a probe/browser
+        // → self-steal the (decrypted) bytes to the decoy over the outer TLS.
+        if buf[0] != VLESS_VERSION {
+            return match decoy {
+                Some(d) => {
+                    metrics.forwarded();
+                    let probe = buf.to_vec();
+                    match TcpStream::connect(d).await {
+                        Ok(up) => {
+                            let _ = vision_xray_splice::tls_plain_relay(tunnel, up, probe).await;
+                        }
+                        Err(e) => tracing::trace!(?e, %d, "raw xray decoy connect failed"),
+                    }
+                    Ok(())
+                }
+                None => Ok(()),
+            };
+        }
+        let mut view = buf.clone().freeze();
+        match Request::decode(&mut view) {
+            Ok(req) => {
+                let consumed = buf.len() - view.len();
+                let leftover = buf.split_off(consumed).freeze();
+                break (req, leftover);
+            }
+            Err(WireError::Truncated { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    if !auth.is_authorized(&request.user) {
+        metrics.rejected_unauthorized();
+        tracing::debug!(user = %request.user, "vless auth: unknown UUID — dropping session");
+        return Ok(());
+    }
+    let user_uuid = *request.user.as_bytes();
+    let flow = request.flow;
+    let target_endpoint = request.target.ok_or(ProxyError::UnsupportedCommand)?;
+    if !matches!(request.command, Command::Tcp) {
+        return Err(ProxyError::UnsupportedCommand);
+    }
+    if let "block" | "blackhole" = router.route(&target_endpoint) {
+        metrics.blackholed();
+        tracing::debug!(target = %target_endpoint, "routing: blackhole — dropping");
+        return Ok(());
+    }
+
+    let target_addr = resolve(&resolver, &target_endpoint).await?;
+    let upstream = tokio::net::TcpStream::connect(target_addr).await?;
+    let _ = upstream.set_nodelay(true);
+
+    // VLESS response prefix — raw, through the outer TLS, before any payload.
+    let mut response_buf = BytesMut::with_capacity(8);
+    Response::default().encode(&mut response_buf);
+    tunnel.write_plaintext(&response_buf).await?;
+
+    let _active = metrics.tunnel_started();
+    match flow {
+        FlowKind::Extended => {
+            vision_xray_splice::vision_server_splice(
+                tunnel,
+                upstream,
+                leftover.to_vec(),
+                user_uuid,
+            )
+            .await?;
+        }
+        // A flow=none client never splices — relay plaintext through the outer TLS.
+        FlowKind::None => {
+            vision_xray_splice::tls_plain_relay(tunnel, upstream, leftover.to_vec()).await?;
         }
     }
     Ok(())
@@ -563,7 +659,8 @@ pub async fn run_raw_proxy(
     // Offer http/1.1 so a probing browser negotiates a protocol the decoy
     // (filebrowser, HTTP/1.1) can answer; our own client offers the same.
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let acceptor = TlsAcceptor::from(Arc::new(tls));
+    let tls_config = Arc::new(tls);
+    let acceptor = TlsAcceptor::from(tls_config.clone());
 
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
@@ -577,13 +674,40 @@ pub async fn run_raw_proxy(
                     continue;
                 }
             };
+            // Disable Nagle: Vision rides interactive, small TLS records, and
+            // after the splice it's a raw relay — buffering hurts latency.
+            let _ = tcp.set_nodelay(true);
             let acceptor = acceptor.clone();
+            let tls_config = tls_config.clone();
             let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
+                // Faithful Xray Vision needs to splice to the raw socket after
+                // CommandPaddingDirect, so it drives rustls manually instead of
+                // copying through an opaque TLS stream.
+                if vision_dialect == VisionDialect::Xray {
+                    let mut tunnel = match vision_xray_splice::RecordTlsServer::new(tcp, tls_config) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::trace!(?e, "raw: rustls server-conn init failed");
+                            return;
+                        }
+                    };
+                    if let Err(e) = tunnel.handshake().await {
+                        tracing::trace!(?e, "raw tls handshake failed (xray path)");
+                        return;
+                    }
+                    if let Err(e) =
+                        handle_xray_vision_session(tunnel, decoy, auth, router, resolver, metrics)
+                            .await
+                    {
+                        tracing::trace!(?e, "raw xray-vision session ended with error");
+                    }
+                    return;
+                }
                 let mut tls = match acceptor.accept(tcp).await {
                     Ok(s) => s,
                     Err(e) => {
