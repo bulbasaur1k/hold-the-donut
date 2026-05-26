@@ -32,6 +32,27 @@ use tokio_rustls::TlsAcceptor;
 /// non-tunnel (probe / browser) connection and self-stolen to the decoy.
 const VLESS_VERSION: u8 = 0x00;
 
+/// Which `xtls-rprx-vision` data-plane to speak for `flow=Extended`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisionDialect {
+    /// donut's own simpler padding (donut-client ↔ donut-server).
+    #[default]
+    Donut,
+    /// Byte-faithful Xray Vision — interoperates with a real Xray client.
+    Xray,
+}
+
+impl VisionDialect {
+    /// Parse the config string (`"donut"` default / `"xray"`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "donut" | "" => Some(Self::Donut),
+            "xray" => Some(Self::Xray),
+            _ => None,
+        }
+    }
+}
+
 use crate::metrics::Metrics;
 use crate::veil_server::VeilServer;
 
@@ -86,7 +107,7 @@ pub async fn run_carrier_proxy(
             let metrics = metrics.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_session(session.stream, auth, router, resolver, metrics).await
+                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
                 {
                     tracing::trace!(?e, "proxy session ended with error");
                 }
@@ -141,7 +162,7 @@ pub async fn run_carrier_backend(
             tokio::spawn(async move {
                 let _active = metrics.tunnel_started();
                 if let Err(e) =
-                    handle_session(session.stream, auth, router, resolver, metrics).await
+                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
                 {
                     tracing::trace!(?e, "carrier backend session ended with error");
                 }
@@ -184,7 +205,7 @@ pub async fn run_quic_proxy(
             tokio::spawn(async move {
                 let _active = metrics.tunnel_started();
                 if let Err(e) =
-                    handle_session(session.stream, auth, router, resolver, metrics).await
+                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
                 {
                     tracing::trace!(?e, "quic proxy session ended with error");
                 }
@@ -256,7 +277,7 @@ pub async fn run_tls_carrier_proxy(
                 tokio::spawn(async move {
                     let _active = metrics.tunnel_started();
                     if let Err(e) =
-                        handle_session(session.stream, auth, router, resolver, metrics).await
+                        handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
                     {
                         tracing::trace!(?e, "tls-carrier session ended with error");
                     }
@@ -354,7 +375,7 @@ pub async fn run_veil_proxy(
                             let metrics = metrics.clone();
                             tokio::spawn(async move {
                                 if let Err(e) =
-                                    handle_session(session.stream, auth, router, resolver, metrics)
+                                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics)
                                         .await
                                 {
                                     tracing::trace!(?e, "veil proxy session ended with error");
@@ -380,6 +401,7 @@ pub async fn run_veil_proxy(
 async fn handle_session<S>(
     mut session: S,
     auth: Arc<UserAuth>,
+    vision_dialect: VisionDialect,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -411,6 +433,7 @@ where
     };
     let (request, leftover) = request;
     let flow = request.flow;
+    let user_uuid = *request.user.as_bytes();
 
     // Credential check — the real VLESS auth. This is the single choke
     // point every transport funnels through, so an unknown UUID is
@@ -457,14 +480,27 @@ where
         // packet — replay them into the Vision decoder.
         FlowKind::Extended => {
             let tunnel = Prefixed::new(leftover.to_vec(), session);
-            if let Err(e) = donut_io::vision::copy_bidirectional(
-                tunnel,
-                upstream,
-                donut_io::vision::VisionConfig::default(),
-            )
-            .await
-            {
-                tracing::trace!(?e, "vision session ended with error");
+            match vision_dialect {
+                // Byte-faithful Xray Vision — interop with a real Xray client.
+                VisionDialect::Xray => {
+                    if let Err(e) =
+                        donut_io::vision_xray::vision_server_copy(tunnel, upstream, user_uuid).await
+                    {
+                        tracing::trace!(?e, "xray-vision session ended with error");
+                    }
+                }
+                // donut's own simpler padding (donut-client ↔ donut-server).
+                VisionDialect::Donut => {
+                    if let Err(e) = donut_io::vision::copy_bidirectional(
+                        tunnel,
+                        upstream,
+                        donut_io::vision::VisionConfig::default(),
+                    )
+                    .await
+                    {
+                        tracing::trace!(?e, "vision session ended with error");
+                    }
+                }
             }
         }
         // Plain VLESS: raw bidirectional copy. Push any leftover client
@@ -510,6 +546,7 @@ pub async fn run_raw_proxy(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     decoy: Option<SocketAddr>,
+    vision_dialect: VisionDialect,
     auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
@@ -563,7 +600,9 @@ pub async fn run_raw_proxy(
                 if first[0] == VLESS_VERSION {
                     let stream = Prefixed::new(vec![first[0]], tls);
                     let _active = metrics.tunnel_started();
-                    if let Err(e) = handle_session(stream, auth, router, resolver, metrics).await {
+                    if let Err(e) =
+                        handle_session(stream, auth, vision_dialect, router, resolver, metrics).await
+                    {
                         tracing::trace!(?e, "raw proxy session ended with error");
                     }
                 } else if let Some(decoy) = decoy {

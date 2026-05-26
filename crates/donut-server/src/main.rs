@@ -146,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
         "raw" => {
             let cert_chain = cfg.inbound.cert_chain()?;
             let key = cfg.inbound.private_key_pem()?;
+            let vision = donut_server::VisionDialect::parse(&cfg.inbound.vision)
+                .with_context(|| format!("unknown inbound.vision {:?}", cfg.inbound.vision))?;
             let decoy: Option<SocketAddr> = match cfg.inbound.dest.as_deref() {
                 Some(d) => Some(
                     d.parse()
@@ -154,11 +156,11 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let bound = donut_server::run_raw_proxy(
-                listen, cert_chain, key, decoy, auth, router, resolver, metrics,
+                listen, cert_chain, key, decoy, vision, auth, router, resolver, metrics,
             )
             .await
             .context("starting raw proxy")?;
-            tracing::info!(%bound, ?decoy, "donut-server listening (RAW VLESS over TLS, cert-based, self-steal)");
+            tracing::info!(%bound, ?vision, ?decoy, "donut-server listening (RAW VLESS over TLS, cert-based, self-steal)");
         }
         // REALITY veiled-TLS front door + selfsteal forward to `dest`.
         "veil" => {
