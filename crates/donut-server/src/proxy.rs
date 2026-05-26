@@ -101,6 +101,7 @@ pub async fn run_carrier_proxy(bind_addr: SocketAddr) -> Result<SocketAddr, Prox
 pub async fn run_carrier_backend(
     bind_addr: SocketAddr,
     path_prefix: String,
+    mode: donut_carrier::Mode,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -108,10 +109,15 @@ pub async fn run_carrier_backend(
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
 
+    // `Server::serve` owns a single shared dispatcher across all accepted
+    // connections, so `stream-up`/`packet-up` pair the uplink POST and
+    // downlink GET that a reverse proxy / CDN forwards as separate
+    // backend connections (closes the Go-reverse-proxy full-duplex
+    // deadlock that blocks `stream-one` behind Caddy/CDN).
     let mut server = donut_carrier::server::Server::serve(
         listener,
         donut_carrier::ServerConfig {
-            mode: donut_carrier::Mode::StreamOne,
+            mode,
             path_prefix,
             ..donut_carrier::ServerConfig::default()
         },

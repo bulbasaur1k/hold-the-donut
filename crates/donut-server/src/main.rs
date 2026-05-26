@@ -53,11 +53,19 @@ async fn main() -> anyhow::Result<()> {
         // does self-steal; only the secret path reaches us.
         "carrier" => {
             let path = cfg.inbound.path.clone();
-            let bound =
-                donut_server::run_carrier_backend(listen, path.clone(), router, resolver, metrics)
-                    .await
-                    .context("starting carrier backend")?;
-            tracing::info!(%bound, %path, "donut-server listening (carrier backend, cert-based, no REALITY)");
+            let mode = donut_carrier::Mode::parse(&cfg.inbound.mode)
+                .with_context(|| format!("unknown inbound.mode {:?}", cfg.inbound.mode))?;
+            let bound = donut_server::run_carrier_backend(
+                listen,
+                path.clone(),
+                mode,
+                router,
+                resolver,
+                metrics,
+            )
+            .await
+            .context("starting carrier backend")?;
+            tracing::info!(%bound, %path, ?mode, "donut-server listening (carrier backend, cert-based, no REALITY)");
         }
         // Direct QUIC / HTTP-3 termination with a real certificate (no
         // reverse proxy in front). For direct-H3 cases / exercising the
