@@ -154,8 +154,7 @@ pub fn cmd_import(args: ImportArgs) -> anyhow::Result<()> {
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(&out_path, &rendered)
-        .with_context(|| format!("writing {out_path}"))?;
+    std::fs::write(&out_path, &rendered).with_context(|| format!("writing {out_path}"))?;
 
     eprintln!("✓ wrote {out_path}");
     if !args.no_ru_direct {

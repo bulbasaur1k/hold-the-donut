@@ -254,7 +254,10 @@ async fn raw_self_steal() {
         }
     }
     let text = String::from_utf8_lossy(&resp);
-    assert!(text.contains("DECOY-SITE"), "raw self-steal must reach decoy, got: {text}");
+    assert!(
+        text.contains("DECOY-SITE"),
+        "raw self-steal must reach decoy, got: {text}"
+    );
 }
 
 /// A protocol-conformant VLESS frame carrying a UUID that is **not** in

@@ -225,8 +225,7 @@ impl FilterState {
         if b.len() >= 6 {
             let starts = &b[..6];
             if starts[..3] == TLS_SERVER_HS_START && starts[5] == TLS_HS_TYPE_SERVER_HELLO {
-                self.remaining_server_hello =
-                    ((starts[3] as i32) << 8 | starts[4] as i32) + 5;
+                self.remaining_server_hello = ((starts[3] as i32) << 8 | starts[4] as i32) + 5;
                 self.is_tls12_or_above = true;
                 self.is_tls = true;
                 if b.len() >= 79 && self.remaining_server_hello >= 79 {
@@ -320,8 +319,20 @@ mod tests {
         let uuid = [9u8; 16];
         let mut once = Some(uuid);
         let mut wire = Vec::new();
-        wire.extend(xtls_padding(b"first-", COMMAND_PADDING_CONTINUE, &mut once, true, &DEFAULT_SEED));
-        wire.extend(xtls_padding(b"second", COMMAND_PADDING_DIRECT, &mut once, false, &DEFAULT_SEED));
+        wire.extend(xtls_padding(
+            b"first-",
+            COMMAND_PADDING_CONTINUE,
+            &mut once,
+            true,
+            &DEFAULT_SEED,
+        ));
+        wire.extend(xtls_padding(
+            b"second",
+            COMMAND_PADDING_DIRECT,
+            &mut once,
+            false,
+            &DEFAULT_SEED,
+        ));
         // trailing raw bytes after the Direct block (post-Vision splice phase)
         wire.extend_from_slice(b"RAWTAIL");
 
