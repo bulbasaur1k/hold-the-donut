@@ -251,7 +251,6 @@ pub async fn mux_relay(
     let mut inbuf = BytesMut::from(&devision(&mut unp, &leftover)[..]);
     let mut sessions: HashMap<u16, UdpSession> = HashMap::new();
     let (resp_tx, mut resp_rx) = mpsc::channel::<(u16, SocketAddr, Vec<u8>)>(512);
-    let mut tunnel_done = false;
 
     loop {
         // Drain all complete frames currently buffered.
@@ -317,13 +316,9 @@ pub async fn mux_relay(
             }
         }
 
-        if tunnel_done && sessions.is_empty() {
-            break;
-        }
-
         let ev = tokio::time::timeout(MUX_IDLE, async {
             tokio::select! {
-                r = tunnel.read_record() => Some(Ev::Tunnel(r)),
+                r = tunnel.read_record_opt() => Some(Ev::Tunnel(r)),
                 Some(p) = resp_rx.recv() => Some(Ev::Resp(p)),
             }
         })
@@ -332,15 +327,20 @@ pub async fn mux_relay(
         match ev {
             Err(_) => break, // idle timeout
             Ok(None) => break,
-            Ok(Some(Ev::Tunnel(r))) => {
-                let pt = r?;
-                if pt.is_empty() {
-                    tunnel_done = true;
-                } else {
+            Ok(Some(Ev::Tunnel(r))) => match r? {
+                // Carrier EOF: the client closed the whole Mux connection, so
+                // every sub-session is gone (no further END frames will come).
+                // Break and drop `sessions` — their recv tasks abort on drop.
+                // Re-polling a closed tunnel here would return instantly and
+                // spin the loop at 100% CPU for as long as a UDP session lived.
+                None => break,
+                // An outer-TLS record with no application bytes (e.g. a
+                // KeyUpdate) decodes to empty — not EOF; keep relaying.
+                Some(pt) => {
                     let d = devision(&mut unp, &pt);
                     inbuf.extend_from_slice(&d);
                 }
-            }
+            },
             Ok(Some(Ev::Resp((sid, src, data)))) => {
                 let frame = keep_frame(sid, src, &data);
                 tunnel.write_plaintext(&frame).await?;
@@ -353,7 +353,7 @@ pub async fn mux_relay(
 }
 
 enum Ev {
-    Tunnel(io::Result<Vec<u8>>),
+    Tunnel(io::Result<Option<Vec<u8>>>),
     Resp((u16, SocketAddr, Vec<u8>)),
 }
 
