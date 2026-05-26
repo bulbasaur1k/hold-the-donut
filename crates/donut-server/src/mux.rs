@@ -22,12 +22,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
+use donut_io::vision_xray::Unpadder;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::metrics::Metrics;
 use crate::vision_xray_splice::RecordTlsServer;
+
+/// De-pad an inbound chunk: when the Mux stream rides inside Vision
+/// (`flow=xtls-rprx-vision` + XUDP, e.g. HAPP), the client pads the frames, so
+/// we must un-pad before parsing. Without Vision it's a pass-through.
+fn devision(unp: &mut Option<Unpadder>, data: &[u8]) -> Vec<u8> {
+    match unp {
+        Some(u) => u.push(data),
+        None => data.to_vec(),
+    }
+}
 
 const STATUS_NEW: u8 = 0x01;
 const STATUS_KEEP: u8 = 0x02;
@@ -114,7 +125,19 @@ fn parse_frame(buf: &mut BytesMut) -> io::Result<Option<Frame>> {
     }
     let meta_len = ((buf[0] as usize) << 8) | buf[1] as usize;
     if !(4..=512).contains(&meta_len) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad mux meta length"));
+        // Usually means the stream isn't actually plain Mux — most often a
+        // Vision-wrapped Mux we failed to un-pad (see mux_relay vision_uuid).
+        // Include a head dump so the cause is unambiguous in the logs.
+        let head: String = buf
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad mux meta length {meta_len} (vision-wrapped Mux not un-padded?) head=[{head}]"),
+        ));
     }
     if buf.len() < 2 + meta_len {
         return Ok(None);
@@ -219,8 +242,13 @@ pub async fn mux_relay(
     mut tunnel: RecordTlsServer,
     leftover: Vec<u8>,
     metrics: &Metrics,
+    vision_uuid: Option<[u8; 16]>,
 ) -> io::Result<()> {
-    let mut inbuf = BytesMut::from(&leftover[..]);
+    // When the Mux stream is Vision-wrapped (flow=vision + XUDP), un-pad the
+    // uplink; the downlink stays raw (the client's reader passes through
+    // un-prefixed bytes). UDP/Mux never triggers a Vision splice (no inner TLS).
+    let mut unp = vision_uuid.map(Unpadder::new);
+    let mut inbuf = BytesMut::from(&devision(&mut unp, &leftover)[..]);
     let mut sessions: HashMap<u16, UdpSession> = HashMap::new();
     let (resp_tx, mut resp_rx) = mpsc::channel::<(u16, SocketAddr, Vec<u8>)>(512);
     let mut tunnel_done = false;
@@ -309,7 +337,8 @@ pub async fn mux_relay(
                 if pt.is_empty() {
                     tunnel_done = true;
                 } else {
-                    inbuf.extend_from_slice(&pt);
+                    let d = devision(&mut unp, &pt);
+                    inbuf.extend_from_slice(&d);
                 }
             }
             Ok(Some(Ev::Resp((sid, src, data)))) => {
