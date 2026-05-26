@@ -1,9 +1,15 @@
-//! donut-config — JSON config loader for the donut server/client.
+//! donut-config — JSON/TOML config loader for the donut server/client.
 //!
 //! A clean, documented subset shaped after Xray's `inbounds`/`outbounds`/
 //! `log` layout (not byte-for-byte). The loader fully *materialises*
 //! everything the daemons need — parsed x25519 keys, [`donut_core::ShortId`]s,
 //! PEM cert chains / private keys — so the `main.rs` glue stays thin.
+//!
+//! The format is picked by file extension: `*.toml` is parsed as TOML,
+//! everything else as JSON (the same `serde` structs back both). TOML is the
+//! more readable hand-editing format; JSON stays fully supported. The schema
+//! below is shown as JSON; the TOML form is the obvious 1:1 translation
+//! (`[inbound]`, `[inbound.reality]`, `users = [...]`, …).
 //!
 //! Schemas (JSON):
 //!
@@ -68,6 +74,8 @@ pub enum ConfigError {
     },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("toml: {0}")]
+    Toml(String),
     #[error("bad x25519 key (expected 32 bytes as base64-url or hex): {0}")]
     Key(String),
     #[error("bad short id: {0}")]
@@ -493,13 +501,55 @@ impl RealityClient {
 // ---- loaders ---------------------------------------------------------
 
 pub fn load_server(path: &str) -> Result<ServerConfig, ConfigError> {
-    let data = read(path)?;
-    Ok(serde_json::from_slice(&data)?)
+    from_path(path)
 }
 
 pub fn load_client(path: &str) -> Result<ClientConfig, ConfigError> {
+    from_path(path)
+}
+
+/// Load and deserialise a config from `path`, choosing the format by file
+/// extension: `.toml` → TOML, anything else (`.json`, `.jsonc`, …) → JSON.
+/// For an unknown/missing extension we try JSON first, then TOML, so a config
+/// named without an extension still works.
+pub fn from_path<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, ConfigError> {
     let data = read(path)?;
-    Ok(serde_json::from_slice(&data)?)
+    match config_format(path) {
+        Format::Toml => from_toml(&data),
+        Format::Json => Ok(serde_json::from_slice(&data)?),
+        Format::Unknown => match serde_json::from_slice(&data) {
+            Ok(v) => Ok(v),
+            Err(json_err) => from_toml(&data).map_err(|toml_err| {
+                ConfigError::Toml(format!(
+                    "{path}: not valid JSON ({json_err}) nor TOML ({toml_err})"
+                ))
+            }),
+        },
+    }
+}
+
+enum Format {
+    Json,
+    Toml,
+    Unknown,
+}
+
+fn config_format(path: &str) -> Format {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("toml") => Format::Toml,
+        Some("json") | Some("jsonc") | Some("js") => Format::Json,
+        _ => Format::Unknown,
+    }
+}
+
+fn from_toml<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, ConfigError> {
+    let s = std::str::from_utf8(data).map_err(|e| ConfigError::Toml(e.to_string()))?;
+    toml::from_str(s).map_err(|e| ConfigError::Toml(e.to_string()))
 }
 
 fn read(path: &str) -> Result<Vec<u8>, ConfigError> {
@@ -677,5 +727,66 @@ mod tests {
         let b64 = BASE64_URL_SAFE_NO_PAD.encode(raw);
         assert_eq!(parse_x25519(&b64).unwrap(), raw);
         assert!(parse_x25519("too-short").is_err());
+    }
+
+    #[test]
+    fn parses_server_and_client_config_from_toml() {
+        let server = r#"
+            [log]
+            level = "info"
+
+            [inbound]
+            listen = "0.0.0.0:443"
+            transport = "raw"
+            vision = "xray"
+            users = ["b831381d-6324-4d53-ad4f-8cda48b30811"]
+            cert = "/x/fullchain.pem"
+            key = "/x/privkey.pem"
+        "#;
+        let cfg: ServerConfig = toml::from_str(server).unwrap();
+        assert_eq!(cfg.inbound.listen, "0.0.0.0:443");
+        assert_eq!(cfg.inbound.transport, "raw");
+        assert_eq!(cfg.inbound.vision, "xray");
+        assert!(cfg.inbound.user_auth().is_ok());
+
+        let client = r#"
+            [inbound]
+            socks = "127.0.0.1:1080"
+
+            [outbound]
+            server = "vpn.example.com:443"
+            uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+            transport = "raw"
+            flow = "xtls-rprx-vision"
+        "#;
+        let cfg: ClientConfig = toml::from_str(client).unwrap();
+        assert_eq!(cfg.outbound.server, "vpn.example.com:443");
+        assert_eq!(cfg.outbound.flow, "xtls-rprx-vision");
+        assert!(cfg.outbound.user_id().is_ok());
+    }
+
+    #[test]
+    fn from_path_picks_format_by_extension() {
+        let base = std::env::temp_dir().join(format!("donut-cfg-{}", std::process::id()));
+        let toml_path = format!("{}.toml", base.display());
+        std::fs::write(
+            &toml_path,
+            "[inbound]\nlisten = \"0.0.0.0:443\"\nusers = [\"b831381d-6324-4d53-ad4f-8cda48b30811\"]\n",
+        )
+        .unwrap();
+        let cfg: ServerConfig = from_path(&toml_path).unwrap();
+        assert_eq!(cfg.inbound.listen, "0.0.0.0:443");
+        std::fs::remove_file(&toml_path).ok();
+
+        // Unknown extension falls back to JSON-then-TOML detection.
+        let noext = format!("{}-noext", base.display());
+        std::fs::write(
+            &noext,
+            "[inbound]\nlisten = \"0.0.0.0:8443\"\nusers = [\"b831381d-6324-4d53-ad4f-8cda48b30811\"]\n",
+        )
+        .unwrap();
+        let cfg: ServerConfig = from_path(&noext).unwrap();
+        assert_eq!(cfg.inbound.listen, "0.0.0.0:8443");
+        std::fs::remove_file(&noext).ok();
     }
 }
