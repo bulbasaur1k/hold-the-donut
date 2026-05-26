@@ -53,7 +53,7 @@ impl VisionDialect {
     }
 }
 
-use crate::metrics::{Metrics, SessErr};
+use crate::metrics::{Metrics, SessErr, SessionKind};
 use crate::veil_server::VeilServer;
 use crate::vision_xray_splice;
 
@@ -107,8 +107,15 @@ pub async fn run_carrier_proxy(
             let resolver = resolver.clone();
             let metrics = metrics.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
+                if let Err(e) = handle_session(
+                    session.stream,
+                    auth,
+                    VisionDialect::Donut,
+                    router,
+                    resolver,
+                    metrics,
+                )
+                .await
                 {
                     tracing::trace!(?e, "proxy session ended with error");
                 }
@@ -162,8 +169,15 @@ pub async fn run_carrier_backend(
             metrics.connection_accepted();
             tokio::spawn(async move {
                 let _active = metrics.tunnel_started();
-                if let Err(e) =
-                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
+                if let Err(e) = handle_session(
+                    session.stream,
+                    auth,
+                    VisionDialect::Donut,
+                    router,
+                    resolver,
+                    metrics,
+                )
+                .await
                 {
                     tracing::trace!(?e, "carrier backend session ended with error");
                 }
@@ -205,8 +219,15 @@ pub async fn run_quic_proxy(
             metrics.connection_accepted();
             tokio::spawn(async move {
                 let _active = metrics.tunnel_started();
-                if let Err(e) =
-                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
+                if let Err(e) = handle_session(
+                    session.stream,
+                    auth,
+                    VisionDialect::Donut,
+                    router,
+                    resolver,
+                    metrics,
+                )
+                .await
                 {
                     tracing::trace!(?e, "quic proxy session ended with error");
                 }
@@ -277,8 +298,15 @@ pub async fn run_tls_carrier_proxy(
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
                     let _active = metrics.tunnel_started();
-                    if let Err(e) =
-                        handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics).await
+                    if let Err(e) = handle_session(
+                        session.stream,
+                        auth,
+                        VisionDialect::Donut,
+                        router,
+                        resolver,
+                        metrics,
+                    )
+                    .await
                     {
                         tracing::trace!(?e, "tls-carrier session ended with error");
                     }
@@ -375,9 +403,15 @@ pub async fn run_veil_proxy(
                             let resolver = resolver.clone();
                             let metrics = metrics.clone();
                             tokio::spawn(async move {
-                                if let Err(e) =
-                                    handle_session(session.stream, auth, VisionDialect::Donut, router, resolver, metrics)
-                                        .await
+                                if let Err(e) = handle_session(
+                                    session.stream,
+                                    auth,
+                                    VisionDialect::Donut,
+                                    router,
+                                    resolver,
+                                    metrics,
+                                )
+                                .await
                                 {
                                     tracing::trace!(?e, "veil proxy session ended with error");
                                 }
@@ -551,7 +585,8 @@ async fn handle_xray_vision_session(
                     match TcpStream::connect(d).await {
                         Ok(up) => {
                             // decoy traffic — don't count it as tunnelled bytes
-                            let _ = vision_xray_splice::tls_plain_relay(tunnel, up, probe, None).await;
+                            let _ =
+                                vision_xray_splice::tls_plain_relay(tunnel, up, probe, None).await;
                         }
                         Err(e) => tracing::trace!(?e, %d, "raw xray decoy connect failed"),
                     }
@@ -587,7 +622,7 @@ async fn handle_xray_vision_session(
         let mut response_buf = BytesMut::with_capacity(8);
         Response::default().encode(&mut response_buf);
         tunnel.write_plaintext(&response_buf).await?;
-        let _active = metrics.tunnel_started();
+        let _active = metrics.tunnel_started_kind(SessionKind::Mux);
         // flow=vision wraps the Mux stream in Vision padding (e.g. HAPP XUDP).
         let vision_uuid = matches!(flow, FlowKind::Extended).then_some(user_uuid);
         let result = crate::mux::mux_relay(tunnel, leftover.to_vec(), &metrics, vision_uuid).await;
@@ -627,7 +662,7 @@ async fn handle_xray_vision_session(
     // never applies to UDP, so no dial/splice, just a UDP-socket bridge.
     if matches!(command, Command::Udp) {
         tunnel.write_plaintext(&response_buf).await?;
-        let _active = metrics.tunnel_started();
+        let _active = metrics.tunnel_started_kind(SessionKind::Udp);
         let result =
             vision_xray_splice::vision_udp_relay(tunnel, target_addr, leftover.to_vec(), &metrics)
                 .await;
@@ -752,7 +787,8 @@ pub async fn run_raw_proxy(
                 // CommandPaddingDirect, so it drives rustls manually instead of
                 // copying through an opaque TLS stream.
                 if vision_dialect == VisionDialect::Xray {
-                    let mut tunnel = match vision_xray_splice::RecordTlsServer::new(tcp, tls_config) {
+                    let mut tunnel = match vision_xray_splice::RecordTlsServer::new(tcp, tls_config)
+                    {
                         Ok(t) => t,
                         Err(e) => {
                             tracing::trace!(?e, "raw: rustls server-conn init failed");
@@ -792,7 +828,8 @@ pub async fn run_raw_proxy(
                     let stream = Prefixed::new(vec![first[0]], tls);
                     let _active = metrics.tunnel_started();
                     if let Err(e) =
-                        handle_session(stream, auth, vision_dialect, router, resolver, metrics).await
+                        handle_session(stream, auth, vision_dialect, router, resolver, metrics)
+                            .await
                     {
                         tracing::trace!(?e, "raw proxy session ended with error");
                     }
