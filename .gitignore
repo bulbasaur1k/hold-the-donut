@@ -25,3 +25,6 @@ scripts/xray-testbench/*.crt
 scripts/xray-testbench/data/
 # Upstream xray-core source checkout (ground-truth reference; not vendored)
 scripts/xray-testbench/upstream/
+
+# Local session context (operational notes + secrets — never commit)
+.session/
