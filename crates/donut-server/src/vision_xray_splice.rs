@@ -138,13 +138,18 @@ impl RecordTlsServer {
         }
     }
 
-    /// Read and decrypt exactly one outer-TLS record. Returns its plaintext
-    /// (empty `Vec` on clean EOF; a CCS/handshake record may also decrypt to
-    /// no application plaintext).
-    pub async fn read_record(&mut self) -> io::Result<Vec<u8>> {
+    /// Read and decrypt one outer-TLS record, distinguishing a clean EOF
+    /// (`Ok(None)`) from a record that carried no application plaintext —
+    /// e.g. a post-handshake KeyUpdate — which yields `Ok(Some(vec![]))`.
+    ///
+    /// Loops over the tunnel MUST treat only `None` as "done": treating an
+    /// empty `Vec` as EOF tears the session down on a stray KeyUpdate (and,
+    /// worse, spins at 100% CPU if the loop keeps re-polling a real EOF that
+    /// returns instantly forever).
+    pub async fn read_record_opt(&mut self) -> io::Result<Option<Vec<u8>>> {
         let total = match self.ensure_one_record().await? {
             Some(t) => t,
-            None => return Ok(Vec::new()),
+            None => return Ok(None),
         };
         self.feed_record(total)?;
         let state = self
@@ -163,7 +168,14 @@ impl RecordTlsServer {
             got += n;
         }
         out.truncate(got);
-        Ok(out)
+        Ok(Some(out))
+    }
+
+    /// Read one outer-TLS record's plaintext; empty `Vec` on clean EOF *or* on
+    /// a record with no application bytes. Prefer [`read_record_opt`] in loops
+    /// where the EOF/empty distinction matters.
+    pub async fn read_record(&mut self) -> io::Result<Vec<u8>> {
+        Ok(self.read_record_opt().await?.unwrap_or_default())
     }
 
     /// Encrypt and send plaintext through the outer TLS (Vision padded phase).
@@ -226,15 +238,21 @@ pub async fn tls_plain_relay(
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
         tokio::select! {
-            r = tunnel.read_record(), if !tunnel_done => {
-                let pt = r?;
-                if pt.is_empty() {
-                    tunnel_done = true;
-                    let _ = target.shutdown().await;
-                    continue;
+            r = tunnel.read_record_opt(), if !tunnel_done => {
+                match r? {
+                    None => {
+                        tunnel_done = true;
+                        let _ = target.shutdown().await;
+                        continue;
+                    }
+                    // Empty (no-app-data) record, e.g. KeyUpdate — not EOF.
+                    Some(pt) => {
+                        if !pt.is_empty() {
+                            target.write_all(&pt).await?;
+                            if let Some(m) = metrics { m.add_bytes(pt.len() as u64, 0); }
+                        }
+                    }
                 }
-                target.write_all(&pt).await?;
-                if let Some(m) = metrics { m.add_bytes(pt.len() as u64, 0); }
             }
             r = target.read(&mut buf), if !target_done => {
                 let n = r?;
@@ -274,7 +292,7 @@ fn take_datagram(buf: &mut BytesMut) -> Option<Vec<u8>> {
 }
 
 enum UdpEvent {
-    Tunnel(io::Result<Vec<u8>>),
+    Tunnel(io::Result<Option<Vec<u8>>>),
     Sock(io::Result<usize>),
 }
 
@@ -310,21 +328,19 @@ pub async fn vision_udp_relay(
         }
         let ev = tokio::time::timeout(UDP_IDLE, async {
             tokio::select! {
-                r = tunnel.read_record() => UdpEvent::Tunnel(r),
+                r = tunnel.read_record_opt() => UdpEvent::Tunnel(r),
                 r = sock.recv(&mut udpbuf) => UdpEvent::Sock(r),
             }
         })
         .await;
         match ev {
             Err(_) => break, // idle timeout
-            Ok(UdpEvent::Tunnel(r)) => {
-                let pt = r?;
-                if pt.is_empty() {
-                    tunnel_done = true;
-                } else {
-                    inbuf.extend_from_slice(&pt);
-                }
-            }
+            Ok(UdpEvent::Tunnel(r)) => match r? {
+                // Clean EOF — client closed the tunnel; tear the relay down.
+                None => tunnel_done = true,
+                // Empty (no-app-data) record, e.g. KeyUpdate — not EOF.
+                Some(pt) => inbuf.extend_from_slice(&pt),
+            },
             Ok(UdpEvent::Sock(r)) => {
                 let n = r?;
                 let mut frame = Vec::with_capacity(2 + n);
@@ -344,10 +360,13 @@ pub async fn vision_udp_relay(
 /// future so `select!` borrows `tunnel` only once (the two modes can't be
 /// separate branches — the borrow checker ignores the runtime guards).
 enum UplinkRead {
-    /// Padded phase: decrypted plaintext of one outer-TLS record (empty = EOF).
+    /// Padded phase: decrypted plaintext of one outer-TLS record. May be empty
+    /// for a no-app-data record (e.g. KeyUpdate) — that is *not* EOF.
     Record(Vec<u8>),
-    /// Spliced phase: `n` raw bytes in the shared buffer (0 = EOF).
+    /// Spliced phase: `n` (>0) raw bytes in the shared buffer.
     Raw(usize),
+    /// Clean EOF in either phase.
+    Eof,
 }
 
 async fn read_uplink(
@@ -356,9 +375,13 @@ async fn read_uplink(
     rawbuf: &mut [u8],
 ) -> io::Result<UplinkRead> {
     if spliced {
-        Ok(UplinkRead::Raw(tunnel.read_raw(rawbuf).await?))
+        let n = tunnel.read_raw(rawbuf).await?;
+        Ok(if n == 0 { UplinkRead::Eof } else { UplinkRead::Raw(n) })
     } else {
-        Ok(UplinkRead::Record(tunnel.read_record().await?))
+        match tunnel.read_record_opt().await? {
+            None => Ok(UplinkRead::Eof),
+            Some(pt) => Ok(UplinkRead::Record(pt)),
+        }
     }
 }
 
@@ -415,30 +438,29 @@ pub async fn vision_server_splice(
             // ---- uplink (client -> server): padded records, then raw ----
             r = read_uplink(&mut tunnel, uplink_spliced, &mut ubuf), if !uplink_done => {
                 match r? {
+                    UplinkRead::Eof => {
+                        uplink_done = true;
+                        let _ = upstream.shutdown().await;
+                        continue;
+                    }
                     UplinkRead::Record(pt) => {
-                        if pt.is_empty() {
-                            uplink_done = true;
-                            let _ = upstream.shutdown().await;
-                            continue;
-                        }
-                        let content = unp.push(&pt);
-                        if !content.is_empty() {
-                            if filter.number_to_filter > 0 {
-                                filter.filter(&content);
+                        // `pt` is empty for a no-app-data record (KeyUpdate);
+                        // feeding the unpadder nothing is a no-op, so skip it.
+                        if !pt.is_empty() {
+                            let content = unp.push(&pt);
+                            if !content.is_empty() {
+                                if filter.number_to_filter > 0 {
+                                    filter.filter(&content);
+                                }
+                                upstream.write_all(&content).await?;
+                                metrics.add_bytes(content.len() as u64, 0);
                             }
-                            upstream.write_all(&content).await?;
-                            metrics.add_bytes(content.len() as u64, 0);
-                        }
-                        if unp.direct() {
-                            uplink_spliced = true;
+                            if unp.direct() {
+                                uplink_spliced = true;
+                            }
                         }
                     }
                     UplinkRead::Raw(n) => {
-                        if n == 0 {
-                            uplink_done = true;
-                            let _ = upstream.shutdown().await;
-                            continue;
-                        }
                         upstream.write_all(&ubuf[..n]).await?;
                         metrics.add_bytes(n as u64, 0);
                     }
