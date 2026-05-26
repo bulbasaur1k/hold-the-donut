@@ -261,6 +261,14 @@ impl FilterState {
     }
 }
 
+fn hex16(b: &[u8]) -> String {
+    b.iter()
+        .take(16)
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
@@ -318,7 +326,8 @@ where
                 break;
             }
             let content = unp.push(&buf[..n]);
-            tracing::debug!(read = n, content = content.len(), direct = unp.direct(), "vision uplink");
+            tracing::debug!(read = n, content = content.len(), direct = unp.direct(),
+                head = %hex16(&content), "vision uplink -> upstream");
             if !content.is_empty() {
                 {
                     let mut f = s_up.lock().expect("vision filter lock");
@@ -346,8 +355,8 @@ where
                 break;
             }
             let chunk = &buf[..n];
+            tracing::debug!(read = n, direct, head = %hex16(chunk), "vision downlink <- upstream");
             if direct {
-                tracing::debug!(raw = n, "vision downlink raw (spliced)");
                 tw.write_all(chunk).await?;
                 continue;
             }
@@ -384,7 +393,9 @@ where
         Ok::<(), std::io::Error>(())
     };
 
-    tokio::try_join!(uplink, downlink)?;
+    // join (not try_join): a half-close / error on one direction must not
+    // cancel the other mid-flight, or the peer sees a premature reset.
+    let (_up, _down) = tokio::join!(uplink, downlink);
     Ok(())
 }
 
