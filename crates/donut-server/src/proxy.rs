@@ -796,11 +796,26 @@ pub async fn run_raw_proxy(
                         }
                     };
                     if let Err(e) = tunnel.handshake().await {
-                        metrics.session_error(SessErr::Tls);
-                        // Most failures here are probes/scanners (old TLS1.2,
-                        // missing extensions, mismatched ALPN); a real client's
-                        // peer here means a config mismatch worth chasing.
-                        tracing::debug!(%peer, ?e, "raw tls handshake failed (xray path)");
+                        let read = tunnel.bytes_read();
+                        // read == 0: the peer reset/closed before sending a
+                        // single byte — an ordinary port scan / health check
+                        // hitting :443, not a failed tunnel. Don't pollute the
+                        // session-error metric with it; count it as a probe.
+                        // read > 0: it spoke some TLS then bailed (a picky
+                        // probe, an old-TLS/ALPN-mismatch client, or — rarely —
+                        // in-path tampering). That's a real handshake failure.
+                        if read == 0 {
+                            metrics.probe();
+                        } else {
+                            metrics.session_error(SessErr::Tls);
+                        }
+                        tracing::debug!(
+                            %peer,
+                            bytes_read = read,
+                            error = %e,
+                            error_kind = ?e.kind(),
+                            "raw tls handshake failed (xray path)"
+                        );
                         return;
                     }
                     if let Err(e) =
