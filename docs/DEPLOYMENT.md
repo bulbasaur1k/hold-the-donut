@@ -204,12 +204,21 @@ firewall-cmd --reload
 ```json
 { "log": { "level": "info" },
   "inbound": { "listen": "0.0.0.0:443", "transport": "tls",
+    "users": ["<UUID>"],
     "path": "<SECRET_PATH>", "dest": "127.0.0.1:8080",
     "cert": "/etc/donut/fullchain.pem", "key": "/etc/donut/privkey.pem" },
   "routing": { "default": "freedom", "rules": [ { "port": ["25"], "outbound": "block" } ] } }
 ```
 
 `/etc/donut/server.json` (QUIC) — то же, но `"transport": "quic"`.
+
+> **Аутентификация.** `inbound.users` — список разрешённых VLESS-UUID; это
+> и есть реальный credential прокси. Сессия с UUID не из списка **дропается**
+> до проксирования (на всех транспортах — единая точка в `handle_session`).
+> Список **обязателен и непустой**, иначе сервер не стартует (fail-closed).
+> UUID и `users`/`uuid` пару проще всего получить из `donut-tools config-gen`
+> (он чеканит общий UUID), либо `uuidgen`. Сравнение UUID — constant-time
+> (без timing-оракула на секрет).
 
 systemd-юниты `donut-server.service` (→ server.json) и
 `donut-server-tls.service` (→ tls.json), у обоих:
@@ -228,6 +237,7 @@ TCP/443 и UDP/443 не конфликтуют (разные протоколы)
 { "log": { "level": "info" },
   "inbound": { "socks": "127.0.0.1:1080" },
   "outbound": { "server": "144.31.85.233:443", "transport": "xhttp",
+    "uuid": "<UUID>",
     "server_name": "cozbystorage.duckdns.org", "path": "<SECRET_PATH>" },
   "routing": { "default": "proxy", "rules": [
     { "geoip": ["ru", "private"], "outbound": "direct" },
@@ -236,6 +246,7 @@ TCP/443 и UDP/443 не конфликтуют (разные протоколы)
   "dns": { "doh": ["77.88.8.8"], "doh_tls_name": "common.dot.dns.yandex.net" } }
 ```
 - `server` — **IP**, чтобы не зависеть от startup-DNS на флаки-канале.
+- `uuid` — VLESS-credential; должен совпадать с одним из `inbound.users` сервера.
 - `server_name` — имя из серта (для TLS/SNI).
 - `transport: "xhttp"` → tcp/443 (`tls`-сервер); `"h3"` → udp/443 (`quic`).
 - geo-базы: `geoip.dat` (v2fly/geoip), `geosite.dat` (v2fly dlc.dat).

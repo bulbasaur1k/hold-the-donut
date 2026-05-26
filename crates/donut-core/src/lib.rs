@@ -12,5 +12,5 @@ mod kinds;
 
 pub use address::{Address, AddressParseError, Endpoint};
 pub use error::{CoreError, CoreResult};
-pub use id::{ShortId, ShortIdParseError, UserId};
+pub use id::{ShortId, ShortIdParseError, UserAuth, UserId};
 pub use kinds::{Command, FlowKind, TlsKind, TransportKind};

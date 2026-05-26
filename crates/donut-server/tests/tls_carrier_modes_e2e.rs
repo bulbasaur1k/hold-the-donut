@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use donut_carrier::{BoxIo, ClientConfig, Connector, Mode};
-use donut_core::{Address, Command, Endpoint, FlowKind, UserId};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth, UserId};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_wire::{Request, Response};
@@ -116,6 +116,7 @@ async fn tunnel_roundtrip(mode: Mode) {
     let echo_addr = spawn_echo().await;
     let decoy_addr = spawn_decoy().await;
 
+    let user = UserId::new_v4();
     let server = donut_server::run_tls_carrier_proxy(
         "127.0.0.1:0".parse().unwrap(),
         vec![cert.clone()],
@@ -123,6 +124,7 @@ async fn tunnel_roundtrip(mode: Mode) {
         SECRET.to_string(),
         mode,
         Some(decoy_addr),
+        Arc::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -147,7 +149,7 @@ async fn tunnel_roundtrip(mode: Mode) {
     .expect("carrier dial");
 
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(Endpoint::new(

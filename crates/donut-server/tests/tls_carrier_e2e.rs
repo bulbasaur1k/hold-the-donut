@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use donut_core::{Address, Command, Endpoint, FlowKind, UserId};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth, UserId};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_wire::{Request, Response};
@@ -91,6 +91,7 @@ async fn tls_carrier_tunnel_and_self_steal() {
     });
 
     // donut-server TLS carrier with the secret path + decoy.
+    let user = UserId::new_v4();
     let addr = donut_server::run_tls_carrier_proxy(
         "127.0.0.1:0".parse().unwrap(),
         vec![cert.clone()],
@@ -98,6 +99,7 @@ async fn tls_carrier_tunnel_and_self_steal() {
         SECRET.to_string(),
         donut_carrier::Mode::StreamOne,
         Some(decoy_addr),
+        Arc::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -129,7 +131,7 @@ async fn tls_carrier_tunnel_and_self_steal() {
         .expect("carrier dial");
 
         let request = Request {
-            user: UserId::new_v4(),
+            user,
             flow: FlowKind::None,
             command: Command::Tcp,
             target: Some(Endpoint::new(
@@ -222,6 +224,7 @@ async fn tls_carrier_self_steal_over_h2() {
         SECRET.to_string(),
         donut_carrier::Mode::StreamOne,
         Some(decoy_addr),
+        Arc::new(UserAuth::new(vec![UserId::new_v4()])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],

@@ -2,6 +2,7 @@
   "log": { "level": "info" },
   "inbound": {
     "listen": "0.0.0.0:443",
+    "users": ["b831381d-6324-4d53-ad4f-8cda48b30811"],
     "reality": {
       "private_key": "REPLACE_WITH_BASE64URL_OR_HEX_X25519_PRIVATE_KEY",
       "short_ids": ["deadbeef"],
