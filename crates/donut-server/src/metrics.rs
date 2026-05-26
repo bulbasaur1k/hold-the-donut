@@ -18,6 +18,7 @@ pub struct Metrics {
     active_connections: AtomicI64,
     handshakes_tunnel: AtomicU64,
     handshakes_forward: AtomicU64,
+    rejected_unauthorized: AtomicU64,
     blackhole_total: AtomicU64,
     bytes_up: AtomicU64,
     bytes_down: AtomicU64,
@@ -48,6 +49,12 @@ impl Metrics {
         self.handshakes_forward.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A session presented a VLESS UUID not in the allowed-user set and
+    /// was dropped before proxying (a failed credential / probe).
+    pub fn rejected_unauthorized(&self) {
+        self.rejected_unauthorized.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A target was dropped by a routing block rule.
     pub fn blackholed(&self) {
         self.blackhole_total.fetch_add(1, Ordering::Relaxed);
@@ -65,6 +72,7 @@ impl Metrics {
         let active = self.active_connections.load(Ordering::Relaxed);
         let tunnel = self.handshakes_tunnel.load(Ordering::Relaxed);
         let forward = self.handshakes_forward.load(Ordering::Relaxed);
+        let unauthorized = self.rejected_unauthorized.load(Ordering::Relaxed);
         let blackhole = self.blackhole_total.load(Ordering::Relaxed);
         let up = self.bytes_up.load(Ordering::Relaxed);
         let down = self.bytes_down.load(Ordering::Relaxed);
@@ -79,6 +87,9 @@ impl Metrics {
              # TYPE donut_handshakes_total counter\n\
              donut_handshakes_total{{result=\"tunnel\"}} {tunnel}\n\
              donut_handshakes_total{{result=\"forward\"}} {forward}\n\
+             # HELP donut_rejected_unauthorized_total Tunnel sessions dropped for an unknown VLESS UUID.\n\
+             # TYPE donut_rejected_unauthorized_total counter\n\
+             donut_rejected_unauthorized_total {unauthorized}\n\
              # HELP donut_blackhole_total Connections dropped by a routing block rule.\n\
              # TYPE donut_blackhole_total counter\n\
              donut_blackhole_total {blackhole}\n\
@@ -148,6 +159,7 @@ mod tests {
         m.connection_accepted();
         let guard = m.tunnel_started();
         m.forwarded();
+        m.rejected_unauthorized();
         m.blackholed();
         m.add_bytes(100, 250);
 
@@ -156,6 +168,7 @@ mod tests {
         assert!(out.contains("donut_active_connections 1"));
         assert!(out.contains("donut_handshakes_total{result=\"tunnel\"} 1"));
         assert!(out.contains("donut_handshakes_total{result=\"forward\"} 1"));
+        assert!(out.contains("donut_rejected_unauthorized_total 1"));
         assert!(out.contains("donut_blackhole_total 1"));
         assert!(out.contains("donut_bytes_total{direction=\"up\"} 100"));
         assert!(out.contains("donut_bytes_total{direction=\"down\"} 250"));

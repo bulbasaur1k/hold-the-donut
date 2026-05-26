@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
-use donut_core::{Address, Command, Endpoint, FlowKind};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_veil::VeilServerConfig;
@@ -56,7 +56,10 @@ pub enum ProxyError {
 /// Bind a carrier server in `stream-one` mode on `bind_addr` and run
 /// the proxy session loop in the background. Returns the bound local
 /// address (useful when `bind_addr` had port 0 — e.g. in tests).
-pub async fn run_carrier_proxy(bind_addr: SocketAddr) -> Result<SocketAddr, ProxyError> {
+pub async fn run_carrier_proxy(
+    bind_addr: SocketAddr,
+    auth: Arc<UserAuth>,
+) -> Result<SocketAddr, ProxyError> {
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
 
@@ -77,11 +80,14 @@ pub async fn run_carrier_proxy(bind_addr: SocketAddr) -> Result<SocketAddr, Prox
     let metrics = Metrics::new();
     tokio::spawn(async move {
         while let Some(session) = server.accept().await {
+            let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
             let metrics = metrics.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
+                if let Err(e) =
+                    handle_session(session.stream, auth, router, resolver, metrics).await
+                {
                     tracing::trace!(?e, "proxy session ended with error");
                 }
             });
@@ -98,10 +104,12 @@ pub async fn run_carrier_proxy(bind_addr: SocketAddr) -> Result<SocketAddr, Prox
 /// outbound. `path_prefix` must match the path the front proxy forwards
 /// (and the client's `ClientConfig.path_prefix`). Returns the bound
 /// local address.
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
 pub async fn run_carrier_backend(
     bind_addr: SocketAddr,
     path_prefix: String,
     mode: donut_carrier::Mode,
+    auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -125,13 +133,16 @@ pub async fn run_carrier_backend(
 
     tokio::spawn(async move {
         while let Some(session) = server.accept().await {
+            let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
                 let _active = metrics.tunnel_started();
-                if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
+                if let Err(e) =
+                    handle_session(session.stream, auth, router, resolver, metrics).await
+                {
                     tracing::trace!(?e, "carrier backend session ended with error");
                 }
             });
@@ -154,6 +165,7 @@ pub async fn run_quic_proxy(
     key: PrivateKeyDer<'static>,
     secret_path: String,
     decoy: Option<SocketAddr>,
+    auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -164,13 +176,16 @@ pub async fn run_quic_proxy(
 
     tokio::spawn(async move {
         while let Some(session) = server.accept().await {
+            let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
                 let _active = metrics.tunnel_started();
-                if let Err(e) = handle_session(session.stream, router, resolver, metrics).await {
+                if let Err(e) =
+                    handle_session(session.stream, auth, router, resolver, metrics).await
+                {
                     tracing::trace!(?e, "quic proxy session ended with error");
                 }
             });
@@ -195,6 +210,7 @@ pub async fn run_tls_carrier_proxy(
     secret_path: String,
     mode: donut_carrier::Mode,
     decoy: Option<SocketAddr>,
+    auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -227,18 +243,20 @@ pub async fn run_tls_carrier_proxy(
     // Session consumer: each paired carrier session becomes a proxied
     // VLESS tunnel.
     {
+        let auth = auth.clone();
         let router = router.clone();
         let resolver = resolver.clone();
         let metrics = metrics.clone();
         tokio::spawn(async move {
             while let Some(session) = rx.recv().await {
+                let auth = auth.clone();
                 let router = router.clone();
                 let resolver = resolver.clone();
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
                     let _active = metrics.tunnel_started();
                     if let Err(e) =
-                        handle_session(session.stream, router, resolver, metrics).await
+                        handle_session(session.stream, auth, router, resolver, metrics).await
                     {
                         tracing::trace!(?e, "tls-carrier session ended with error");
                     }
@@ -290,6 +308,7 @@ pub async fn run_veil_proxy(
     key: PrivateKeyDer<'static>,
     veil: VeilServerConfig,
     dest: SocketAddr,
+    auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -310,6 +329,7 @@ pub async fn run_veil_proxy(
                 }
             };
             let server = server.clone();
+            let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
             let metrics = metrics.clone();
@@ -328,12 +348,14 @@ pub async fn run_veil_proxy(
                             peer,
                         );
                         while let Some(session) = rx.recv().await {
+                            let auth = auth.clone();
                             let router = router.clone();
                             let resolver = resolver.clone();
                             let metrics = metrics.clone();
                             tokio::spawn(async move {
                                 if let Err(e) =
-                                    handle_session(session.stream, router, resolver, metrics).await
+                                    handle_session(session.stream, auth, router, resolver, metrics)
+                                        .await
                                 {
                                     tracing::trace!(?e, "veil proxy session ended with error");
                                 }
@@ -357,6 +379,7 @@ pub async fn run_veil_proxy(
 
 async fn handle_session<S>(
     mut session: S,
+    auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -388,6 +411,19 @@ where
     };
     let (request, leftover) = request;
     let flow = request.flow;
+
+    // Credential check — the real VLESS auth. This is the single choke
+    // point every transport funnels through, so an unknown UUID is
+    // rejected here before any upstream is dialled. We drop silently:
+    // by this point the caller has already cleared the transport-level
+    // self-steal (TLS/REALITY + the version byte / secret path), and the
+    // de-framed stream is not something an HTTP decoy could answer, so a
+    // decoy relay would buy no extra cover — closing is the honest move.
+    if !auth.is_authorized(&request.user) {
+        metrics.rejected_unauthorized();
+        tracing::debug!(user = %request.user, "vless auth: unknown UUID — dropping session");
+        return Ok(());
+    }
 
     let target_endpoint = request.target.ok_or(ProxyError::UnsupportedCommand)?;
     if !matches!(request.command, Command::Tcp) {
@@ -474,6 +510,7 @@ pub async fn run_raw_proxy(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     decoy: Option<SocketAddr>,
+    auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -504,6 +541,7 @@ pub async fn run_raw_proxy(
                 }
             };
             let acceptor = acceptor.clone();
+            let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
             let metrics = metrics.clone();
@@ -525,7 +563,7 @@ pub async fn run_raw_proxy(
                 if first[0] == VLESS_VERSION {
                     let stream = Prefixed::new(vec![first[0]], tls);
                     let _active = metrics.tunnel_started();
-                    if let Err(e) = handle_session(stream, router, resolver, metrics).await {
+                    if let Err(e) = handle_session(stream, auth, router, resolver, metrics).await {
                         tracing::trace!(?e, "raw proxy session ended with error");
                     }
                 } else if let Some(decoy) = decoy {

@@ -9,8 +9,10 @@
 //!    asks for CONNECT to the echo server, sends "hello-socks", and
 //!    verifies the echoed payload.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use donut_core::{UserAuth, UserId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -34,14 +36,19 @@ async fn socks5_to_donut_client_to_donut_server_to_echo() {
         }
     });
 
-    // 2. donut-server carrier proxy.
-    let proxy_addr = donut_server::run_carrier_proxy("127.0.0.1:0".parse().unwrap())
-        .await
-        .expect("bind donut-server");
+    // 2. donut-server carrier proxy with a known allowed UUID.
+    let user = UserId::new_v4();
+    let proxy_addr = donut_server::run_carrier_proxy(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(UserAuth::new(vec![user])),
+    )
+    .await
+    .expect("bind donut-server");
 
-    // 3. donut-client SOCKS5 inbound pointing at donut-server.
+    // 3. donut-client SOCKS5 inbound pointing at donut-server, presenting
+    //    the matching UUID.
     let socks_addr =
-        donut_client::run_local_socks_proxy("127.0.0.1:0".parse().unwrap(), proxy_addr)
+        donut_client::run_local_socks_proxy("127.0.0.1:0".parse().unwrap(), proxy_addr, user)
             .await
             .expect("bind donut-client");
 

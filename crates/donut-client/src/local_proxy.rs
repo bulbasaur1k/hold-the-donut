@@ -55,6 +55,7 @@ pub enum LocalProxyError {
 pub async fn run_local_socks_proxy(
     local_addr: SocketAddr,
     server_addr: SocketAddr,
+    user: UserId,
 ) -> Result<SocketAddr, LocalProxyError> {
     let listener = TcpListener::bind(local_addr).await?;
     let local = listener.local_addr()?;
@@ -65,7 +66,7 @@ pub async fn run_local_socks_proxy(
                 Err(_) => continue,
             };
             tokio::spawn(async move {
-                if let Err(e) = handle_socks_session(sock, server_addr).await {
+                if let Err(e) = handle_socks_session(sock, server_addr, user).await {
                     tracing::trace!(?e, "local socks proxy session ended");
                 }
             });
@@ -77,6 +78,7 @@ pub async fn run_local_socks_proxy(
 async fn handle_socks_session(
     sock: tokio::net::TcpStream,
     server_addr: SocketAddr,
+    user: UserId,
 ) -> Result<(), LocalProxyError> {
     let pending = handshake_connect(sock).await?;
     let target = pending.target.clone();
@@ -93,7 +95,7 @@ async fn handle_socks_session(
     // Push inner-frame request header. The Response prefix will come
     // back before the upstream payload.
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(target),
@@ -131,6 +133,7 @@ pub async fn run_veil_socks_proxy(
     local_addr: SocketAddr,
     veil_client: VeilClient,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
 ) -> Result<SocketAddr, LocalProxyError> {
@@ -147,9 +150,15 @@ pub async fn run_veil_socks_proxy(
             let router = router.clone();
             let resolver = resolver.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_veil_socks_session(sock, veil_client, server_addr, router, resolver)
-                        .await
+                if let Err(e) = handle_veil_socks_session(
+                    sock,
+                    veil_client,
+                    server_addr,
+                    user,
+                    router,
+                    resolver,
+                )
+                .await
                 {
                     tracing::trace!(?e, "local veil socks proxy session ended");
                 }
@@ -208,12 +217,13 @@ async fn handle_direct_dial(
 async fn bridge_carrier_to_socks<C>(
     pending: PendingConnect,
     mut carrier: C,
+    user: UserId,
 ) -> Result<(), LocalProxyError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(pending.target.clone()),
@@ -239,6 +249,7 @@ async fn handle_veil_socks_session(
     sock: tokio::net::TcpStream,
     veil_client: Arc<VeilClient>,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
 ) -> Result<(), LocalProxyError> {
@@ -259,7 +270,7 @@ async fn handle_veil_socks_session(
             let carrier = donut_carrier::client::dial_over_stream(tls, &carrier_cfg)
                 .await
                 .map_err(|e| LocalProxyError::Carrier(format!("{e}")))?;
-            bridge_carrier_to_socks(pending, carrier).await
+            bridge_carrier_to_socks(pending, carrier, user).await
         }
     }
 }
@@ -274,6 +285,7 @@ pub async fn run_xhttp_socks_proxy(
     local_addr: SocketAddr,
     xhttp_client: XhttpClient,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
 ) -> Result<SocketAddr, LocalProxyError> {
@@ -290,9 +302,15 @@ pub async fn run_xhttp_socks_proxy(
             let router = router.clone();
             let resolver = resolver.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_xhttp_socks_session(sock, xhttp_client, server_addr, router, resolver)
-                        .await
+                if let Err(e) = handle_xhttp_socks_session(
+                    sock,
+                    xhttp_client,
+                    server_addr,
+                    user,
+                    router,
+                    resolver,
+                )
+                .await
                 {
                     tracing::trace!(?e, "local xhttp socks proxy session ended");
                 }
@@ -306,6 +324,7 @@ async fn handle_xhttp_socks_session(
     sock: tokio::net::TcpStream,
     xhttp_client: Arc<XhttpClient>,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
 ) -> Result<(), LocalProxyError> {
@@ -319,7 +338,7 @@ async fn handle_xhttp_socks_session(
         Route::Proxy => {
             tracing::trace!(target = %pending.target, "split-tunnel: via xhttp tunnel");
             let carrier = xhttp_client.connect(server_addr).await?;
-            bridge_carrier_to_socks(pending, carrier).await
+            bridge_carrier_to_socks(pending, carrier, user).await
         }
     }
 }
@@ -332,6 +351,7 @@ pub async fn run_h3_socks_proxy(
     local_addr: SocketAddr,
     h3_client: H3Client,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
 ) -> Result<SocketAddr, LocalProxyError> {
@@ -349,7 +369,8 @@ pub async fn run_h3_socks_proxy(
             let resolver = resolver.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_h3_socks_session(sock, h3_client, server_addr, router, resolver).await
+                    handle_h3_socks_session(sock, h3_client, server_addr, user, router, resolver)
+                        .await
                 {
                     tracing::trace!(?e, "local h3 socks proxy session ended");
                 }
@@ -363,6 +384,7 @@ async fn handle_h3_socks_session(
     sock: tokio::net::TcpStream,
     h3_client: Arc<H3Client>,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
 ) -> Result<(), LocalProxyError> {
@@ -376,7 +398,7 @@ async fn handle_h3_socks_session(
         Route::Proxy => {
             tracing::trace!(target = %pending.target, "split-tunnel: via h3 tunnel");
             let carrier = h3_client.connect(server_addr).await?;
-            bridge_carrier_to_socks(pending, carrier).await
+            bridge_carrier_to_socks(pending, carrier, user).await
         }
     }
 }
@@ -386,10 +408,12 @@ async fn handle_h3_socks_session(
 /// over TLS 1.3 (no carrier wrapping), the analogue of Xray's RAW/TCP
 /// network. Split-tunnel routing identical to the other transports.
 /// Returns the bound local address.
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
 pub async fn run_raw_socks_proxy(
     local_addr: SocketAddr,
     raw_client: RawClient,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     flow: FlowKind,
@@ -407,9 +431,16 @@ pub async fn run_raw_socks_proxy(
             let router = router.clone();
             let resolver = resolver.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_raw_socks_session(sock, raw_client, server_addr, router, resolver, flow)
-                        .await
+                if let Err(e) = handle_raw_socks_session(
+                    sock,
+                    raw_client,
+                    server_addr,
+                    user,
+                    router,
+                    resolver,
+                    flow,
+                )
+                .await
                 {
                     tracing::trace!(?e, "local raw socks proxy session ended");
                 }
@@ -419,10 +450,12 @@ pub async fn run_raw_socks_proxy(
     Ok(local)
 }
 
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
 async fn handle_raw_socks_session(
     sock: tokio::net::TcpStream,
     raw_client: Arc<RawClient>,
     server_addr: SocketAddr,
+    user: UserId,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     flow: FlowKind,
@@ -437,7 +470,7 @@ async fn handle_raw_socks_session(
         Route::Proxy => {
             tracing::trace!(target = %pending.target, ?flow, "split-tunnel: via raw tunnel");
             let tls = raw_client.connect(server_addr).await?;
-            bridge_raw_to_socks(pending, tls, flow).await
+            bridge_raw_to_socks(pending, tls, user, flow).await
         }
     }
 }
@@ -449,13 +482,14 @@ async fn handle_raw_socks_session(
 async fn bridge_raw_to_socks<C>(
     pending: PendingConnect,
     mut stream: C,
+    user: UserId,
     flow: FlowKind,
 ) -> Result<(), LocalProxyError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow,
         command: Command::Tcp,
         target: Some(pending.target.clone()),

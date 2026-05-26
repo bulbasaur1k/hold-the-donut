@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use donut_core::{Address, Command, Endpoint, FlowKind, UserId};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth, UserId};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_wire::{Request, Response};
@@ -53,12 +53,14 @@ async fn quic_proxy_relays_payload_over_h3() {
 
     // 2. donut-server QUIC/H3 proxy with a self-signed cert.
     let (cert, key) = gen_cert();
+    let user = UserId::new_v4();
     let quic_addr = donut_server::run_quic_proxy(
         "127.0.0.1:0".parse().unwrap(),
         vec![cert.clone()],
         key,
         "/".to_string(),
         None,
+        Arc::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -82,7 +84,7 @@ async fn quic_proxy_relays_payload_over_h3() {
 
     // VLESS inner frame targeting the echo server, then payload.
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(Endpoint::new(

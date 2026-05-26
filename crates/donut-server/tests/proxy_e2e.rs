@@ -13,8 +13,10 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use bytes::BytesMut;
-use donut_core::{Address, Command, Endpoint, FlowKind, UserId};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth, UserId};
 use donut_wire::{Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -40,9 +42,13 @@ async fn proxy_relays_payload_to_freedom_target() {
     });
 
     // 2. donut-server proxy.
-    let proxy_addr = donut_server::run_carrier_proxy("127.0.0.1:0".parse().unwrap())
-        .await
-        .expect("bind proxy");
+    let user = UserId::new_v4();
+    let proxy_addr = donut_server::run_carrier_proxy(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(UserAuth::new(vec![user])),
+    )
+    .await
+    .expect("bind proxy");
 
     // 3. Carrier client → proxy. Encode an inner-frame Request that
     //    targets the echo server, then write a payload and read the
@@ -60,7 +66,7 @@ async fn proxy_relays_payload_to_freedom_target() {
     .expect("carrier dial");
 
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(Endpoint::new(

@@ -3,6 +3,7 @@
   "inbound": { "socks": "127.0.0.1:1080" },
   "outbound": {
     "server": "vpn.example.com:443",
+    "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
     "reality": {
       "public_key": "REPLACE_WITH_BASE64URL_OR_HEX_X25519_PUBLIC_KEY",
       "short_id": "deadbeef",

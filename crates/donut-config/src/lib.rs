@@ -13,6 +13,7 @@
 //!   "log": { "level": "info" },
 //!   "inbound": {
 //!     "listen": "0.0.0.0:443",
+//!     "users": ["b831381d-6324-4d53-ad4f-8cda48b30811"], // allowed UUIDs
 //!     "reality": {
 //!       "private_key": "<base64-url or hex x25519 private key>",
 //!       "short_ids": ["deadbeef", "0123"],
@@ -30,6 +31,7 @@
 //!   "inbound":  { "socks": "127.0.0.1:1080" },
 //!   "outbound": {
 //!     "server": "vpn.example.com:443",
+//!     "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", // matches a server user
 //!     "reality": {
 //!       "public_key": "<base64-url or hex x25519 public key>",
 //!       "short_id": "deadbeef",
@@ -48,7 +50,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use base64::prelude::*;
-use donut_core::ShortId;
+use donut_core::{ShortId, UserAuth, UserId};
 use donut_dns::Resolver;
 use donut_geo::{GeoIpDb, GeoSiteDb};
 use donut_routing::Router;
@@ -70,6 +72,12 @@ pub enum ConfigError {
     Key(String),
     #[error("bad short id: {0}")]
     ShortId(String),
+    #[error("bad user uuid: {0}")]
+    User(String),
+    #[error("inbound.users must list at least one allowed UUID")]
+    NoUsers,
+    #[error("outbound.uuid is required (the VLESS credential to present)")]
+    NoUuid,
     #[error("pem: {0}")]
     Pem(String),
     #[error("routing: {0}")]
@@ -257,9 +265,32 @@ pub struct ServerInbound {
     /// client's `outbound.mode`. Ignored by other transports.
     #[serde(default = "default_carrier_mode")]
     pub mode: String,
+    /// Allowed VLESS user UUIDs. A tunnel session whose inner-frame UUID
+    /// is not in this list is rejected before any upstream is dialled —
+    /// this is the proxy's actual credential check, applied to every
+    /// transport. Must list at least one UUID (an empty list authorises
+    /// no one and the daemon refuses to start).
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 impl ServerInbound {
+    /// Materialise the allowed-user set from `users`. Errors on any
+    /// unparseable UUID or an empty list (fail-closed: a server with no
+    /// configured users would accept nobody, which is almost certainly a
+    /// misconfiguration, so surface it loudly at startup).
+    pub fn user_auth(&self) -> Result<UserAuth, ConfigError> {
+        if self.users.is_empty() {
+            return Err(ConfigError::NoUsers);
+        }
+        let users = self
+            .users
+            .iter()
+            .map(|s| s.parse::<UserId>().map_err(|_| ConfigError::User(s.clone())))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(UserAuth::new(users))
+    }
+
     /// Load the PEM certificate chain (`transport = "quic"`).
     pub fn cert_chain(&self) -> Result<Vec<CertificateDer<'static>>, ConfigError> {
         let path = self.cert.as_deref().ok_or_else(|| {
@@ -364,6 +395,11 @@ pub struct ClientInbound {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientOutbound {
     pub server: String,
+    /// VLESS user UUID presented on the inner frame. Must match one of
+    /// the server's `inbound.users`, otherwise the server drops the
+    /// session. Required.
+    #[serde(default)]
+    pub uuid: String,
     /// Client transport: `"veil"` (REALITY veiled-TLS, default),
     /// `"xhttp"` (carrier over plain TLS to a cert-based front), or
     /// `"h3"` (carrier over HTTP/3). The latter two use a real
@@ -394,6 +430,19 @@ pub struct ClientOutbound {
     /// TLS-in-TLS detection). Ignored by carrier transports.
     #[serde(default)]
     pub flow: String,
+}
+
+impl ClientOutbound {
+    /// Parse the configured VLESS credential. Errors if `uuid` is empty
+    /// (required) or not a valid UUID.
+    pub fn user_id(&self) -> Result<UserId, ConfigError> {
+        if self.uuid.trim().is_empty() {
+            return Err(ConfigError::NoUuid);
+        }
+        self.uuid
+            .parse::<UserId>()
+            .map_err(|_| ConfigError::User(self.uuid.clone()))
+    }
 }
 
 fn default_client_transport() -> String {
@@ -525,6 +574,7 @@ mod tests {
         let json = r#"{
             "inbound": {
                 "listen": "0.0.0.0:443",
+                "users": ["b831381d-6324-4d53-ad4f-8cda48b30811"],
                 "reality": {
                     "private_key": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
                     "short_ids": ["deadbeef", "0123"],
@@ -544,6 +594,30 @@ mod tests {
         );
         assert_eq!(reality.short_id_set().unwrap().len(), 2);
         assert_eq!(cfg.inbound.transport, "veil"); // default
+
+        // The allowed-user set materialises and authorises the configured UUID.
+        let auth = cfg.inbound.user_auth().unwrap();
+        let uuid: donut_core::UserId = "b831381d-6324-4d53-ad4f-8cda48b30811".parse().unwrap();
+        assert!(auth.is_authorized(&uuid));
+        assert!(!auth.is_authorized(&donut_core::UserId::new_v4()));
+    }
+
+    #[test]
+    fn server_with_no_users_is_rejected() {
+        let json = r#"{
+            "inbound": {
+                "listen": "0.0.0.0:443",
+                "transport": "raw",
+                "cert": "/x/fullchain.pem",
+                "key": "/x/privkey.pem"
+            }
+        }"#;
+        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.inbound.users.is_empty());
+        assert!(matches!(
+            cfg.inbound.user_auth(),
+            Err(ConfigError::NoUsers)
+        ));
     }
 
     #[test]
@@ -552,6 +626,7 @@ mod tests {
             "inbound": { "socks": "127.0.0.1:1080" },
             "outbound": {
                 "server": "vpn.example.com:443",
+                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
                 "reality": {
                     "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
                     "short_id": "deadbeef",
@@ -568,6 +643,20 @@ mod tests {
             "deadbeef".parse::<donut_core::ShortId>().unwrap()
         );
         assert_eq!(cfg.outbound.transport, "veil"); // default
+        assert_eq!(
+            cfg.outbound.user_id().unwrap(),
+            "b831381d-6324-4d53-ad4f-8cda48b30811".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn client_without_uuid_is_rejected() {
+        let json = r#"{
+            "inbound": { "socks": "127.0.0.1:1080" },
+            "outbound": { "server": "vpn.example.com:443", "transport": "raw" }
+        }"#;
+        let cfg: ClientConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(cfg.outbound.user_id(), Err(ConfigError::NoUuid)));
     }
 
     #[test]

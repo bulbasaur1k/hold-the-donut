@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use donut_core::{Address, Command, Endpoint, FlowKind, UserId};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth, UserId};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_wire::{Request, Response};
@@ -88,7 +88,11 @@ async fn spawn_decoy() -> SocketAddr {
     addr
 }
 
-async fn start_server(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> (SocketAddr, SocketAddr) {
+async fn start_server(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    auth: Arc<UserAuth>,
+) -> (SocketAddr, SocketAddr) {
     let echo_addr = spawn_echo().await;
     let decoy_addr = spawn_decoy().await;
     let addr = donut_server::run_raw_proxy(
@@ -96,6 +100,7 @@ async fn start_server(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>
         vec![cert],
         key,
         Some(decoy_addr),
+        auth,
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -113,14 +118,15 @@ async fn raw_tunnel_echo() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (cert, key) = gen_cert();
     let connector = client_connector(cert.clone());
-    let (addr, echo_addr) = start_server(cert, key).await;
+    let user = UserId::new_v4();
+    let (addr, echo_addr) = start_server(cert, key, Arc::new(UserAuth::new(vec![user]))).await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let sni = ServerName::try_from("localhost").unwrap();
     let mut tls = connector.connect(sni, tcp).await.unwrap();
 
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(Endpoint::new(
@@ -159,7 +165,8 @@ async fn raw_vision_tunnel_echo() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (cert, key) = gen_cert();
     let connector = client_connector(cert.clone());
-    let (addr, echo_addr) = start_server(cert, key).await;
+    let user = UserId::new_v4();
+    let (addr, echo_addr) = start_server(cert, key, Arc::new(UserAuth::new(vec![user]))).await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let sni = ServerName::try_from("localhost").unwrap();
@@ -167,7 +174,7 @@ async fn raw_vision_tunnel_echo() {
 
     // VLESS Request carrying the XTLS-Vision flow.
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::Extended,
         command: Command::Tcp,
         target: Some(Endpoint::new(
@@ -221,7 +228,8 @@ async fn raw_self_steal() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (cert, key) = gen_cert();
     let connector = client_connector(cert.clone());
-    let (addr, _echo) = start_server(cert, key).await;
+    let (addr, _echo) =
+        start_server(cert, key, Arc::new(UserAuth::new(vec![UserId::new_v4()]))).await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let sni = ServerName::try_from("localhost").unwrap();
@@ -246,4 +254,54 @@ async fn raw_self_steal() {
     }
     let text = String::from_utf8_lossy(&resp);
     assert!(text.contains("DECOY-SITE"), "raw self-steal must reach decoy, got: {text}");
+}
+
+/// A protocol-conformant VLESS frame carrying a UUID that is **not** in
+/// the server's allowed-user set must be dropped before reaching the
+/// target — no Response prefix, the tunnel just closes. This is the
+/// regression guard for the auth bypass (any UUID was previously
+/// accepted and proxied).
+#[tokio::test]
+async fn raw_rejects_unknown_uuid() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (cert, key) = gen_cert();
+    let connector = client_connector(cert.clone());
+
+    // The server allows exactly one UUID; the client presents a different one.
+    let allowed = UserId::new_v4();
+    let (addr, echo_addr) = start_server(cert, key, Arc::new(UserAuth::new(vec![allowed]))).await;
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let sni = ServerName::try_from("localhost").unwrap();
+    let mut tls = connector.connect(sni, tcp).await.unwrap();
+
+    let request = Request {
+        user: UserId::new_v4(), // not `allowed`
+        flow: FlowKind::None,
+        command: Command::Tcp,
+        target: Some(Endpoint::new(
+            Address::ipv4(match echo_addr.ip() {
+                std::net::IpAddr::V4(v) => v,
+                _ => unreachable!(),
+            }),
+            echo_addr.port(),
+        )),
+        seed: vec![],
+    };
+    let mut framed = BytesMut::with_capacity(request.encoded_len() + 16);
+    request.encode(&mut framed);
+    framed.extend_from_slice(b"hello-raw");
+    tls.write_all(&framed).await.unwrap();
+    tls.flush().await.unwrap();
+
+    // The server drops the session without writing a Response prefix, so
+    // the read must end in EOF — never the echoed payload.
+    let mut prefix = [0u8; 2];
+    let res = timeout(Duration::from_secs(5), tls.read_exact(&mut prefix))
+        .await
+        .expect("read must not hang");
+    assert!(
+        res.is_err(),
+        "unauthorized UUID must be dropped (got a response prefix instead)",
+    );
 }

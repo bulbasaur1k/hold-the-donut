@@ -43,6 +43,51 @@ impl FromStr for UserId {
     }
 }
 
+/// The set of [`UserId`]s a server accepts on the VLESS inner frame.
+///
+/// Membership is the proxy's actual credential check: a session whose
+/// inner-frame UUID is not in this set must be rejected before any
+/// upstream is dialled. An empty set authorises no one (fail-closed).
+#[derive(Debug, Clone, Default)]
+pub struct UserAuth {
+    users: Vec<UserId>,
+}
+
+impl UserAuth {
+    pub fn new(users: Vec<UserId>) -> Self {
+        Self { users }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.users.len()
+    }
+
+    /// Constant-time membership test. The candidate is compared against
+    /// every configured user without short-circuiting — neither the
+    /// byte at which two UUIDs diverge nor which entry matched affects
+    /// the running time, so the secret UUID(s) leak no timing oracle.
+    /// (The set *size* is not secret.)
+    pub fn is_authorized(&self, candidate: &UserId) -> bool {
+        let cand = candidate.as_bytes();
+        let mut found: u8 = 0;
+        for u in &self.users {
+            let a = u.as_bytes();
+            let mut diff: u8 = 0;
+            for i in 0..16 {
+                diff |= a[i] ^ cand[i];
+            }
+            // diff == 0 ⇒ this entry matched. Map 0→0xFF, nonzero→0x00
+            // branchlessly and fold into `found`.
+            found |= ((diff as u16).wrapping_sub(1) >> 8) as u8;
+        }
+        found != 0
+    }
+}
+
 /// Veiled-TLS short identifier. Exactly 8 bytes on the wire, stored
 /// in the plaintext `SessionID[8..16]` of the modified ClientHello.
 ///
@@ -139,5 +184,36 @@ mod tests {
         let u = UserId::new_v4();
         let bytes = *u.as_bytes();
         assert_eq!(UserId::from_bytes(bytes), u);
+    }
+
+    #[test]
+    fn user_auth_membership() {
+        let allowed = UserId::from_bytes([0xab; 16]);
+        let other = UserId::from_bytes([0xcd; 16]);
+        let auth = UserAuth::new(vec![allowed]);
+
+        assert!(auth.is_authorized(&allowed));
+        assert!(!auth.is_authorized(&other));
+        // A near-miss (single differing byte) must still be rejected.
+        let mut near = [0xab; 16];
+        near[15] = 0xac;
+        assert!(!auth.is_authorized(&UserId::from_bytes(near)));
+    }
+
+    #[test]
+    fn user_auth_empty_rejects_all() {
+        let auth = UserAuth::default();
+        assert!(auth.is_empty());
+        assert!(!auth.is_authorized(&UserId::new_v4()));
+    }
+
+    #[test]
+    fn user_auth_multiple_entries() {
+        let a = UserId::from_bytes([0x01; 16]);
+        let b = UserId::from_bytes([0x02; 16]);
+        let auth = UserAuth::new(vec![a, b]);
+        assert!(auth.is_authorized(&a));
+        assert!(auth.is_authorized(&b));
+        assert!(!auth.is_authorized(&UserId::from_bytes([0x03; 16])));
     }
 }

@@ -35,6 +35,16 @@ async fn main() -> anyhow::Result<()> {
     let resolver = std::sync::Arc::new(cfg.resolver()?);
     let metrics = donut_server::Metrics::new();
 
+    // The allowed-user set is the proxy's credential check; it applies to
+    // every transport. Fails closed: `user_auth()` errors if `inbound.users`
+    // is empty, so the daemon refuses to start a wide-open proxy.
+    let auth = std::sync::Arc::new(
+        cfg.inbound
+            .user_auth()
+            .context("materialising inbound.users")?,
+    );
+    tracing::info!(users = auth.len(), "VLESS user authentication enabled");
+
     // Optional Prometheus /metrics endpoint on its own listener.
     if let Some(addr) = &cfg.metrics.listen {
         let maddr: SocketAddr = addr
@@ -59,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 path.clone(),
                 mode,
+                auth,
                 router,
                 resolver,
                 metrics,
@@ -87,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 key,
                 path.clone(),
                 decoy,
+                auth,
                 router,
                 resolver,
                 metrics,
@@ -118,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
                 path.clone(),
                 mode,
                 decoy,
+                auth,
                 router,
                 resolver,
                 metrics,
@@ -140,10 +153,11 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 None => None,
             };
-            let bound =
-                donut_server::run_raw_proxy(listen, cert_chain, key, decoy, router, resolver, metrics)
-                    .await
-                    .context("starting raw proxy")?;
+            let bound = donut_server::run_raw_proxy(
+                listen, cert_chain, key, decoy, auth, router, resolver, metrics,
+            )
+            .await
+            .context("starting raw proxy")?;
             tracing::info!(%bound, ?decoy, "donut-server listening (RAW VLESS over TLS, cert-based, self-steal)");
         }
         // REALITY veiled-TLS front door + selfsteal forward to `dest`.
@@ -164,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
             let cert_chain = reality.cert_chain()?;
             let key = reality.private_key_pem()?;
             let bound = donut_server::run_veil_proxy(
-                listen, cert_chain, key, veil, dest, router, resolver, metrics,
+                listen, cert_chain, key, veil, dest, auth, router, resolver, metrics,
             )
             .await
             .context("starting veil proxy")?;

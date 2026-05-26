@@ -42,6 +42,13 @@ async fn main() -> anyhow::Result<()> {
     let router = std::sync::Arc::new(cfg.router()?);
     let resolver = std::sync::Arc::new(cfg.resolver()?);
 
+    // The VLESS credential presented on every inner frame. Required —
+    // the server drops sessions whose UUID is not in its `inbound.users`.
+    let user = cfg
+        .outbound
+        .user_id()
+        .context("materialising outbound.uuid")?;
+
     match cfg.outbound.transport.as_str() {
         // REALITY veiled-TLS over TCP.
         "veil" => {
@@ -61,10 +68,16 @@ async fn main() -> anyhow::Result<()> {
             let server_name = ServerName::try_from(reality.server_name.clone())
                 .with_context(|| format!("invalid server_name {}", reality.server_name))?;
             let veil_client = donut_client::VeilClient::new(veil_cfg, server_name);
-            let bound =
-                donut_client::run_veil_socks_proxy(socks, veil_client, server, router, resolver)
-                    .await
-                    .context("starting veil socks proxy")?;
+            let bound = donut_client::run_veil_socks_proxy(
+                socks,
+                veil_client,
+                server,
+                user,
+                router,
+                resolver,
+            )
+            .await
+            .context("starting veil socks proxy")?;
             tracing::info!(%bound, %server, "donut-client SOCKS5 listening (VLESS+REALITY+XHTTP/TCP)");
         }
         // Cert-based XHTTP over plain TLS to a reverse-proxy front.
@@ -76,18 +89,20 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("unknown outbound.mode {:?}", cfg.outbound.mode))?;
             let xhttp =
                 donut_client::XhttpClient::new(server_name, cfg.outbound.path.clone(), mode);
-            let bound = donut_client::run_xhttp_socks_proxy(socks, xhttp, server, router, resolver)
-                .await
-                .context("starting xhttp socks proxy")?;
+            let bound =
+                donut_client::run_xhttp_socks_proxy(socks, xhttp, server, user, router, resolver)
+                    .await
+                    .context("starting xhttp socks proxy")?;
             tracing::info!(%bound, %server, path = %cfg.outbound.path, ?mode, "donut-client SOCKS5 listening (XHTTP/TLS, cert-based)");
         }
         // Cert-based XHTTP over HTTP/3 (full-duplex QUIC carrier).
         "h3" => {
             let name = cert_server_name(&cfg.outbound)?;
             let h3 = donut_client::H3Client::new(name, cfg.outbound.path.clone());
-            let bound = donut_client::run_h3_socks_proxy(socks, h3, server, router, resolver)
-                .await
-                .context("starting h3 socks proxy")?;
+            let bound =
+                donut_client::run_h3_socks_proxy(socks, h3, server, user, router, resolver)
+                    .await
+                    .context("starting h3 socks proxy")?;
             tracing::info!(%bound, %server, path = %cfg.outbound.path, "donut-client SOCKS5 listening (XHTTP over HTTP/3, cert-based)");
         }
         // Cert-based RAW: VLESS straight over TLS (no carrier), Xray
@@ -99,10 +114,11 @@ async fn main() -> anyhow::Result<()> {
             let flow = donut_core::FlowKind::from_wire(&cfg.outbound.flow)
                 .with_context(|| format!("unknown outbound.flow {:?}", cfg.outbound.flow))?;
             let raw = donut_client::RawClient::new(server_name);
-            let bound =
-                donut_client::run_raw_socks_proxy(socks, raw, server, router, resolver, flow)
-                    .await
-                    .context("starting raw socks proxy")?;
+            let bound = donut_client::run_raw_socks_proxy(
+                socks, raw, server, user, router, resolver, flow,
+            )
+            .await
+            .context("starting raw socks proxy")?;
             tracing::info!(%bound, %server, ?flow, "donut-client SOCKS5 listening (RAW VLESS over TLS, cert-based)");
         }
         other => anyhow::bail!(

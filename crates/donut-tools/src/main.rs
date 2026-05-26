@@ -186,10 +186,12 @@ fn generate_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
 fn veil_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
     let (private, public) = gen_keypair();
     let short_id = hex::encode(rand::random::<[u8; 8]>());
+    let uuid = donut_core::UserId::new_v4().to_string();
 
     let inbound = ServerInbound {
         listen: args.listen.clone(),
         transport: "veil".into(),
+        users: vec![uuid.clone()],
         reality: Some(RealityServer {
             private_key: BASE64_URL_SAFE_NO_PAD.encode(private),
             short_ids: vec![short_id.clone()],
@@ -206,6 +208,7 @@ fn veil_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
 
     let outbound = ClientOutbound {
         server: args.server_addr.clone(),
+        uuid,
         transport: "veil".into(),
         reality: Some(RealityClient {
             public_key: BASE64_URL_SAFE_NO_PAD.encode(public),
@@ -236,10 +239,12 @@ fn cert_pair(
         .path
         .clone()
         .unwrap_or_else(|| format!("/donut-{}", hex::encode(rand::random::<[u8; 4]>())));
+    let uuid = donut_core::UserId::new_v4().to_string();
 
     let inbound = ServerInbound {
         listen: args.listen.clone(),
         transport: server_transport.into(),
+        users: vec![uuid.clone()],
         reality: None,
         path: path.clone(),
         cert: Some(args.cert.clone()),
@@ -250,6 +255,7 @@ fn cert_pair(
 
     let outbound = ClientOutbound {
         server: args.server_addr.clone(),
+        uuid,
         transport: client_transport.into(),
         reality: None,
         server_name: args.server_name.clone(),
@@ -336,6 +342,7 @@ mod tests {
         // Shared ShortID.
         assert_eq!(server_reality.short_ids[0], client_reality.short_id);
 
+        assert_shared_uuid(&server, &client);
         assert_round_trips(&server, &client);
     }
 
@@ -363,6 +370,7 @@ mod tests {
         assert_eq!(client.outbound.mode, "packet-up");
         assert_eq!(client.outbound.server_name, args.server_name);
 
+        assert_shared_uuid(&server, &client);
         assert_round_trips(&server, &client);
     }
 
@@ -390,6 +398,18 @@ mod tests {
         let (server, client) = generate_pair(&args);
         assert_eq!(server.inbound.path, "/secret-tunnel");
         assert_eq!(client.outbound.path, "/secret-tunnel");
+    }
+
+    /// The client's credential is materialisable and accepted by the
+    /// server's allowed-user set — config-gen must produce a pair that
+    /// actually authenticates.
+    fn assert_shared_uuid(server: &ServerConfig, client: &ClientConfig) {
+        let auth = server.inbound.user_auth().expect("server users materialise");
+        let user = client.outbound.user_id().expect("client uuid materialises");
+        assert!(
+            auth.is_authorized(&user),
+            "generated client UUID must be in the server's allowed set",
+        );
     }
 
     /// Both halves serialise and round-trip back through the loader types.

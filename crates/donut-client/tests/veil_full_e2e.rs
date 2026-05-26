@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use donut_client::{run_veil_socks_proxy, VeilClient};
-use donut_core::ShortId;
+use donut_core::{ShortId, UserAuth, UserId};
 use donut_dns::Resolver;
 use donut_routing::{Router, Rule};
 use donut_server::run_veil_proxy;
@@ -71,13 +71,15 @@ async fn socks5_through_veiled_reality_tunnel_to_echo() {
     let server_pub = veil_server.public_key_bytes();
     let veil_client_cfg = VeilClientConfig::new(server_pub, short_id, [26, 4, 15]);
 
-    // 3. donut-server veiled proxy.
+    // 3. donut-server veiled proxy with a known allowed UUID.
+    let user = UserId::new_v4();
     let server_addr = run_veil_proxy(
         "127.0.0.1:0".parse().unwrap(),
         vec![cert.clone()],
         key,
         veil_server,
         decoy_addr,
+        Arc::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -88,12 +90,14 @@ async fn socks5_through_veiled_reality_tunnel_to_echo() {
     .await
     .expect("bind veil server");
 
-    // 4. donut-client veiled SOCKS5 inbound pointing at the server.
+    // 4. donut-client veiled SOCKS5 inbound pointing at the server,
+    //    presenting the matching UUID.
     let veil_client = VeilClient::new(veil_client_cfg, ServerName::try_from("localhost").unwrap());
     let socks_addr = run_veil_socks_proxy(
         "127.0.0.1:0".parse().unwrap(),
         veil_client,
         server_addr,
+        user,
         Arc::new(Router::new("proxy")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -191,12 +195,14 @@ async fn blackhole_rule_drops_proxied_connection() {
     let router = Arc::new(
         Router::new("freedom").with_rule(Rule::to("block").cidr("127.0.0.0/8".parse().unwrap())),
     );
+    let user = UserId::new_v4();
     let server_addr = run_veil_proxy(
         "127.0.0.1:0".parse().unwrap(),
         vec![cert.clone()],
         key,
         veil_server,
         decoy_addr,
+        Arc::new(UserAuth::new(vec![user])),
         router,
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -212,6 +218,7 @@ async fn blackhole_rule_drops_proxied_connection() {
         "127.0.0.1:0".parse().unwrap(),
         veil_client,
         server_addr,
+        user,
         Arc::new(Router::new("proxy")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -291,6 +298,7 @@ async fn direct_rule_bypasses_the_server() {
         "127.0.0.1:0".parse().unwrap(),
         veil_client,
         unreachable_server,
+        UserId::new_v4(), // direct route never sends a frame to the server
         router,
         resolver,
     )

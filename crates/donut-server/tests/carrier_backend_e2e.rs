@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use donut_core::{Address, Command, Endpoint, FlowKind, UserId};
+use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth, UserId};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_wire::{Request, Response};
@@ -44,10 +44,12 @@ async fn carrier_backend_relays_over_secret_path() {
 
     // 2. donut-server carrier backend on a secret path (what Caddy
     //    reverse-proxies to). No REALITY, no TLS — the front terminates.
+    let user = UserId::new_v4();
     let backend_addr = donut_server::run_carrier_backend(
         "127.0.0.1:0".parse().unwrap(),
         SECRET_PATH.to_string(),
         donut_carrier::Mode::StreamOne,
+        Arc::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -74,7 +76,7 @@ async fn carrier_backend_relays_over_secret_path() {
     .expect("carrier dial");
 
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(Endpoint::new(
@@ -134,10 +136,12 @@ async fn carrier_backend_stream_up_pairs_separate_connections() {
         }
     });
 
+    let user = UserId::new_v4();
     let backend_addr = donut_server::run_carrier_backend(
         "127.0.0.1:0".parse().unwrap(),
         SECRET_PATH.to_string(),
         donut_carrier::Mode::StreamUp,
+        Arc::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -164,7 +168,7 @@ async fn carrier_backend_stream_up_pairs_separate_connections() {
     .expect("carrier dial");
 
     let request = Request {
-        user: UserId::new_v4(),
+        user,
         flow: FlowKind::None,
         command: Command::Tcp,
         target: Some(Endpoint::new(
