@@ -60,6 +60,10 @@ users = ["$UUID"]
 cert = "/etc/donut/fullchain.pem"
 key = "/etc/donut/privkey.pem"
 dest = "127.0.0.1:8080"
+
+# Prometheus /metrics — только на localhost, наружу порт НЕ открывать.
+[metrics]
+listen = "127.0.0.1:9090"
 EOF
 
 # ссылка для клиента — СОХРАНИ её (приватно):
@@ -105,6 +109,7 @@ firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp && firewall-cmd --
 systemctl daemon-reload && systemctl enable --now donut-server
 
 curl -k https://<DOMAIN>                     # проверка: должен открыться сайт-подложка
+curl -s http://127.0.0.1:9090/metrics | head # проверка: счётчики donut_* отдаются
 ```
 
 ### C. Клиент
