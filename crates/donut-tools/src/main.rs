@@ -204,6 +204,7 @@ fn veil_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
         key: None,
         dest: None,
         mode: "stream-one".into(),
+        vision: "donut".into(),
     };
 
     let outbound = ClientOutbound {
@@ -251,6 +252,7 @@ fn cert_pair(
         key: Some(args.key.clone()),
         dest: Some(args.dest.clone()),
         mode: mode.into(),
+        vision: "donut".into(),
     };
 
     let outbound = ClientOutbound {

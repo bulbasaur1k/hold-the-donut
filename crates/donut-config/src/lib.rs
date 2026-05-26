@@ -265,6 +265,12 @@ pub struct ServerInbound {
     /// client's `outbound.mode`. Ignored by other transports.
     #[serde(default = "default_carrier_mode")]
     pub mode: String,
+    /// Vision data-plane dialect for `transport = "raw"` + `flow =
+    /// "xtls-rprx-vision"`: `"donut"` (default, our simpler padding —
+    /// for the donut client) or `"xray"` (byte-faithful Xray Vision —
+    /// interoperates with a real Xray VLESS client). Ignored otherwise.
+    #[serde(default = "default_vision_dialect")]
+    pub vision: String,
     /// Allowed VLESS user UUIDs. A tunnel session whose inner-frame UUID
     /// is not in this list is rejected before any upstream is dialled —
     /// this is the proxy's actual credential check, applied to every
@@ -451,6 +457,10 @@ fn default_client_transport() -> String {
 
 fn default_carrier_mode() -> String {
     "stream-one".to_string()
+}
+
+fn default_vision_dialect() -> String {
+    "donut".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

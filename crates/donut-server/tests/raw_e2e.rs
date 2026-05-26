@@ -100,6 +100,7 @@ async fn start_server(
         vec![cert],
         key,
         Some(decoy_addr),
+        donut_server::VisionDialect::Donut,
         auth,
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(

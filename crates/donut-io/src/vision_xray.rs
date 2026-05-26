@@ -9,7 +9,10 @@
 
 #![allow(dead_code)] // wired into the raw transport in a follow-up step
 
+use std::sync::{Arc, Mutex};
+
 use rand::Rng;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const COMMAND_PADDING_CONTINUE: u8 = 0x00;
 pub const COMMAND_PADDING_END: u8 = 0x01;
@@ -282,6 +285,107 @@ pub fn is_complete_record(mut b: &[u8]) -> bool {
         b = &b[total..];
     }
     true
+}
+
+/// Server-side faithful Vision data-plane (RAW inbound). Bridges the
+/// Vision-framed `tunnel` (donut↔Xray) to the plaintext `upstream`:
+/// - **uplink** (client→server): un-pads via [`Unpadder`], filters the inner
+///   ClientHello, writes plaintext to `upstream`.
+/// - **downlink** (server→client): pads upstream bytes (UUID-prefixed first
+///   block), filters the inner ServerHello → on inner TLS 1.3 it emits
+///   `CommandPaddingDirect` and splices raw.
+///
+/// `uuid` is the authenticated VLESS user (`TrafficState.UserUUID`). Call
+/// **after** the VLESS request is read and the VLESS response prefix written
+/// (both raw, outside Vision).
+pub async fn vision_server_copy<T, U>(tunnel: T, upstream: U, uuid: [u8; 16]) -> std::io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut tr, mut tw) = tokio::io::split(tunnel);
+    let (mut ur, mut uw) = tokio::io::split(upstream);
+    let shared = Arc::new(Mutex::new(FilterState::default()));
+
+    // uplink: tunnel (padded by client) -> unpad + filter -> upstream
+    let s_up = shared.clone();
+    let uplink = async move {
+        let mut unp = Unpadder::new(uuid);
+        let mut buf = vec![0u8; BUF_SIZE];
+        loop {
+            let n = tr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let content = unp.push(&buf[..n]);
+            tracing::debug!(read = n, content = content.len(), direct = unp.direct(), "vision uplink");
+            if !content.is_empty() {
+                {
+                    let mut f = s_up.lock().expect("vision filter lock");
+                    if f.number_to_filter > 0 {
+                        f.filter(&content);
+                    }
+                }
+                uw.write_all(&content).await?;
+            }
+        }
+        let _ = uw.shutdown().await;
+        Ok::<(), std::io::Error>(())
+    };
+
+    // downlink: upstream -> pad (UUID first) + filter (ServerHello -> Direct) -> tunnel
+    let s_down = shared.clone();
+    let downlink = async move {
+        let mut uuid_once = Some(uuid);
+        let mut is_padding = true;
+        let mut direct = false;
+        let mut buf = vec![0u8; BUF_SIZE];
+        loop {
+            let n = ur.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            if direct {
+                tracing::debug!(raw = n, "vision downlink raw (spliced)");
+                tw.write_all(chunk).await?;
+                continue;
+            }
+            let (is_tls, enable_xtls) = {
+                let mut f = s_down.lock().expect("vision filter lock");
+                if f.number_to_filter > 0 {
+                    f.filter(chunk);
+                }
+                (f.is_tls, f.enable_xtls)
+            };
+            if is_padding {
+                let app_data = is_tls
+                    && chunk.len() >= 6
+                    && chunk.starts_with(&TLS_APP_DATA_START)
+                    && is_complete_record(chunk);
+                let command = if app_data {
+                    is_padding = false;
+                    if enable_xtls {
+                        direct = true;
+                        COMMAND_PADDING_DIRECT
+                    } else {
+                        COMMAND_PADDING_END
+                    }
+                } else {
+                    COMMAND_PADDING_CONTINUE
+                };
+                let block = xtls_padding(chunk, command, &mut uuid_once, is_tls, &DEFAULT_SEED);
+                tw.write_all(&block).await?;
+            } else {
+                tw.write_all(chunk).await?;
+            }
+        }
+        let _ = tw.shutdown().await;
+        Ok::<(), std::io::Error>(())
+    };
+
+    tokio::try_join!(uplink, downlink)?;
+    Ok(())
 }
 
 #[cfg(test)]
