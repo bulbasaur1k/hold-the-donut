@@ -11,19 +11,26 @@
 //! source of `(stream, target)` pairs satisfies it.
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
-use donut_core::{Address, Command, Endpoint};
+use donut_core::{Address, Command, Endpoint, FlowKind};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_veil::VeilServerConfig;
 use donut_wire::{Request, Response, WireError};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+
+/// VLESS inner-frame version byte: the first byte of every tunnel
+/// request. A first decrypted byte that is *not* this is treated as a
+/// non-tunnel (probe / browser) connection and self-stolen to the decoy.
+const VLESS_VERSION: u8 = 0x00;
 
 use crate::metrics::Metrics;
 use crate::veil_server::VeilServer;
@@ -180,6 +187,7 @@ pub async fn run_tls_carrier_proxy(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     secret_path: String,
+    mode: donut_carrier::Mode,
     decoy: Option<SocketAddr>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
@@ -194,18 +202,47 @@ pub async fn run_tls_carrier_proxy(
     .with_single_cert(cert_chain, key)
     .map_err(|e| ProxyError::Tls(e.to_string()))?;
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let acceptor = TlsAcceptor::from(Arc::new(tls));
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls));
 
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
 
-    let carrier_cfg = Arc::new(donut_carrier::ServerConfig {
-        mode: donut_carrier::Mode::StreamOne,
-        path_prefix: secret_path,
-        decoy,
-        ..donut_carrier::ServerConfig::default()
-    });
+    // One acceptor with a **shared** dispatcher so stream-up / packet-up
+    // can pair the uplink POST and downlink GET that arrive on separate
+    // TLS connections (stream-one pairs within a single connection too).
+    let (acceptor, mut rx) =
+        donut_carrier::server::ConnectionAcceptor::new(donut_carrier::ServerConfig {
+            mode,
+            path_prefix: secret_path,
+            decoy,
+            ..donut_carrier::ServerConfig::default()
+        });
 
+    // Session consumer: each paired carrier session becomes a proxied
+    // VLESS tunnel.
+    {
+        let router = router.clone();
+        let resolver = resolver.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            while let Some(session) = rx.recv().await {
+                let router = router.clone();
+                let resolver = resolver.clone();
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    let _active = metrics.tunnel_started();
+                    if let Err(e) =
+                        handle_session(session.stream, router, resolver, metrics).await
+                    {
+                        tracing::trace!(?e, "tls-carrier session ended with error");
+                    }
+                });
+            }
+        });
+    }
+
+    // Accept loop: terminate TLS, then feed the connection to the shared
+    // dispatcher.
     tokio::spawn(async move {
         loop {
             let (tcp, peer) = match listener.accept().await {
@@ -215,38 +252,18 @@ pub async fn run_tls_carrier_proxy(
                     continue;
                 }
             };
+            let tls_acceptor = tls_acceptor.clone();
             let acceptor = acceptor.clone();
-            let carrier_cfg = carrier_cfg.clone();
-            let router = router.clone();
-            let resolver = resolver.clone();
-            let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
-                let tls_stream = match acceptor.accept(tcp).await {
+                let tls_stream = match tls_acceptor.accept(tcp).await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::trace!(?e, "tls-carrier handshake failed");
                         return;
                     }
                 };
-                let mut rx = donut_carrier::server::serve_connection(
-                    tls_stream,
-                    (*carrier_cfg).clone(),
-                    peer,
-                );
-                while let Some(session) = rx.recv().await {
-                    let router = router.clone();
-                    let resolver = resolver.clone();
-                    let metrics = metrics.clone();
-                    tokio::spawn(async move {
-                        let _active = metrics.tunnel_started();
-                        if let Err(e) =
-                            handle_session(session.stream, router, resolver, metrics).await
-                        {
-                            tracing::trace!(?e, "tls-carrier session ended with error");
-                        }
-                    });
-                }
+                acceptor.drive(tls_stream, peer);
             });
         }
     });
@@ -364,6 +381,7 @@ where
         }
     };
     let (request, leftover) = request;
+    let flow = request.flow;
 
     let target_endpoint = request.target.ok_or(ProxyError::UnsupportedCommand)?;
     if !matches!(request.command, Command::Tcp) {
@@ -391,17 +409,36 @@ where
     Response::default().encode(&mut response_buf);
     session.write_all(&response_buf).await?;
 
-    // Push any leftover client bytes that came in the same read as
-    // the inner-frame header.
-    if !leftover.is_empty() {
-        upstream.write_all(&leftover).await?;
+    match flow {
+        // XTLS-Vision: the data-plane is framed with first-packet
+        // padding. The `leftover` bytes are the start of the first framed
+        // packet — replay them into the Vision decoder.
+        FlowKind::Extended => {
+            let tunnel = Prefixed::new(leftover.to_vec(), session);
+            if let Err(e) = donut_io::vision::copy_bidirectional(
+                tunnel,
+                upstream,
+                donut_io::vision::VisionConfig::default(),
+            )
+            .await
+            {
+                tracing::trace!(?e, "vision session ended with error");
+            }
+        }
+        // Plain VLESS: raw bidirectional copy. Push any leftover client
+        // bytes that came in the same read as the inner-frame header.
+        FlowKind::None => {
+            if !leftover.is_empty() {
+                upstream.write_all(&leftover).await?;
+            }
+            if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut session, &mut upstream).await
+            {
+                metrics.add_bytes(up, down);
+            }
+            let _ = upstream.shutdown().await;
+            let _ = session.shutdown().await;
+        }
     }
-
-    if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut session, &mut upstream).await {
-        metrics.add_bytes(up, down);
-    }
-    let _ = upstream.shutdown().await;
-    let _ = session.shutdown().await;
     Ok(())
 }
 
@@ -414,6 +451,156 @@ async fn resolve(resolver: &Resolver, ep: &Endpoint) -> Result<SocketAddr, Proxy
             .resolve_one(d, ep.port)
             .await
             .map_err(|e| ProxyError::Resolve(format!("{d}: {e}"))),
+    }
+}
+
+/// Bind a **cert-based RAW proxy** on `bind_addr` (TCP): donut-server
+/// terminates TLS itself with a real certificate, then the first
+/// decrypted byte decides the connection. A VLESS inner frame
+/// (`0x00` version) is proxied directly over the decrypted stream — no
+/// HTTP carrier wrapping, the closest analogue to Xray's `RAW`/TCP
+/// network and the transport that `xtls-rprx-vision` rides on. Anything
+/// else (an HTTP probe / a browser) is relayed to the `decoy` backend
+/// (filebrowser) so the port self-steals like an ordinary HTTPS site.
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
+pub async fn run_raw_proxy(
+    bind_addr: SocketAddr,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    decoy: Option<SocketAddr>,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+) -> Result<SocketAddr, ProxyError> {
+    let mut tls = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|e| ProxyError::Tls(e.to_string()))?
+    .with_no_client_auth()
+    .with_single_cert(cert_chain, key)
+    .map_err(|e| ProxyError::Tls(e.to_string()))?;
+    // Offer http/1.1 so a probing browser negotiates a protocol the decoy
+    // (filebrowser, HTTP/1.1) can answer; our own client offers the same.
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(tls));
+
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(?e, "raw accept error");
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let router = router.clone();
+            let resolver = resolver.clone();
+            let metrics = metrics.clone();
+            metrics.connection_accepted();
+            tokio::spawn(async move {
+                let mut tls = match acceptor.accept(tcp).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::trace!(?e, "raw tls handshake failed");
+                        return;
+                    }
+                };
+                // Peek the first decrypted byte to triage VLESS vs probe.
+                let mut first = [0u8; 1];
+                match tls.read(&mut first).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                if first[0] == VLESS_VERSION {
+                    let stream = Prefixed::new(vec![first[0]], tls);
+                    let _active = metrics.tunnel_started();
+                    if let Err(e) = handle_session(stream, router, resolver, metrics).await {
+                        tracing::trace!(?e, "raw proxy session ended with error");
+                    }
+                } else if let Some(decoy) = decoy {
+                    tracing::trace!(%decoy, "raw: non-tunnel connection → decoy self-steal");
+                    metrics.forwarded();
+                    let stream = Prefixed::new(vec![first[0]], tls);
+                    relay_to_decoy(stream, decoy).await;
+                } else {
+                    tracing::trace!("raw: non-tunnel connection, no decoy → drop");
+                }
+            });
+        }
+    });
+
+    Ok(local)
+}
+
+/// Bidirectionally relay a (partly-consumed) client stream to the decoy
+/// backend so a probe sees an ordinary site.
+async fn relay_to_decoy<S>(mut client: S, decoy: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match TcpStream::connect(decoy).await {
+        Ok(mut up) => {
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+            let _ = up.shutdown().await;
+        }
+        Err(e) => tracing::trace!(?e, %decoy, "raw decoy connect failed"),
+    }
+}
+
+/// An `AsyncRead + AsyncWrite` that replays `prefix` bytes before the
+/// inner stream — used to "un-read" the byte(s) peeked during triage.
+struct Prefixed<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S> Prefixed<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.pos < this.prefix.len() {
+            let rem = &this.prefix[this.pos..];
+            let n = rem.len().min(buf.remaining());
+            buf.put_slice(&rem[..n]);
+            this.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 

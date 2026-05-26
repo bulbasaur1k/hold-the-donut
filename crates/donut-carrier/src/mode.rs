@@ -19,3 +19,16 @@ pub enum Mode {
     /// blocked by middleboxes.
     PacketUp,
 }
+
+impl Mode {
+    /// Parse the kebab-case config string (`"stream-one"`, `"stream-up"`,
+    /// `"packet-up"`) into a [`Mode`]. Returns `None` for unknown values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "stream-one" => Some(Self::StreamOne),
+            "stream-up" => Some(Self::StreamUp),
+            "packet-up" => Some(Self::PacketUp),
+            _ => None,
+        }
+    }
+}

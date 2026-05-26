@@ -71,6 +71,12 @@ impl Dispatcher {
         let (sid, _tail) = match session_extract::session_id(&req, &self.config) {
             Ok(v) => v,
             Err(e) => {
+                // Not a valid tunnel request: self-steal to the decoy so
+                // the endpoint looks like an ordinary site, else 404.
+                if let Some(decoy) = self.config.decoy {
+                    tracing::trace!(?e, %decoy, "stream-up: non-tunnel request → decoy");
+                    return super::proxy_to_decoy(req, decoy).await;
+                }
                 tracing::debug!(?e, "stream-up: session extraction failed");
                 return Ok(empty_response(StatusCode::NOT_FOUND));
             }

@@ -75,7 +75,7 @@ impl Metrics {
              # HELP donut_active_connections Currently active tunnelled connections.\n\
              # TYPE donut_active_connections gauge\n\
              donut_active_connections {active}\n\
-             # HELP donut_handshakes_total REALITY triage outcomes.\n\
+             # HELP donut_handshakes_total Connection triage outcomes (tunnel vs decoy self-steal).\n\
              # TYPE donut_handshakes_total counter\n\
              donut_handshakes_total{{result=\"tunnel\"}} {tunnel}\n\
              donut_handshakes_total{{result=\"forward\"}} {forward}\n\

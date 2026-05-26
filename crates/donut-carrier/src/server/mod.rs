@@ -87,6 +87,55 @@ where
     rx
 }
 
+/// Drives many incoming carrier connections through a **single shared
+/// dispatcher**. The multi-request modes (`stream-up`, `packet-up`) pair
+/// requests by session id across *different* connections (e.g. the
+/// uplink POST and downlink GET arrive on separate TLS connections to a
+/// cert-terminating donut-server); a per-connection dispatcher — as
+/// [`serve_connection`] builds — cannot pair them. Build one acceptor,
+/// then call [`ConnectionAcceptor::drive`] for every accepted connection;
+/// consume the paired sessions from the returned receiver.
+#[derive(Clone)]
+pub struct ConnectionAcceptor {
+    cfg: Arc<ServerConfig>,
+    tx: mpsc::Sender<Session>,
+    dispatcher: SharedDispatcher,
+}
+
+impl ConnectionAcceptor {
+    /// Build an acceptor for `config` and the session receiver that all
+    /// driven connections feed.
+    pub fn new(config: ServerConfig) -> (Self, mpsc::Receiver<Session>) {
+        let (tx, rx) = mpsc::channel::<Session>(64);
+        let cfg = Arc::new(config);
+        let dispatcher = build_dispatcher(&cfg, &tx);
+        (
+            Self {
+                cfg,
+                tx,
+                dispatcher,
+            },
+            rx,
+        )
+    }
+
+    /// Drive a freshly accepted connection's byte stream. The hyper
+    /// connection runs on a background task; its requests feed the shared
+    /// dispatcher, so sessions surface on the acceptor's receiver.
+    pub fn drive<IO>(&self, io: IO, remote: SocketAddr)
+    where
+        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        tokio::spawn(drive_connection(
+            io,
+            self.cfg.clone(),
+            self.tx.clone(),
+            self.dispatcher.clone(),
+            remote,
+        ));
+    }
+}
+
 fn build_dispatcher(cfg: &Arc<ServerConfig>, tx: &mpsc::Sender<Session>) -> SharedDispatcher {
     match cfg.mode {
         Mode::StreamOne => SharedDispatcher::StreamOne,
@@ -205,10 +254,32 @@ pub(crate) async fn proxy_to_decoy(
         .uri
         .path_and_query()
         .map(|p| p.as_str())
-        .unwrap_or("/");
-    let mut builder = Request::builder().method(parts.method).uri(path);
+        .unwrap_or("/")
+        .to_string();
+    // HTTP/2 callers carry the authority in `:authority` (the URI), not a
+    // `host` header; HTTP/1.1 callers carry it in `host`. The HTTP/1.1
+    // upstream requires a Host header, so derive it from whichever is set.
+    let host = parts
+        .uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| {
+            parts
+                .headers
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "localhost".to_string());
+    let mut builder = Request::builder()
+        .method(parts.method)
+        .uri(path)
+        .header(http::header::HOST, host);
     for (k, v) in parts.headers.iter() {
-        if k == http::header::CONNECTION || k == http::header::TRANSFER_ENCODING {
+        if k == http::header::HOST
+            || k == http::header::CONNECTION
+            || k == http::header::TRANSFER_ENCODING
+        {
             continue;
         }
         builder = builder.header(k, v);

@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod connect;
 mod error;
 mod io_glue;
 mod mode;
@@ -31,6 +32,7 @@ pub mod server;
 mod tests;
 
 pub use config::{ClientConfig, ServerConfig};
+pub use connect::{tcp_connector, BoxIo, Connector, DuplexIo};
 pub use error::CarrierError;
 pub use io_glue::CarrierStream;
 pub use mode::Mode;

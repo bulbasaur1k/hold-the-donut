@@ -7,3 +7,5 @@
 //! Status: **M0 stub.**
 
 #![forbid(unsafe_op_in_unsafe_fn)]
+
+pub mod vision;

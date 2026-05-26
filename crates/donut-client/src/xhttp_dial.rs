@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use donut_carrier::{CarrierStream, ClientConfig as CarrierClientConfig, Mode};
+use donut_carrier::{BoxIo, CarrierStream, ClientConfig as CarrierClientConfig, Connector, Mode};
 use donut_veil::Fingerprint;
 use rustls::client::ClientHelloMutator;
 use rustls::pki_types::ServerName;
@@ -31,8 +31,9 @@ pub struct XhttpClient {
 impl XhttpClient {
     /// `server_name` is the TLS SNI / certificate name of the front;
     /// `path` is the secret path prefix the front routes to the carrier
-    /// backend (must match the server's `inbound.path`).
-    pub fn new(server_name: ServerName<'static>, path: String) -> Self {
+    /// backend (must match the server's `inbound.path`); `mode` is the
+    /// carrier framing mode (must match the server's `inbound.mode`).
+    pub fn new(server_name: ServerName<'static>, path: String, mode: Mode) -> Self {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -61,7 +62,7 @@ impl XhttpClient {
             _ => "localhost".to_string(),
         };
         let carrier_cfg = CarrierClientConfig {
-            mode: Mode::StreamOne,
+            mode,
             path_prefix: path,
             host,
             ..CarrierClientConfig::default()
@@ -100,15 +101,24 @@ impl XhttpClient {
         Err(last)
     }
 
-    /// One TCP + TLS connect + carrier dial attempt.
+    /// One carrier dial attempt. Builds a TLS connection factory (each
+    /// call = fresh TCP + TLS 1.3 with a randomized fingerprint) and
+    /// hands it to the carrier client, which opens one connection for
+    /// `stream-one`, two for `stream-up`, or many for `packet-up`.
     async fn connect_once(&self, addr: SocketAddr) -> io::Result<CarrierStream> {
-        let tcp = TcpStream::connect(addr).await?;
-        tcp.set_nodelay(true).ok();
-        let tls = self
-            .connector
-            .connect(self.server_name.clone(), tcp)
-            .await?;
-        donut_carrier::client::dial_over_stream(tls, &self.carrier_cfg)
+        let connector = self.connector.clone();
+        let server_name = self.server_name.clone();
+        let tls_factory: Arc<dyn Connector> = Arc::new(move || {
+            let connector = connector.clone();
+            let server_name = server_name.clone();
+            async move {
+                let tcp = TcpStream::connect(addr).await?;
+                tcp.set_nodelay(true).ok();
+                let tls = connector.connect(server_name, tcp).await?;
+                Ok(Box::new(tls) as BoxIo)
+            }
+        });
+        donut_carrier::client::dial_with(tls_factory, &self.carrier_cfg)
             .await
             .map_err(|e| io::Error::other(format!("carrier dial: {e}")))
     }

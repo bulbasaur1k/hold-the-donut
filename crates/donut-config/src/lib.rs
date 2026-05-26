@@ -93,14 +93,23 @@ fn default_level() -> String {
 pub struct LogConfig {
     #[serde(default = "default_level")]
     pub level: String,
+    /// Log output format: `"text"` (default, human-readable) or `"json"`
+    /// (structured, one JSON object per line — for log-analysis tooling).
+    #[serde(default = "default_log_format")]
+    pub format: String,
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: default_level(),
+            format: default_log_format(),
         }
     }
+}
+
+fn default_log_format() -> String {
+    "text".to_string()
 }
 
 // ---- server ----------------------------------------------------------
@@ -243,6 +252,11 @@ pub struct ServerInbound {
     /// get a 404.
     #[serde(default)]
     pub dest: Option<String>,
+    /// Carrier framing mode for `transport = "tls"`: `"stream-one"`
+    /// (default), `"stream-up"`, or `"packet-up"`. Must match the
+    /// client's `outbound.mode`. Ignored by other transports.
+    #[serde(default = "default_carrier_mode")]
+    pub mode: String,
 }
 
 impl ServerInbound {
@@ -368,10 +382,26 @@ pub struct ClientOutbound {
     /// (`xhttp`/`h3`). Must match the server's `inbound.path`.
     #[serde(default = "default_carrier_path")]
     pub path: String,
+    /// Carrier framing mode for `xhttp`: `"stream-one"` (default,
+    /// single full-duplex exchange), `"stream-up"` (separate POST-up /
+    /// GET-down connections), or `"packet-up"` (many sequenced POSTs +
+    /// one GET). Must match the server's `inbound.mode`. Ignored by
+    /// `veil`/`h3`.
+    #[serde(default = "default_carrier_mode")]
+    pub mode: String,
+    /// XTLS flow for `transport = "raw"`: `""`/`"none"` (default, plain
+    /// VLESS) or `"xtls-rprx-vision"` (first-packet padding against
+    /// TLS-in-TLS detection). Ignored by carrier transports.
+    #[serde(default)]
+    pub flow: String,
 }
 
 fn default_client_transport() -> String {
     "veil".to_string()
+}
+
+fn default_carrier_mode() -> String {
+    "stream-one".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = donut_config::load_client(&args.config)
         .with_context(|| format!("loading client config {}", args.config))?;
 
-    init_tracing(&cfg.log.level);
+    init_tracing(&cfg.log.level, &cfg.log.format);
 
     let socks: SocketAddr = cfg
         .inbound
@@ -72,11 +72,14 @@ async fn main() -> anyhow::Result<()> {
             let name = cert_server_name(&cfg.outbound)?;
             let server_name = ServerName::try_from(name.clone())
                 .with_context(|| format!("invalid server_name {name}"))?;
-            let xhttp = donut_client::XhttpClient::new(server_name, cfg.outbound.path.clone());
+            let mode = donut_carrier::Mode::parse(&cfg.outbound.mode)
+                .with_context(|| format!("unknown outbound.mode {:?}", cfg.outbound.mode))?;
+            let xhttp =
+                donut_client::XhttpClient::new(server_name, cfg.outbound.path.clone(), mode);
             let bound = donut_client::run_xhttp_socks_proxy(socks, xhttp, server, router, resolver)
                 .await
                 .context("starting xhttp socks proxy")?;
-            tracing::info!(%bound, %server, path = %cfg.outbound.path, "donut-client SOCKS5 listening (XHTTP/TLS, cert-based)");
+            tracing::info!(%bound, %server, path = %cfg.outbound.path, ?mode, "donut-client SOCKS5 listening (XHTTP/TLS, cert-based)");
         }
         // Cert-based XHTTP over HTTP/3 (full-duplex QUIC carrier).
         "h3" => {
@@ -87,8 +90,23 @@ async fn main() -> anyhow::Result<()> {
                 .context("starting h3 socks proxy")?;
             tracing::info!(%bound, %server, path = %cfg.outbound.path, "donut-client SOCKS5 listening (XHTTP over HTTP/3, cert-based)");
         }
+        // Cert-based RAW: VLESS straight over TLS (no carrier), Xray
+        // RAW/TCP analogue; the transport `xtls-rprx-vision` rides on.
+        "raw" => {
+            let name = cert_server_name(&cfg.outbound)?;
+            let server_name = ServerName::try_from(name.clone())
+                .with_context(|| format!("invalid server_name {name}"))?;
+            let flow = donut_core::FlowKind::from_wire(&cfg.outbound.flow)
+                .with_context(|| format!("unknown outbound.flow {:?}", cfg.outbound.flow))?;
+            let raw = donut_client::RawClient::new(server_name);
+            let bound =
+                donut_client::run_raw_socks_proxy(socks, raw, server, router, resolver, flow)
+                    .await
+                    .context("starting raw socks proxy")?;
+            tracing::info!(%bound, %server, ?flow, "donut-client SOCKS5 listening (RAW VLESS over TLS, cert-based)");
+        }
         other => anyhow::bail!(
-            "unknown outbound.transport {other:?} (expected \"veil\", \"xhttp\" or \"h3\")"
+            "unknown outbound.transport {other:?} (expected \"veil\", \"xhttp\", \"h3\" or \"raw\")"
         ),
     }
 
@@ -118,10 +136,17 @@ fn cert_server_name(outbound: &donut_config::ClientOutbound) -> anyhow::Result<S
     Ok(host.to_string())
 }
 
-fn init_tracing(level: &str) {
+fn init_tracing(level: &str, format: &str) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    if format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }
 
 async fn shutdown_signal() {

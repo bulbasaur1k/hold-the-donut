@@ -9,13 +9,15 @@
 
 mod h3_dial;
 mod local_proxy;
+mod raw_dial;
 mod veil_dial;
 mod xhttp_dial;
 
 pub use h3_dial::H3Client;
 pub use local_proxy::{
-    run_h3_socks_proxy, run_local_socks_proxy, run_veil_socks_proxy, run_xhttp_socks_proxy,
-    LocalProxyError,
+    run_h3_socks_proxy, run_local_socks_proxy, run_raw_socks_proxy, run_veil_socks_proxy,
+    run_xhttp_socks_proxy, LocalProxyError,
 };
+pub use raw_dial::RawClient;
 pub use veil_dial::VeilClient;
 pub use xhttp_dial::XhttpClient;

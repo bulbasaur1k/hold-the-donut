@@ -14,6 +14,8 @@ Cargo.lock.lock
 .env.local
 /dist
 /release
+# Cross-built server binary extracted from the Docker image for deploy
+/donut-server
 # CI artifacts
 coverage/
 *.profraw

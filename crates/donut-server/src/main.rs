@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = donut_config::load_server(&args.config)
         .with_context(|| format!("loading server config {}", args.config))?;
 
-    init_tracing(&cfg.log.level);
+    init_tracing(&cfg.log.level, &cfg.log.format);
 
     let listen: SocketAddr = cfg
         .inbound
@@ -94,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
             let cert_chain = cfg.inbound.cert_chain()?;
             let key = cfg.inbound.private_key_pem()?;
             let path = cfg.inbound.path.clone();
+            let mode = donut_carrier::Mode::parse(&cfg.inbound.mode)
+                .with_context(|| format!("unknown inbound.mode {:?}", cfg.inbound.mode))?;
             let decoy: Option<SocketAddr> = match cfg.inbound.dest.as_deref() {
                 Some(d) => Some(
                     d.parse()
@@ -106,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
                 cert_chain,
                 key,
                 path.clone(),
+                mode,
                 decoy,
                 router,
                 resolver,
@@ -113,7 +116,27 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             .context("starting tls carrier proxy")?;
-            tracing::info!(%bound, %path, ?decoy, "donut-server listening (TLS carrier, cert-based, self-steal)");
+            tracing::info!(%bound, %path, ?mode, ?decoy, "donut-server listening (TLS carrier, cert-based, self-steal)");
+        }
+        // Cert-based RAW: VLESS directly over TLS on TCP (no carrier
+        // wrapping); first decrypted byte triages VLESS-vs-probe, probes
+        // self-steal to `dest` (filebrowser). This is Xray's RAW/TCP
+        // analogue and the transport `xtls-rprx-vision` rides on.
+        "raw" => {
+            let cert_chain = cfg.inbound.cert_chain()?;
+            let key = cfg.inbound.private_key_pem()?;
+            let decoy: Option<SocketAddr> = match cfg.inbound.dest.as_deref() {
+                Some(d) => Some(
+                    d.parse()
+                        .with_context(|| format!("parsing inbound.dest {d}"))?,
+                ),
+                None => None,
+            };
+            let bound =
+                donut_server::run_raw_proxy(listen, cert_chain, key, decoy, router, resolver, metrics)
+                    .await
+                    .context("starting raw proxy")?;
+            tracing::info!(%bound, ?decoy, "donut-server listening (RAW VLESS over TLS, cert-based, self-steal)");
         }
         // REALITY veiled-TLS front door + selfsteal forward to `dest`.
         "veil" => {
@@ -140,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%bound, %dest, "donut-server listening (VLESS+REALITY+XHTTP)");
         }
         other => anyhow::bail!(
-            "unknown inbound.transport {other:?} (expected \"veil\", \"carrier\", \"quic\" or \"tls\")"
+            "unknown inbound.transport {other:?} (expected \"veil\", \"carrier\", \"quic\", \"tls\" or \"raw\")"
         ),
     }
 
@@ -149,10 +172,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_tracing(level: &str) {
+fn init_tracing(level: &str, format: &str) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    if format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }
 
 async fn shutdown_signal() {

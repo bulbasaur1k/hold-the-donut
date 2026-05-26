@@ -80,11 +80,11 @@ hex = "0.4"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 # DNS
-hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config", "dns-over-rustls", "dns-over-https-rustls"] }
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config", "dns-over-rustls", "dns-over-https-rustls", "webpki-roots"] }
 
 # Collections / concurrency
 arc-swap = "1"

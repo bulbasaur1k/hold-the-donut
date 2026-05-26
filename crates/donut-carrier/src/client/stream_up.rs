@@ -7,7 +7,7 @@
 //! The two halves are bridged into a single bidirectional
 //! [`CarrierStream`] returned to the caller.
 
-use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -17,10 +17,10 @@ use hyper::body::Frame;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio_util::io::ReaderStream;
 
 use crate::config::ClientConfig;
+use crate::connect::Connector;
 use crate::error::CarrierError;
 use crate::io_glue::{CarrierStream, PIPE_CAPACITY};
 use crate::placement::Placement;
@@ -29,7 +29,7 @@ use crate::session::SessionId;
 type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
 pub(super) async fn dial(
-    target: SocketAddr,
+    connector: Arc<dyn Connector>,
     config: &ClientConfig,
     sid: SessionId,
 ) -> Result<CarrierStream, CarrierError> {
@@ -37,16 +37,15 @@ pub(super) async fn dial(
     let (bridge_rd, mut bridge_wr) = tokio::io::split(bridge_side);
 
     // Uplink — a single chunked POST whose body is sourced from the
-    // user's writes (i.e. from `bridge_rd`).
+    // user's writes (i.e. from `bridge_rd`), on its own connection.
     let upload_path = compose_path(config, sid, false);
     let upload_body: BoxedBody =
         StreamBody::new(ReaderStream::new(bridge_rd).map_ok(Frame::data)).boxed();
     let upload_req = build_request("POST", &upload_path, config, sid, upload_body)?;
 
-    let upload_tcp = TcpStream::connect(target).await?;
-    upload_tcp.set_nodelay(true).ok();
+    let upload_io = connector.connect().await?;
     let (mut upload_sender, upload_conn) =
-        http1::handshake::<_, BoxedBody>(TokioIo::new(upload_tcp)).await?;
+        http1::handshake::<_, BoxedBody>(TokioIo::new(upload_io)).await?;
     tokio::spawn(async move {
         if let Err(e) = upload_conn.await {
             tracing::trace!(?e, "stream-up uplink connection ended");
@@ -76,10 +75,9 @@ pub(super) async fn dial(
             .boxed(),
     )?;
 
-    let download_tcp = TcpStream::connect(target).await?;
-    download_tcp.set_nodelay(true).ok();
+    let download_io = connector.connect().await?;
     let (mut download_sender, download_conn) =
-        http1::handshake::<_, BoxedBody>(TokioIo::new(download_tcp)).await?;
+        http1::handshake::<_, BoxedBody>(TokioIo::new(download_io)).await?;
     tokio::spawn(async move {
         if let Err(e) = download_conn.await {
             tracing::trace!(?e, "stream-up downlink connection ended");

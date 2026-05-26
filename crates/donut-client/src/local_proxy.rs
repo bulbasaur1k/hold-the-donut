@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::h3_dial::H3Client;
+use crate::raw_dial::RawClient;
 use crate::veil_dial::VeilClient;
 use crate::xhttp_dial::XhttpClient;
 
@@ -378,4 +379,113 @@ async fn handle_h3_socks_session(
             bridge_carrier_to_socks(pending, carrier).await
         }
     }
+}
+
+/// Bind a SOCKS5 listener and, for each CONNECT, dial the donut-server
+/// through a **cert-based RAW** tunnel ([`RawClient`]): VLESS straight
+/// over TLS 1.3 (no carrier wrapping), the analogue of Xray's RAW/TCP
+/// network. Split-tunnel routing identical to the other transports.
+/// Returns the bound local address.
+pub async fn run_raw_socks_proxy(
+    local_addr: SocketAddr,
+    raw_client: RawClient,
+    server_addr: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    flow: FlowKind,
+) -> Result<SocketAddr, LocalProxyError> {
+    let listener = TcpListener::bind(local_addr).await?;
+    let local = listener.local_addr()?;
+    let raw_client = Arc::new(raw_client);
+    tokio::spawn(async move {
+        loop {
+            let (sock, _peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let raw_client = raw_client.clone();
+            let router = router.clone();
+            let resolver = resolver.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_raw_socks_session(sock, raw_client, server_addr, router, resolver, flow)
+                        .await
+                {
+                    tracing::trace!(?e, "local raw socks proxy session ended");
+                }
+            });
+        }
+    });
+    Ok(local)
+}
+
+async fn handle_raw_socks_session(
+    sock: tokio::net::TcpStream,
+    raw_client: Arc<RawClient>,
+    server_addr: SocketAddr,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    flow: FlowKind,
+) -> Result<(), LocalProxyError> {
+    let pending = handshake_connect(sock).await?;
+    match classify_route(&router, &pending.target) {
+        Route::Block => {
+            tracing::debug!(target = %pending.target, "split-tunnel: blocked, dropping");
+            Ok(())
+        }
+        Route::Direct => handle_direct_dial(pending, &resolver).await,
+        Route::Proxy => {
+            tracing::trace!(target = %pending.target, ?flow, "split-tunnel: via raw tunnel");
+            let tls = raw_client.connect(server_addr).await?;
+            bridge_raw_to_socks(pending, tls, flow).await
+        }
+    }
+}
+
+/// Bridge a SOCKS5 CONNECT over a RAW (no-carrier) tunnel stream: push the
+/// VLESS inner-frame Request (carrying `flow`), drain the Response prefix,
+/// then run the data-plane. With `FlowKind::Extended` the data-plane is
+/// XTLS-Vision (first-packet padding); otherwise it's a raw copy.
+async fn bridge_raw_to_socks<C>(
+    pending: PendingConnect,
+    mut stream: C,
+    flow: FlowKind,
+) -> Result<(), LocalProxyError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = Request {
+        user: UserId::new_v4(),
+        flow,
+        command: Command::Tcp,
+        target: Some(pending.target.clone()),
+        seed: vec![],
+    };
+    let mut framed = BytesMut::with_capacity(request.encoded_len());
+    request.encode(&mut framed);
+    stream.write_all(&framed).await?;
+    stream.flush().await?;
+
+    let mut prefix = [0u8; 2];
+    stream.read_exact(&mut prefix).await?;
+    let mut prefix_view = bytes::Bytes::copy_from_slice(&prefix);
+    Response::decode(&mut prefix_view)?;
+
+    let bound: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
+    let sock = pending.accept(bound).await?;
+    match flow {
+        FlowKind::Extended => {
+            let _ = donut_io::vision::copy_bidirectional(
+                stream,
+                sock,
+                donut_io::vision::VisionConfig::default(),
+            )
+            .await;
+        }
+        FlowKind::None => {
+            let mut sock = sock;
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+        }
+    }
+    Ok(())
 }

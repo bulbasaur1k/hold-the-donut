@@ -5,7 +5,6 @@
 //! fresh TCP connections for each chunked POST so middleboxes that
 //! limit upload duration aren't tripped.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -14,9 +13,9 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::config::ClientConfig;
+use crate::connect::Connector;
 use crate::error::CarrierError;
 use crate::io_glue::{CarrierStream, PIPE_CAPACITY};
 use crate::placement::Placement;
@@ -25,7 +24,7 @@ use crate::session::SessionId;
 type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
 pub(super) async fn dial(
-    target: SocketAddr,
+    connector: Arc<dyn Connector>,
     config: &ClientConfig,
     sid: SessionId,
 ) -> Result<CarrierStream, CarrierError> {
@@ -33,9 +32,11 @@ pub(super) async fn dial(
     let (mut bridge_rd, mut bridge_wr) = tokio::io::split(bridge_side);
 
     // Uplink: spawn a task that reads from bridge_rd, packages chunks
-    // into sequenced POSTs, and ships them off.
+    // into sequenced POSTs, and ships them off (each on its own
+    // connection from the connector).
     let cfg = Arc::new(config.clone());
     let cfg_uplink = cfg.clone();
+    let connector_uplink = connector.clone();
     tokio::spawn(async move {
         let max_chunk = cfg_uplink
             .max_post_bytes
@@ -49,7 +50,7 @@ pub(super) async fn dial(
                 Err(_) => break,
             };
             let chunk = Bytes::copy_from_slice(&buf[..n]);
-            if let Err(e) = post_chunk(target, &cfg_uplink, sid, seq, chunk).await {
+            if let Err(e) = post_chunk(&connector_uplink, &cfg_uplink, sid, seq, chunk).await {
                 tracing::trace!(?e, seq, "packet-up uplink POST failed");
                 break;
             }
@@ -70,10 +71,9 @@ pub(super) async fn dial(
             .boxed(),
     )?;
 
-    let download_tcp = TcpStream::connect(target).await?;
-    download_tcp.set_nodelay(true).ok();
+    let download_io = connector.connect().await?;
     let (mut download_sender, download_conn) =
-        http1::handshake::<_, BoxedBody>(TokioIo::new(download_tcp)).await?;
+        http1::handshake::<_, BoxedBody>(TokioIo::new(download_io)).await?;
     tokio::spawn(async move {
         if let Err(e) = download_conn.await {
             tracing::trace!(?e, "packet-up downlink connection ended");
@@ -103,7 +103,7 @@ pub(super) async fn dial(
 }
 
 async fn post_chunk(
-    target: SocketAddr,
+    connector: &Arc<dyn Connector>,
     config: &ClientConfig,
     sid: SessionId,
     seq: u64,
@@ -113,9 +113,8 @@ async fn post_chunk(
     let body: BoxedBody = Full::new(chunk).map_err(|never| match never {}).boxed();
     let req = build_request("POST", &path, config, sid, Some(seq), body)?;
 
-    let tcp = TcpStream::connect(target).await?;
-    tcp.set_nodelay(true).ok();
-    let (mut sender, conn) = http1::handshake::<_, BoxedBody>(TokioIo::new(tcp)).await?;
+    let io = connector.connect().await?;
+    let (mut sender, conn) = http1::handshake::<_, BoxedBody>(TokioIo::new(io)).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::trace!(?e, "packet-up POST connection ended");

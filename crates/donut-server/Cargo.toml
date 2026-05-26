@@ -38,3 +38,6 @@ anyhow.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
 rcgen.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
