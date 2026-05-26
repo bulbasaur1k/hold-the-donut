@@ -115,6 +115,39 @@ UserUUID = the VLESS user's 16-byte UUID
   Carries the inner ServerHello → this is where the server's filter detects TLS 1.3
   and emits `CommandPaddingDirect` to splice.
 
+## Interop status (vs real Xray 26.5.9) — debugging notes
+
+Tested: `teddysun/xray` client (`vless` + `network: tcp` + `tls` allowInsecure
++ `flow: xtls-rprx-vision`) → local `donut-server` `transport: raw`,
+`vision: "xray"`, on `0.0.0.0:8443` (self-signed cert) → freedom outbound.
+Reproduce from `/tmp/donut-interop/{server,client}.json` (UUID in `uuid.env`).
+
+What works ✅
+- **Padding relay**: a plaintext `http://api.ipify.org` request tunnels
+  end-to-end and returns 200. The xray client's own logs show byte-exact
+  padding/unpadding both directions, TLS-1.3 detection from our ServerHello,
+  `CommandPaddingDirect`, and `CopyRawConn splice`.
+- HTTPS handshake bytes are valid TLS records in both directions (verified
+  via `hex16` head logging): uplink `16 03 01`(ClientHello) → `14 03 03`(CCS)
+  +`17 03 03`(Finished) → `17 03 03`(appdata); downlink `16 03 03 .. 02`
+  (ServerHello flight) → `17 03 03`(appdata).
+
+What's broken ❌ (the only remaining bug)
+- **HTTPS resets post-splice** (`curl` rc=56, no response). It is isolated
+  to the **raw-splice data phase** (after `CommandPaddingDirect`): the
+  padding relay is fine (HTTP works), the handshake is byte-exact and the
+  splice negotiates, but the inner TLS doesn't complete. Suspect a
+  drop/dup/ordering byte in the raw passthrough that the head logs don't
+  reveal. `try_join!`→`join!` did **not** fix it (so it's not premature
+  cancellation).
+
+Next debugging step
+- Byte-level diff of the raw phase: point the donut upstream at a **local,
+  inspectable** inner-TLS target (or pcap) instead of opaque Cloudflare, and
+  compare the exact bytes our server relays vs a direct connection — find the
+  lost/extra byte at/after the Direct transition. Check the `Unpadder`
+  leftover handling and the downlink `direct` branch around the transition.
+
 ## Byte-stream adaptation notes (Rust port)
 
 Xray works on `buf.MultiBuffer` (chunks ≤ `buf.Size`=8192). Our tokio port reads
