@@ -26,6 +26,32 @@ enum Cmd {
     Probe { target: String },
     /// Generate a consistent server + client config pair (fresh keypair).
     ConfigGen(ConfigGenArgs),
+    /// Build a `vless://` share-link from explicit parameters (for pasting
+    /// into off-the-shelf App Store clients like HAPP / Streisand / v2box).
+    Link(LinkArgs),
+}
+
+/// Parameters for the `link` subcommand — a standalone `vless://` builder.
+#[derive(Debug, Clone, Args)]
+struct LinkArgs {
+    /// VLESS user UUID (must match a server `inbound.users` entry).
+    #[arg(long)]
+    uuid: String,
+    /// Public address the client dials (`host:port`).
+    #[arg(long)]
+    server_addr: String,
+    /// TLS SNI / certificate name presented by the client.
+    #[arg(long)]
+    sni: String,
+    /// uTLS ClientHello fingerprint to mimic.
+    #[arg(long, default_value = "chrome")]
+    fp: String,
+    /// XTLS flow. Default matches a `raw` + `vision:"xray"` server.
+    #[arg(long, default_value = "xtls-rprx-vision")]
+    flow: String,
+    /// Display label (URL fragment). Empty ⇒ derived from the host.
+    #[arg(long, default_value = "")]
+    label: String,
 }
 
 /// Which transport pair `config-gen` should emit. Server and client name
@@ -44,6 +70,11 @@ enum TransportKind {
     /// donut-server terminates H3 itself; secret path → tunnel, else →
     /// decoy self-steal. No REALITY.
     Quic,
+    /// Cert-based RAW + faithful Xray Vision (server `raw`, `vision:"xray"`,
+    /// `flow=xtls-rprx-vision`). The interop path for **off-the-shelf App
+    /// Store clients** (HAPP, Streisand, …): emits the server config plus a
+    /// ready-to-paste `vless://` link — no donut-client needed.
+    Raw,
 }
 
 /// Carrier framing mode for the cert-based TLS carrier (`tls`/`xhttp`).
@@ -135,6 +166,17 @@ fn main() -> anyhow::Result<()> {
         Cmd::Keygen => keygen(),
         Cmd::Probe { target } => eprintln!("probe {target}: not yet implemented (M9)"),
         Cmd::ConfigGen(args) => config_gen(&args)?,
+        Cmd::Link(args) => {
+            let label = if args.label.is_empty() {
+                host_of(&args.server_addr)
+            } else {
+                args.label.clone()
+            };
+            println!(
+                "{}",
+                vless_link(&args.uuid, &args.server_addr, &args.sni, &args.fp, &args.flow, &label)
+            );
+        }
     }
     Ok(())
 }
@@ -158,8 +200,33 @@ fn keygen() {
     println!("short_id    (both configs):  {}", hex::encode(short_id));
 }
 
-/// Build and print a consistent server + client config pair.
+/// Build and print the deploy artifacts for the requested transport.
+///
+/// - `raw` (Xray-interop): the server config + a `vless://` link to paste into
+///   off-the-shelf App Store clients (no donut-client config — those clients
+///   speak the protocol directly).
+/// - `veil`/`tls`/`quic`: a matching server + donut-client config pair (those
+///   transports use our own framing, so they need the donut-client).
 fn config_gen(args: &ConfigGenArgs) -> anyhow::Result<()> {
+    if args.transport == TransportKind::Raw {
+        let (server, uuid) = raw_server(args);
+        let label = format!("donut-{}", host_of(&args.server_addr));
+        let link = vless_link(
+            &uuid,
+            &args.server_addr,
+            &args.server_name,
+            "chrome",
+            "xtls-rprx-vision",
+            &label,
+        );
+        println!("// ===== server.json =====");
+        println!("{}", serde_json::to_string_pretty(&server)?);
+        println!();
+        println!("// ===== share link (paste into HAPP / Streisand / v2box / etc.) =====");
+        println!("{link}");
+        return Ok(());
+    }
+
     let (server, client) = generate_pair(args);
     println!("// ===== server.json =====");
     println!("{}", serde_json::to_string_pretty(&server)?);
@@ -167,6 +234,68 @@ fn config_gen(args: &ConfigGenArgs) -> anyhow::Result<()> {
     println!("// ===== client.json =====");
     println!("{}", serde_json::to_string_pretty(&client)?);
     Ok(())
+}
+
+/// Cert-based RAW server speaking **faithful Xray Vision** (`vision:"xray"`).
+/// Returns the server config and the fresh user UUID (for the share link).
+/// There is no paired donut-client: this transport targets off-the-shelf
+/// clients, which connect with just the `vless://` link.
+fn raw_server(args: &ConfigGenArgs) -> (ServerConfig, String) {
+    let uuid = donut_core::UserId::new_v4().to_string();
+    let inbound = ServerInbound {
+        listen: args.listen.clone(),
+        transport: "raw".into(),
+        users: vec![uuid.clone()],
+        reality: None,
+        path: "/".into(),
+        cert: Some(args.cert.clone()),
+        key: Some(args.key.clone()),
+        dest: Some(args.dest.clone()),
+        mode: "stream-one".into(),
+        vision: "xray".into(),
+    };
+    (server_config(inbound), uuid)
+}
+
+/// Build a standard `vless://` share URI:
+/// `vless://UUID@host:port?type=tcp&security=tls&sni=..&fp=..&alpn=http/1.1&flow=..#label`
+fn vless_link(uuid: &str, addr: &str, sni: &str, fp: &str, flow: &str, label: &str) -> String {
+    let mut params: Vec<(&str, &str)> = vec![
+        ("type", "tcp"),
+        ("security", "tls"),
+        ("sni", sni),
+        ("fp", fp),
+        ("alpn", "http/1.1"),
+    ];
+    if !flow.is_empty() && flow != "none" {
+        params.push(("flow", flow));
+    }
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", pct(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("vless://{uuid}@{addr}?{query}#{}", pct(label))
+}
+
+/// Host portion of a `host:port` address (for a default link label).
+fn host_of(addr: &str) -> String {
+    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr).to_string()
+}
+
+/// Percent-encode an RFC 3986 query/fragment value (encode everything that
+/// isn't an unreserved character).
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Produce a matching `(ServerConfig, ClientConfig)` for the requested
@@ -178,6 +307,9 @@ fn generate_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
         TransportKind::Tls => cert_pair(args, "tls", "xhttp", args.carrier_mode.as_str()),
         // QUIC/H3 ignore the carrier mode; pin it to the default.
         TransportKind::Quic => cert_pair(args, "quic", "h3", "stream-one"),
+        // RAW emits a server + share-link (no donut-client) via raw_server,
+        // handled directly in config_gen before this is reached.
+        TransportKind::Raw => unreachable!("raw transport is handled by raw_server"),
     }
 }
 
@@ -391,6 +523,40 @@ mod tests {
         assert_eq!(server.inbound.path, client.outbound.path);
 
         assert_round_trips(&server, &client);
+    }
+
+    #[test]
+    fn raw_server_is_vision_xray_and_link_is_wellformed() {
+        let args = args_for(TransportKind::Raw);
+        let (server, uuid) = raw_server(&args);
+        assert_eq!(server.inbound.transport, "raw");
+        assert_eq!(server.inbound.vision, "xray");
+        assert!(server.inbound.reality.is_none());
+        assert_eq!(server.inbound.users, vec![uuid.clone()]);
+        // The generated UUID authenticates against the server's user set.
+        let auth = server.inbound.user_auth().unwrap();
+        assert!(auth.is_authorized(&uuid.parse().unwrap()));
+
+        let link = vless_link(
+            &uuid,
+            &args.server_addr,
+            &args.server_name,
+            "chrome",
+            "xtls-rprx-vision",
+            "donut",
+        );
+        assert!(link.starts_with(&format!("vless://{uuid}@203.0.113.1:443?")));
+        assert!(link.contains("security=tls"));
+        assert!(link.contains("flow=xtls-rprx-vision"));
+        assert!(link.contains("type=tcp"));
+        assert!(link.contains("alpn=http%2F1.1")); // '/' percent-encoded
+        assert!(link.ends_with("#donut"));
+    }
+
+    #[test]
+    fn link_omits_flow_when_none() {
+        let link = vless_link("u", "h:443", "sni.example", "chrome", "none", "lbl");
+        assert!(!link.contains("flow="));
     }
 
     #[test]
