@@ -109,6 +109,10 @@ pub struct Metrics {
     handshakes_tunnel: AtomicU64,
     handshakes_forward: AtomicU64,
     rejected_unauthorized: AtomicU64,
+    // peers that reset/closed before sending a TLS ClientHello (port scans /
+    // health checks) — tracked apart from real handshake errors so the error
+    // metric isn't drowned in internet background noise.
+    probes_total: AtomicU64,
     blackhole_total: AtomicU64,
     bytes_up: AtomicU64,
     bytes_down: AtomicU64,
@@ -173,6 +177,13 @@ impl Metrics {
         self.rejected_unauthorized.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A peer opened a TCP connection on the public listener but reset/closed
+    /// before sending a TLS ClientHello — a port scan or health check, not a
+    /// failed tunnel. Kept separate from session errors (pure background noise).
+    pub fn probe(&self) {
+        self.probes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A target was dropped by a routing block rule.
     pub fn blackholed(&self) {
         self.blackhole_total.fetch_add(1, Ordering::Relaxed);
@@ -219,6 +230,7 @@ impl Metrics {
         let tunnel = self.handshakes_tunnel.load(Ordering::Relaxed);
         let forward = self.handshakes_forward.load(Ordering::Relaxed);
         let unauthorized = self.rejected_unauthorized.load(Ordering::Relaxed);
+        let probes = self.probes_total.load(Ordering::Relaxed);
         let blackhole = self.blackhole_total.load(Ordering::Relaxed);
         let up = self.bytes_up.load(Ordering::Relaxed);
         let down = self.bytes_down.load(Ordering::Relaxed);
@@ -250,6 +262,9 @@ impl Metrics {
              # HELP donut_rejected_unauthorized_total Tunnel sessions dropped for an unknown VLESS UUID.\n\
              # TYPE donut_rejected_unauthorized_total counter\n\
              donut_rejected_unauthorized_total {unauthorized}\n\
+             # HELP donut_probes_total TCP peers that reset/closed before a TLS ClientHello (scans / health checks).\n\
+             # TYPE donut_probes_total counter\n\
+             donut_probes_total {probes}\n\
              # HELP donut_blackhole_total Connections dropped by a routing block rule.\n\
              # TYPE donut_blackhole_total counter\n\
              donut_blackhole_total {blackhole}\n\
@@ -399,6 +414,7 @@ mod tests {
         let mux_guard = m.tunnel_started_kind(SessionKind::Mux);
         m.forwarded();
         m.rejected_unauthorized();
+        m.probe();
         m.blackholed();
         m.add_bytes(100, 250);
         m.session_ok();
@@ -413,6 +429,7 @@ mod tests {
         assert!(out.contains("donut_handshakes_total{result=\"tunnel\"} 2"));
         assert!(out.contains("donut_handshakes_total{result=\"forward\"} 1"));
         assert!(out.contains("donut_rejected_unauthorized_total 1"));
+        assert!(out.contains("donut_probes_total 1"));
         assert!(out.contains("donut_blackhole_total 1"));
         assert!(out.contains("donut_bytes_total{direction=\"up\"} 100"));
         assert!(out.contains("donut_bytes_total{direction=\"down\"} 250"));

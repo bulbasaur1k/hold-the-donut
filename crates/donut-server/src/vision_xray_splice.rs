@@ -42,6 +42,10 @@ pub struct RecordTlsServer {
     conn: ServerConnection,
     /// Raw TCP bytes read but not yet consumed as complete outer-TLS records.
     inbuf: BytesMut,
+    /// Total raw bytes ever read from the socket. Lets a handshake failure be
+    /// classified: `0` means the peer reset/closed before sending a single
+    /// byte (an ordinary port scan), `> 0` means it spoke some TLS first.
+    read_total: u64,
 }
 
 impl RecordTlsServer {
@@ -51,7 +55,13 @@ impl RecordTlsServer {
             tcp,
             conn,
             inbuf: BytesMut::with_capacity(READ_CHUNK),
+            read_total: 0,
         })
+    }
+
+    /// Total raw bytes read from the peer so far (for failure triage).
+    pub fn bytes_read(&self) -> u64 {
+        self.read_total
     }
 
     /// Pull more bytes from the socket into `inbuf`. Returns `false` on EOF.
@@ -61,6 +71,7 @@ impl RecordTlsServer {
         if n == 0 {
             return Ok(false);
         }
+        self.read_total += n as u64;
         self.inbuf.extend_from_slice(&tmp[..n]);
         Ok(true)
     }
