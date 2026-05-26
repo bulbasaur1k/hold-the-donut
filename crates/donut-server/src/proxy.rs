@@ -579,10 +579,10 @@ async fn handle_xray_vision_session(
     }
     let user_uuid = *request.user.as_bytes();
     let flow = request.flow;
-    // UDP/Mux aren't supported by the freedom outbound — count it (this is the
-    // common "client sent VLESS UDP" case) and drop.
-    let target_endpoint = match request.target {
-        Some(t) if matches!(request.command, Command::Tcp) => t,
+    let command = request.command;
+    // TCP and UDP both carry a target; Mux (and a missing target) we don't serve.
+    let target_endpoint = match (request.target, command) {
+        (Some(t), Command::Tcp) | (Some(t), Command::Udp) => t,
         _ => {
             metrics.session_error(SessErr::Unsupported);
             return Err(ProxyError::UnsupportedCommand);
@@ -595,6 +595,26 @@ async fn handle_xray_vision_session(
     }
 
     let target_addr = resolve(&resolver, &target_endpoint).await?;
+
+    // VLESS response prefix — raw, through the outer TLS, before any payload.
+    let mut response_buf = BytesMut::with_capacity(8);
+    Response::default().encode(&mut response_buf);
+
+    // UDP (QUIC etc.): length-prefixed datagrams to a single target — Vision
+    // never applies to UDP, so no dial/splice, just a UDP-socket bridge.
+    if matches!(command, Command::Udp) {
+        tunnel.write_plaintext(&response_buf).await?;
+        let _active = metrics.tunnel_started();
+        let result =
+            vision_xray_splice::vision_udp_relay(tunnel, target_addr, leftover.to_vec(), &metrics)
+                .await;
+        match &result {
+            Ok(()) => metrics.session_ok(),
+            Err(e) => metrics.session_error(SessErr::from_io(e)),
+        }
+        return result.map_err(ProxyError::from);
+    }
+
     let dial_start = std::time::Instant::now();
     let upstream = match tokio::net::TcpStream::connect(target_addr).await {
         Ok(u) => {
@@ -607,10 +627,6 @@ async fn handle_xray_vision_session(
         }
     };
     let _ = upstream.set_nodelay(true);
-
-    // VLESS response prefix — raw, through the outer TLS, before any payload.
-    let mut response_buf = BytesMut::with_capacity(8);
-    Response::default().encode(&mut response_buf);
     tunnel.write_plaintext(&response_buf).await?;
 
     let _active = metrics.tunnel_started();
