@@ -580,7 +580,23 @@ async fn handle_xray_vision_session(
     let user_uuid = *request.user.as_bytes();
     let flow = request.flow;
     let command = request.command;
-    // TCP and UDP both carry a target; Mux (and a missing target) we don't serve.
+
+    // Mux.Cool / XUDP: multiplexed sub-streams (UDP packet-addressing), no
+    // single target in the header. Modern clients use this for UDP/QUIC.
+    if matches!(command, Command::Mux) {
+        let mut response_buf = BytesMut::with_capacity(8);
+        Response::default().encode(&mut response_buf);
+        tunnel.write_plaintext(&response_buf).await?;
+        let _active = metrics.tunnel_started();
+        let result = crate::mux::mux_relay(tunnel, leftover.to_vec(), &metrics).await;
+        match &result {
+            Ok(()) => metrics.session_ok(),
+            Err(e) => metrics.session_error(SessErr::from_io(e)),
+        }
+        return result.map_err(ProxyError::from);
+    }
+
+    // TCP and UDP both carry a target; a missing target we don't serve.
     let target_endpoint = match (request.target, command) {
         (Some(t), Command::Tcp) | (Some(t), Command::Udp) => t,
         _ => {

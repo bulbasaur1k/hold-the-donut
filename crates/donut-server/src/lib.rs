@@ -12,6 +12,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod metrics;
+mod mux;
 mod proxy;
 mod selfsteal;
 mod veil_server;
