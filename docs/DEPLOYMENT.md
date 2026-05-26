@@ -20,7 +20,7 @@ cert-based деплоя не используется.
 | `tls`     | tcp/443 | donut-server сам (реальный серт) | path-gating → `dest` (filebrowser); h1+h2; carrier mode `stream-one`/`stream-up`/`packet-up` | **рекоменд. TCP**, все 3 mode проверены E2E на боевом |
 | `quic`    | udp/443 | donut-server сам (реальный серт) | path-gating → `dest` (filebrowser) | **рабочий**, задеплоен и проверен |
 | `raw`     | свой TCP-порт | donut-server сам (реальный серт) | 1-й дешифр. байт `0x00`=VLESS → туннель, иначе → relay на `dest` | **реализован+протестирован E2E** (на боевом — на 8443, юнит `donut-server-raw` сейчас disabled); несёт flow `xtls-rprx-vision` |
-| `carrier` | localhost | нет (TLS терминирует фронт) | фронт (Caddy) | бэкенд за reverse-proxy; см. ограничение #9 |
+| `carrier` | localhost | нет (TLS терминирует фронт) | фронт (Caddy) | бэкенд за reverse-proxy; honor-ит `mode` → `stream-up`/`packet-up` для CDN (#9 закрыт) |
 | `veil`    | tcp/443 | REALITY veiled-TLS | forward на `dest` | исходный путь, тесты проходят; для cert-деплоя не нужен |
 
 ### Клиентские режимы (`outbound.transport` в client.json)
@@ -28,7 +28,7 @@ cert-based деплоя не используется.
 | transport | Как ходит | Статус |
 |---|---|---|
 | `h3`    | QUIC/HTTP-3 carrier к серверу (full-duplex) | **рабочий**, проверен боевым деплоем |
-| `xhttp` | carrier поверх обычного TLS; `mode` = `stream-one`/`stream-up`/`packet-up` | работает с серверным `tls`; все 3 mode проверены на боевом; через Caddy — нет (#9) |
+| `xhttp` | carrier поверх обычного TLS; `mode` = `stream-one`/`stream-up`/`packet-up` | работает с серверным `tls` (все 3 mode на боевом) и с `carrier`-бэкендом за Caddy/CDN через `stream-up`/`packet-up` (#9 закрыт) |
 | `raw`   | VLESS напрямую по TLS (без carrier); `flow` = `none`/`xtls-rprx-vision` | **реализован+протестирован E2E на боевом** (Xray RAW/TCP-аналог) |
 | `veil`  | REALITY veiled-TLS + carrier | исходный, тесты проходят |
 
@@ -256,11 +256,14 @@ curl --socks5-hostname 127.0.0.1:1080 https://yandex.ru -o /dev/null -w '%{http_
 
 ## 5. Известные ограничения / TODO
 
-- **#9 xhttp через reverse-proxy (Caddy/CDN)** — `stream-one` дедлочит через
-  Go-reverse-proxy (нет full-duplex по одному запросу). Прямой `tls`-режим
-  (раздел 4.4) это обходит. Для CDN-фронтинга нужен режим `stream-up`
-  (раздельные POST-up/GET-down) — заготовки есть (h2c-сервер, неблокирующий
-  клиент), осталось дописать stream-up-over-TLS.
+- **#9 xhttp через reverse-proxy (Caddy/CDN) — ЗАКРЫТО.** `stream-one`
+  дедлочил через Go-reverse-proxy (нет full-duplex по одному запросу).
+  Решение: режимы `stream-up`/`packet-up` (раздельные POST-up/GET-down на
+  отдельных соединениях). `run_carrier_backend` теперь honor-ит
+  `inbound.mode`, а `Server::serve` держит **общий dispatcher** на listener
+  → пары POST/GET с разных CDN-форварднутых соединений матчатся по
+  session-id. Регресс-тест: `carrier_backend_stream_up_pairs_separate_connections`.
+  (Для прямого VPS по-прежнему достаточно `tls` stream-one / h3.)
 - **Cert renewal** — при схеме 4.4 серт обновляет certbot (Caddy уходит из
   пути 443). Если оставлен Caddy на 443 — работает `donut-cert-sync.timer`.
 - **Флаки-канал** — у клиента ретраи коннекта; долгоживущий туннель при

@@ -47,6 +47,7 @@ async fn carrier_backend_relays_over_secret_path() {
     let backend_addr = donut_server::run_carrier_backend(
         "127.0.0.1:0".parse().unwrap(),
         SECRET_PATH.to_string(),
+        donut_carrier::Mode::StreamOne,
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -107,4 +108,92 @@ async fn carrier_backend_relays_over_secret_path() {
         .expect("read echo timeout")
         .unwrap();
     assert_eq!(got, b"hello-xhttp-backend");
+}
+
+/// #9 regression: behind a reverse proxy / CDN, `stream-up` must pair the
+/// uplink POST and downlink GET that arrive as *separate* backend
+/// connections. `Server::serve`'s shared dispatcher makes this work where
+/// `stream-one` deadlocks through a Go reverse proxy.
+#[tokio::test]
+async fn carrier_backend_stream_up_pairs_separate_connections() {
+    const SECRET_PATH: &str = "/store/sync";
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = match echo_listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                let (mut rd, mut wr) = s.split();
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                let _ = wr.shutdown().await;
+            });
+        }
+    });
+
+    let backend_addr = donut_server::run_carrier_backend(
+        "127.0.0.1:0".parse().unwrap(),
+        SECRET_PATH.to_string(),
+        donut_carrier::Mode::StreamUp,
+        Arc::new(Router::new("freedom")),
+        Arc::new(Resolver::doh(
+            &["1.1.1.1".parse().unwrap()],
+            "cloudflare-dns.com",
+        )),
+        donut_server::Metrics::new(),
+    )
+    .await
+    .expect("bind carrier backend");
+
+    // stream-up client opens two plain-TCP connections (uplink POST,
+    // downlink GET) — the dispatcher pairs them by session id.
+    let client_cfg = donut_carrier::ClientConfig {
+        mode: donut_carrier::Mode::StreamUp,
+        path_prefix: SECRET_PATH.to_string(),
+        ..donut_carrier::ClientConfig::default()
+    };
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        donut_carrier::client::dial(backend_addr, &client_cfg),
+    )
+    .await
+    .expect("carrier dial timeout")
+    .expect("carrier dial");
+
+    let request = Request {
+        user: UserId::new_v4(),
+        flow: FlowKind::None,
+        command: Command::Tcp,
+        target: Some(Endpoint::new(
+            Address::ipv4(match echo_addr.ip() {
+                std::net::IpAddr::V4(v) => v,
+                _ => unreachable!("ephemeral 127.0.0.1 is v4"),
+            }),
+            echo_addr.port(),
+        )),
+        seed: vec![],
+    };
+    let mut framed = BytesMut::with_capacity(request.encoded_len() + 16);
+    request.encode(&mut framed);
+    framed.extend_from_slice(b"hello-stream-up");
+    stream.write_all(&framed).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut prefix = [0u8; 2];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut prefix))
+        .await
+        .expect("response prefix read")
+        .unwrap();
+    let mut prefix_view = bytes::Bytes::copy_from_slice(&prefix);
+    Response::decode(&mut prefix_view).expect("response decode");
+
+    let mut got = vec![0u8; b"hello-stream-up".len()];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut got))
+        .await
+        .expect("read echo timeout")
+        .unwrap();
+    assert_eq!(got, b"hello-stream-up");
 }
