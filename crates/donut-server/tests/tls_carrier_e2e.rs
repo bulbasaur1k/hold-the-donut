@@ -106,6 +106,7 @@ async fn tls_carrier_tunnel_and_self_steal() {
             "cloudflare-dns.com",
         )),
         donut_server::Metrics::new(),
+        donut_server::RuntimeTuning::default(),
     )
     .await
     .expect("bind tls carrier");
@@ -231,6 +232,7 @@ async fn tls_carrier_self_steal_over_h2() {
             "cloudflare-dns.com",
         )),
         donut_server::Metrics::new(),
+        donut_server::RuntimeTuning::default(),
     )
     .await
     .expect("bind tls carrier");

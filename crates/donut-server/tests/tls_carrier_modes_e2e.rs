@@ -131,6 +131,7 @@ async fn tunnel_roundtrip(mode: Mode) {
             "cloudflare-dns.com",
         )),
         donut_server::Metrics::new(),
+        donut_server::RuntimeTuning::default(),
     )
     .await
     .expect("bind tls carrier");

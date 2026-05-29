@@ -108,6 +108,7 @@ async fn start_server(
             "cloudflare-dns.com",
         )),
         donut_server::Metrics::new(),
+        donut_server::RuntimeTuning::default(),
     )
     .await
     .expect("bind raw proxy");

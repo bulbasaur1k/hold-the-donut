@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth};
@@ -31,6 +32,36 @@ use tokio_rustls::TlsAcceptor;
 /// request. A first decrypted byte that is *not* this is treated as a
 /// non-tunnel (probe / browser) connection and self-stolen to the decoy.
 const VLESS_VERSION: u8 = 0x00;
+
+/// Runtime tuning passed into the proxy entry points. Built from
+/// [`donut_config::TuningConfig`] in `main`; cheap to clone (`Copy`) so it
+/// rides along through the call graph without an `Arc`.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeTuning {
+    /// Idle timeout for a Mux.Cool / XUDP relay.
+    pub mux_idle: Duration,
+    /// Idle timeout for a single-target VLESS-UDP relay.
+    pub udp_idle: Duration,
+    /// Pause between `accept()` retries after a persistent error
+    /// (EMFILE / ENOBUFS). 0 disables the backoff.
+    pub accept_backoff: Duration,
+}
+
+impl RuntimeTuning {
+    pub fn from_config(t: &donut_config::TuningConfig) -> Self {
+        Self {
+            mux_idle: Duration::from_secs(t.mux_idle_secs),
+            udp_idle: Duration::from_secs(t.udp_idle_secs),
+            accept_backoff: Duration::from_millis(t.accept_backoff_ms),
+        }
+    }
+}
+
+impl Default for RuntimeTuning {
+    fn default() -> Self {
+        Self::from_config(&donut_config::TuningConfig::default())
+    }
+}
 
 /// Which `xtls-rprx-vision` data-plane to speak for `flow=Extended`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -257,6 +288,7 @@ pub async fn run_tls_carrier_proxy(
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
+    tuning: RuntimeTuning,
 ) -> Result<SocketAddr, ProxyError> {
     let mut tls = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
@@ -325,7 +357,7 @@ pub async fn run_tls_carrier_proxy(
                     tracing::warn!(?e, "tls-carrier accept error");
                     // Backoff on a persistent accept error (EMFILE/ENOBUFS)
                     // so the loop can't busy-spin at 100% CPU.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(tuning.accept_backoff).await;
                     continue;
                 }
             };
@@ -365,6 +397,7 @@ pub async fn run_veil_proxy(
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
+    tuning: RuntimeTuning,
 ) -> Result<SocketAddr, ProxyError> {
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
@@ -380,7 +413,7 @@ pub async fn run_veil_proxy(
                     tracing::warn!(?e, "veil proxy accept error");
                     // Backoff on a persistent accept error (EMFILE/ENOBUFS)
                     // so the loop can't busy-spin at 100% CPU.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(tuning.accept_backoff).await;
                     continue;
                 }
             };
@@ -565,6 +598,7 @@ where
 /// can splice to the raw TCP socket — exactly what a real Xray client does
 /// after `CommandPaddingDirect`, bypassing the outer TLS to avoid double
 /// encryption. See [`crate::vision_xray_splice`].
+#[allow(clippy::too_many_arguments)] // wired from the daemon entry point
 async fn handle_xray_vision_session(
     mut tunnel: vision_xray_splice::RecordTlsServer,
     decoy: Option<SocketAddr>,
@@ -572,6 +606,7 @@ async fn handle_xray_vision_session(
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
+    tuning: RuntimeTuning,
 ) -> Result<(), ProxyError> {
     // Accumulate decrypted plaintext until the VLESS request header decodes.
     let mut buf = BytesMut::with_capacity(512);
@@ -631,7 +666,14 @@ async fn handle_xray_vision_session(
         let _active = metrics.tunnel_started_kind(SessionKind::Mux);
         // flow=vision wraps the Mux stream in Vision padding (e.g. HAPP XUDP).
         let vision_uuid = matches!(flow, FlowKind::Extended).then_some(user_uuid);
-        let result = crate::mux::mux_relay(tunnel, leftover.to_vec(), &metrics, vision_uuid).await;
+        let result = crate::mux::mux_relay(
+            tunnel,
+            leftover.to_vec(),
+            &metrics,
+            vision_uuid,
+            tuning.mux_idle,
+        )
+        .await;
         match &result {
             Ok(()) => metrics.session_ok(),
             Err(e) => metrics.session_error(SessErr::from_io(e)),
@@ -669,9 +711,14 @@ async fn handle_xray_vision_session(
     if matches!(command, Command::Udp) {
         tunnel.write_plaintext(&response_buf).await?;
         let _active = metrics.tunnel_started_kind(SessionKind::Udp);
-        let result =
-            vision_xray_splice::vision_udp_relay(tunnel, target_addr, leftover.to_vec(), &metrics)
-                .await;
+        let result = vision_xray_splice::vision_udp_relay(
+            tunnel,
+            target_addr,
+            leftover.to_vec(),
+            &metrics,
+            tuning.udp_idle,
+        )
+        .await;
         match &result {
             Ok(()) => metrics.session_ok(),
             Err(e) => metrics.session_error(SessErr::from_io(e)),
@@ -749,6 +796,7 @@ pub async fn run_raw_proxy(
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
+    tuning: RuntimeTuning,
 ) -> Result<SocketAddr, ProxyError> {
     let mut tls = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
@@ -780,7 +828,7 @@ pub async fn run_raw_proxy(
                     // without a pause we busy-loop at 100% CPU and flood the
                     // log. A short backoff lets the kernel reclaim the FD/
                     // buffer pressure and caps the warning rate.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(tuning.accept_backoff).await;
                     continue;
                 }
             };
@@ -830,9 +878,10 @@ pub async fn run_raw_proxy(
                         );
                         return;
                     }
-                    if let Err(e) =
-                        handle_xray_vision_session(tunnel, decoy, auth, router, resolver, metrics)
-                            .await
+                    if let Err(e) = handle_xray_vision_session(
+                        tunnel, decoy, auth, router, resolver, metrics, tuning,
+                    )
+                    .await
                     {
                         tracing::debug!(%peer, ?e, "raw xray-vision session ended with error");
                     }
