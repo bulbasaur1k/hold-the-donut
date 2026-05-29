@@ -323,6 +323,9 @@ pub async fn run_tls_carrier_proxy(
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(?e, "tls-carrier accept error");
+                    // Backoff on a persistent accept error (EMFILE/ENOBUFS)
+                    // so the loop can't busy-spin at 100% CPU.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };
@@ -375,6 +378,9 @@ pub async fn run_veil_proxy(
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(?e, "veil proxy accept error");
+                    // Backoff on a persistent accept error (EMFILE/ENOBUFS)
+                    // so the loop can't busy-spin at 100% CPU.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };
@@ -769,6 +775,12 @@ pub async fn run_raw_proxy(
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(?e, "raw accept error");
+                    // Resource-exhaustion errors (EMFILE/ENFILE: "too many
+                    // open files", ENOBUFS) make accept() return immediately;
+                    // without a pause we busy-loop at 100% CPU and flood the
+                    // log. A short backoff lets the kernel reclaim the FD/
+                    // buffer pressure and caps the warning rate.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };

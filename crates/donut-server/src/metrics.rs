@@ -376,6 +376,9 @@ pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(?e, "metrics listener accept error");
+                // Backoff on a persistent accept error (EMFILE/ENOBUFS) so the
+                // loop can't busy-spin at 100% CPU and flood the log.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
