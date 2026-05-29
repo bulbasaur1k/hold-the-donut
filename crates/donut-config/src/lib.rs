@@ -175,6 +175,15 @@ pub struct TuningConfig {
     /// pressure (try 250–500). Default 100.
     #[serde(default = "default_accept_backoff_ms")]
     pub accept_backoff_ms: u64,
+    /// Maximum time a TCP peer is given to complete the outer-TLS handshake
+    /// (seconds). A real client finishes well under 1 s; the timeout exists
+    /// to drop peers whose TCP established but whose ClientHello never
+    /// arrives — the failure mode that turned a TSPU app-data drop into
+    /// 2500+ stuck connections on 2026-05-29. Only the handshake phase is
+    /// bounded; an established tunnel (streaming etc.) runs without limit.
+    /// Default 10.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub tls_handshake_timeout_secs: u64,
 }
 
 fn default_mux_idle_secs() -> u64 {
@@ -186,6 +195,9 @@ fn default_udp_idle_secs() -> u64 {
 fn default_accept_backoff_ms() -> u64 {
     100
 }
+fn default_tls_handshake_timeout_secs() -> u64 {
+    10
+}
 
 impl Default for TuningConfig {
     fn default() -> Self {
@@ -193,6 +205,7 @@ impl Default for TuningConfig {
             mux_idle_secs: default_mux_idle_secs(),
             udp_idle_secs: default_udp_idle_secs(),
             accept_backoff_ms: default_accept_backoff_ms(),
+            tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
         }
     }
 }
