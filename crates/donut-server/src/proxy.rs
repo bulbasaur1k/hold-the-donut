@@ -45,6 +45,10 @@ pub struct RuntimeTuning {
     /// Pause between `accept()` retries after a persistent error
     /// (EMFILE / ENOBUFS). 0 disables the backoff.
     pub accept_backoff: Duration,
+    /// Maximum time a peer is given to complete the outer-TLS handshake.
+    /// Only the handshake phase is bounded — once it succeeds the session
+    /// runs without limit (streaming etc.).
+    pub tls_handshake_timeout: Duration,
 }
 
 impl RuntimeTuning {
@@ -53,6 +57,7 @@ impl RuntimeTuning {
             mux_idle: Duration::from_secs(t.mux_idle_secs),
             udp_idle: Duration::from_secs(t.udp_idle_secs),
             accept_backoff: Duration::from_millis(t.accept_backoff_ms),
+            tls_handshake_timeout: Duration::from_secs(t.tls_handshake_timeout_secs),
         }
     }
 }
@@ -855,15 +860,31 @@ pub async fn run_raw_proxy(
                             return;
                         }
                     };
-                    if let Err(e) = tunnel.handshake().await {
+                    let handshake_outcome =
+                        tokio::time::timeout(tuning.tls_handshake_timeout, tunnel.handshake())
+                            .await;
+                    let handshake_err: Option<std::io::Error> = match handshake_outcome {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(e),
+                        // Synthesise an io::Error so the failure log + error
+                        // metric look identical to other handshake failures;
+                        // the `error_kind` field tells the operator which it
+                        // was. A timeout here is the TSPU-app-data-drop case:
+                        // TCP established but the ClientHello never arrived.
+                        Err(_) => Some(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "tls handshake timeout",
+                        )),
+                    };
+                    if let Some(e) = handshake_err {
                         let read = tunnel.bytes_read();
-                        // read == 0: the peer reset/closed before sending a
-                        // single byte — an ordinary port scan / health check
-                        // hitting :443, not a failed tunnel. Don't pollute the
-                        // session-error metric with it; count it as a probe.
-                        // read > 0: it spoke some TLS then bailed (a picky
-                        // probe, an old-TLS/ALPN-mismatch client, or — rarely —
-                        // in-path tampering). That's a real handshake failure.
+                        // read == 0: the peer reset/closed (or sat silent
+                        // until the timeout) before sending a single byte —
+                        // an ordinary port scan / health check, or a
+                        // TSPU-blocked client. Count as a probe, not a
+                        // session error.
+                        // read > 0: it spoke some TLS then stalled (picky
+                        // probe, old-TLS/ALPN mismatch, in-path tampering).
                         if read == 0 {
                             metrics.probe();
                         } else {
