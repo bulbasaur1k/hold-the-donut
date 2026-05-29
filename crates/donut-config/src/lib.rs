@@ -147,6 +147,54 @@ pub struct ServerConfig {
     /// Optional Prometheus metrics endpoint.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Runtime tuning knobs (idle timeouts, accept backoff). Defaults match
+    /// the historical hardcoded values, so an absent or partial section is a
+    /// no-op vs prior behaviour.
+    #[serde(default)]
+    pub tuning: TuningConfig,
+}
+
+/// Runtime tuning. Each knob has a default that matches the value we shipped
+/// before the section existed, so a missing `[tuning]` block is identical to
+/// the historical hardcode. Override only what you actually need to move.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningConfig {
+    /// Idle timeout for a Mux.Cool / XUDP relay (seconds). Lower = dormant
+    /// XUDP carriers get reaped faster (less FD/memory held by stuck mux
+    /// sessions); higher = more tolerance for sporadic clients. Default 180.
+    #[serde(default = "default_mux_idle_secs")]
+    pub mux_idle_secs: u64,
+    /// Idle timeout for a single-target VLESS-UDP relay (seconds). Same
+    /// trade-off as `mux_idle_secs`. Default 120.
+    #[serde(default = "default_udp_idle_secs")]
+    pub udp_idle_secs: u64,
+    /// Pause between `accept()` retries after a persistent error
+    /// (milliseconds). Caps CPU + log-flood under EMFILE / ENOBUFS pressure;
+    /// the only reason to change it is if `accept_backoff_ms = 0` recreates
+    /// the old busy-spin, or if you want a calmer log under chronic FD
+    /// pressure (try 250–500). Default 100.
+    #[serde(default = "default_accept_backoff_ms")]
+    pub accept_backoff_ms: u64,
+}
+
+fn default_mux_idle_secs() -> u64 {
+    180
+}
+fn default_udp_idle_secs() -> u64 {
+    120
+}
+fn default_accept_backoff_ms() -> u64 {
+    100
+}
+
+impl Default for TuningConfig {
+    fn default() -> Self {
+        Self {
+            mux_idle_secs: default_mux_idle_secs(),
+            udp_idle_secs: default_udp_idle_secs(),
+            accept_backoff_ms: default_accept_backoff_ms(),
+        }
+    }
 }
 
 /// Optional Prometheus `/metrics` listener. Absent ⇒ no metrics endpoint.

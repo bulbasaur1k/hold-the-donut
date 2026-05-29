@@ -86,6 +86,7 @@ async fn socks5_through_veiled_reality_tunnel_to_echo() {
             "cloudflare-dns.com",
         )),
         donut_server::Metrics::new(),
+        donut_server::RuntimeTuning::default(),
     )
     .await
     .expect("bind veil server");
@@ -209,6 +210,7 @@ async fn blackhole_rule_drops_proxied_connection() {
             "cloudflare-dns.com",
         )),
         donut_server::Metrics::new(),
+        donut_server::RuntimeTuning::default(),
     )
     .await
     .expect("bind veil server");

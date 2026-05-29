@@ -370,7 +370,9 @@ impl Drop for ActiveGuard {
 
 /// Serve `GET /metrics` on `listener` in Prometheus text format. Runs
 /// until the listener errors; spawn it on a dedicated address.
-pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>) {
+/// `accept_backoff` is the pause between `accept()` retries on a persistent
+/// error (configurable via `[tuning] accept_backoff_ms`).
+pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>, accept_backoff: Duration) {
     loop {
         let (mut sock, _) = match listener.accept().await {
             Ok(v) => v,
@@ -378,7 +380,7 @@ pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>) {
                 tracing::warn!(?e, "metrics listener accept error");
                 // Backoff on a persistent accept error (EMFILE/ENOBUFS) so the
                 // loop can't busy-spin at 100% CPU and flood the log.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(accept_backoff).await;
                 continue;
             }
         };

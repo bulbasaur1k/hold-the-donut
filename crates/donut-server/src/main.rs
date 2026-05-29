@@ -34,6 +34,13 @@ async fn main() -> anyhow::Result<()> {
     let router = std::sync::Arc::new(cfg.router()?);
     let resolver = std::sync::Arc::new(cfg.resolver()?);
     let metrics = donut_server::Metrics::new();
+    let tuning = donut_server::RuntimeTuning::from_config(&cfg.tuning);
+    tracing::info!(
+        mux_idle_secs = cfg.tuning.mux_idle_secs,
+        udp_idle_secs = cfg.tuning.udp_idle_secs,
+        accept_backoff_ms = cfg.tuning.accept_backoff_ms,
+        "runtime tuning loaded"
+    );
 
     // The allowed-user set is the proxy's credential check; it applies to
     // every transport. Fails closed: `user_auth()` errors if `inbound.users`
@@ -54,7 +61,11 @@ async fn main() -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding metrics listener {maddr}"))?;
         tracing::info!(%maddr, "metrics endpoint listening on /metrics");
-        tokio::spawn(donut_server::metrics::serve(listener, metrics.clone()));
+        tokio::spawn(donut_server::metrics::serve(
+            listener,
+            metrics.clone(),
+            tuning.accept_backoff,
+        ));
     }
 
     match cfg.inbound.transport.as_str() {
@@ -134,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                 router,
                 resolver,
                 metrics,
+                tuning,
             )
             .await
             .context("starting tls carrier proxy")?;
@@ -156,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let bound = donut_server::run_raw_proxy(
-                listen, cert_chain, key, decoy, vision, auth, router, resolver, metrics,
+                listen, cert_chain, key, decoy, vision, auth, router, resolver, metrics, tuning,
             )
             .await
             .context("starting raw proxy")?;
@@ -180,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
             let cert_chain = reality.cert_chain()?;
             let key = reality.private_key_pem()?;
             let bound = donut_server::run_veil_proxy(
-                listen, cert_chain, key, veil, dest, auth, router, resolver, metrics,
+                listen, cert_chain, key, veil, dest, auth, router, resolver, metrics, tuning,
             )
             .await
             .context("starting veil proxy")?;

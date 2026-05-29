@@ -14,7 +14,11 @@ async fn metrics_endpoint_serves_prometheus_text() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(donut_server::metrics::serve(listener, metrics));
+    tokio::spawn(donut_server::metrics::serve(
+        listener,
+        metrics,
+        Duration::from_millis(100),
+    ));
 
     let mut sock = TcpStream::connect(addr).await.unwrap();
     sock.write_all(b"GET /metrics HTTP/1.0\r\n\r\n")

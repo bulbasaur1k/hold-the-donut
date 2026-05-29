@@ -420,6 +420,7 @@ fn server_config(inbound: ServerInbound) -> ServerConfig {
         geo: Default::default(),
         dns: Default::default(),
         metrics: Default::default(),
+        tuning: Default::default(),
     }
 }
 

@@ -46,7 +46,6 @@ const STATUS_END: u8 = 0x03;
 const STATUS_KEEPALIVE: u8 = 0x04;
 const OPTION_DATA: u8 = 0x01;
 const NET_UDP: u8 = 0x02;
-const MUX_IDLE: Duration = Duration::from_secs(180);
 
 /// A target address parsed from a frame (Mux `PortThenAddress`).
 #[derive(Clone)]
@@ -248,6 +247,7 @@ pub async fn mux_relay(
     leftover: Vec<u8>,
     metrics: &Metrics,
     vision_uuid: Option<[u8; 16]>,
+    idle: Duration,
 ) -> io::Result<()> {
     // When the Mux stream is Vision-wrapped (flow=vision + XUDP), un-pad the
     // uplink; the downlink stays raw (the client's reader passes through
@@ -321,7 +321,7 @@ pub async fn mux_relay(
             }
         }
 
-        let ev = tokio::time::timeout(MUX_IDLE, async {
+        let ev = tokio::time::timeout(idle, async {
             tokio::select! {
                 r = tunnel.read_record_opt() => Some(Ev::Tunnel(r)),
                 Some(p) = resp_rx.recv() => Some(Ev::Resp(p)),

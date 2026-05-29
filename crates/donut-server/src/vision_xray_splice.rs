@@ -284,10 +284,6 @@ pub async fn tls_plain_relay(
     Ok(())
 }
 
-/// Idle timeout for a UDP association (no activity → close), matching how
-/// proxies reap UDP flows so associations don't leak.
-const UDP_IDLE: Duration = Duration::from_secs(120);
-
 /// Pull one length-prefixed VLESS-UDP datagram (`[len:2 BE][payload]`) out of
 /// `buf` if a complete one is buffered.
 fn take_datagram(buf: &mut BytesMut) -> Option<Vec<u8>> {
@@ -317,6 +313,7 @@ pub async fn vision_udp_relay(
     target: SocketAddr,
     leftover: Vec<u8>,
     metrics: &Metrics,
+    idle: Duration,
 ) -> io::Result<()> {
     let bind = if target.is_ipv6() {
         "[::]:0"
@@ -341,7 +338,7 @@ pub async fn vision_udp_relay(
         if tunnel_done {
             break;
         }
-        let ev = tokio::time::timeout(UDP_IDLE, async {
+        let ev = tokio::time::timeout(idle, async {
             tokio::select! {
                 r = tunnel.read_record_opt() => UdpEvent::Tunnel(r),
                 r = sock.recv(&mut udpbuf) => UdpEvent::Sock(r),
