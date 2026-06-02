@@ -3,12 +3,15 @@
 //! Serves ready-to-import client configs for the `xhttp` inbound:
 //!
 //! ```text
-//! GET /sub/<uuid>?format=xray|clash|links|happ&profile=ru|all
+//! GET /sub/<uuid>?format=json|xray|clash|links|happ&profile=ru|all
 //! ```
 //!
-//! * `format=xray`  (default) — full xray `client.json` (XMUX + pure-XUDP
-//!   mux + geoip routing). For standalone xray-core, NOT HAPP (its inbound
-//!   clashes with HAPP's own core on :1080).
+//! * `format=json` — XTLS-standard JSON **array** subscription (routing baked
+//!   in → RU-split enforced; inbounds 10808/10809). Provider-style; the right
+//!   choice for HAPP (it applies the routing inside the config it runs).
+//! * `format=xray`  (default) — single full xray `client.json` (XMUX +
+//!   pure-XUDP mux + geoip routing). For standalone `xray -c`, NOT a HAPP
+//!   subscription (single object + :1080 inbound).
 //! * `format=clash` — Clash-Meta (mihomo) YAML profile.
 //! * `format=links` — base64 of the `vless://` link list (the classic
 //!   subscription format v2rayN/NG understand). Connection only, no rules.
@@ -136,6 +139,14 @@ fn handle(target: &str, cfg: &SubServeConfig, users: &UserAuth) -> String {
             let body = base64::engine::general_purpose::STANDARD
                 .encode(format!("{}\n", subgen::vless_xhttp_link(&p)));
             http_response(200, "text/plain; charset=utf-8", &body)
+        }
+        "json" | "xray-json" | "sub-json" => {
+            // XTLS-standard JSON array subscription: routing baked in (RU-split
+            // enforced), inbounds on 10808/10809. Provider-style; HAPP applies
+            // the routing because it's inside the config it runs.
+            let arr = serde_json::to_string_pretty(&subgen::xray_json_subscription(&p, profile))
+                .unwrap_or_else(|_| "[]".to_string());
+            http_response(200, "application/json; charset=utf-8", &arr)
         }
         "happ" => {
             // HAPP subscription: base64 of the vless link + a

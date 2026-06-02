@@ -137,6 +137,38 @@ fn xray_routing(profile: RoutingProfile) -> Value {
     json!({ "domainStrategy": "IPIfNonMatch", "rules": rules })
 }
 
+/// XRAY-JSON **subscription** (XTLS standard, XTLS/Xray-core#3765): a JSON
+/// array of full configs. Unlike a bare link, the `routing` is baked in, so
+/// RU-split is **enforced** — the client can't accidentally tunnel RU traffic.
+/// This is how commercial providers ship configs. Inbounds use the de-facto
+/// 10808/10809 (not 1080) so HAPP's "JSON overrides app inbound" rule doesn't
+/// clash with a stale :1080 holder.
+pub fn xray_json_subscription(p: &XhttpParams, profile: RoutingProfile) -> Value {
+    json!([{
+        "remarks": p.label,
+        "dns": {
+            "queryStrategy": "UseIPv4",
+            "servers": [
+                // Resolve RU domains via a Russian resolver so they map to RU
+                // IPs and the geoip:ru rule catches them (tighter RU-split).
+                { "address": "77.88.8.8", "domains": ["geosite:category-ru"], "expectIPs": ["geoip:ru"] },
+                "https://cloudflare-dns.com/dns-query"
+            ]
+        },
+        "inbounds": [
+            { "tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": { "udp": true } },
+            { "tag": "http-in",  "listen": "127.0.0.1", "port": 10809, "protocol": "http" }
+        ],
+        "outbounds": [
+            xray_proxy_outbound(p),
+            { "tag": "direct", "protocol": "freedom" },
+            { "tag": "block",  "protocol": "blackhole" }
+        ],
+        "routing": xray_routing(profile),
+        "meta": { "serverDescription": "donut" }
+    }])
+}
+
 /// A HAPP **routing profile** (the app's own `directSites`/`directIp`/… model,
 /// distinct from an xray `routing` block). HAPP applies this to whatever
 /// connection it manages — so a `links` subscription stays import-clean (no
@@ -369,6 +401,33 @@ mod tests {
         assert!(y.contains("reuse-settings:"));
         assert!(y.contains("max-concurrency: \"16-32\""));
         assert!(y.contains("GEOIP,RU,DIRECT"));
+    }
+
+    #[test]
+    fn xray_json_subscription_is_array_with_baked_routing() {
+        let v = xray_json_subscription(&params(), RoutingProfile::RuSplit);
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let c = &arr[0];
+        // Provider-style inbound on 10808 (not the clashing 1080).
+        assert_eq!(c["inbounds"][0]["port"], 10808);
+        // Routing baked in with the RU-direct rule → enforced split-tunnel.
+        let rules = c["routing"]["rules"].as_array().unwrap();
+        let has_ru = rules.iter().any(|r| {
+            r["ip"]
+                .as_array()
+                .map(|a| a.iter().any(|v| v == "geoip:ru"))
+                .unwrap_or(false)
+        });
+        assert!(has_ru, "JSON subscription must bake in geoip:ru → direct");
+        // Standard outbound tags present.
+        let tags: Vec<&str> = c["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        assert!(tags.contains(&"proxy") && tags.contains(&"direct") && tags.contains(&"block"));
     }
 
     #[test]
