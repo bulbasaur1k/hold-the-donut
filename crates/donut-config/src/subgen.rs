@@ -137,6 +137,66 @@ fn xray_routing(profile: RoutingProfile) -> Value {
     json!({ "domainStrategy": "IPIfNonMatch", "rules": rules })
 }
 
+/// A HAPP **routing profile** (the app's own `directSites`/`directIp`/… model,
+/// distinct from an xray `routing` block). HAPP applies this to whatever
+/// connection it manages — so a `links` subscription stays import-clean (no
+/// inbound to clash on :1080) while RU-split rules still land.
+fn happ_routing_profile(profile: RoutingProfile) -> Value {
+    let (global, direct_sites, direct_ip) = match profile {
+        RoutingProfile::RuSplit => (
+            "false",
+            json!(["geosite:category-ru", "geosite:private"]),
+            json!(["geoip:ru", "geoip:private"]),
+        ),
+        // Everything tunnelled; only private stays direct.
+        RoutingProfile::ProxyAll => ("true", json!(["geosite:private"]), json!(["geoip:private"])),
+    };
+    json!({
+        "Name": "donut RU-split",
+        "GlobalProxy": global,
+        "RemoteDNSType": "DoH",
+        "RemoteDNSDomain": "https://cloudflare-dns.com/dns-query",
+        "RemoteDNSIP": "1.1.1.1",
+        "DomesticDNSType": "DoU",
+        "DomesticDNSDomain": "",
+        "DomesticDNSIP": "77.88.8.8",
+        "Geoipurl": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
+        "Geositeurl": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+        "LastUpdated": "",
+        "DnsHosts": {},
+        "DirectSites": direct_sites,
+        "DirectIp": direct_ip,
+        "ProxySites": [],
+        "ProxyIp": [],
+        "BlockSites": ["geosite:category-ads-all"],
+        "BlockIp": [],
+        "DomainStrategy": "IPIfNonMatch",
+        "FakeDNS": "false"
+    })
+}
+
+/// HAPP routing deeplink (`happ://routing/onadd/<base64-json>`). HAPP parses
+/// this from a subscription body and applies the RU-split routing profile —
+/// the documented way to push routing rules into HAPP.
+pub fn happ_routing_deeplink(profile: RoutingProfile) -> String {
+    use base64::Engine;
+    let json = serde_json::to_string(&happ_routing_profile(profile)).expect("static json");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json);
+    format!("happ://routing/onadd/{b64}")
+}
+
+/// HAPP subscription **body** (plain, pre-base64): the `vless://` connection
+/// link plus the routing deeplink, one per line. The subscription endpoint
+/// base64-wraps this; HAPP decodes it, imports the profile, and applies the
+/// RU-split routing — connection + rules from a single subscription URL.
+pub fn happ_subscription_body(p: &XhttpParams, profile: RoutingProfile) -> String {
+    format!(
+        "{}\n{}\n",
+        vless_xhttp_link(p),
+        happ_routing_deeplink(profile)
+    )
+}
+
 /// Build a full **xray-format** `client.json` for the xHTTP transport with
 /// the given routing `profile` (geoip/geosite split). The `geoip:`/
 /// `geosite:` tags resolve against the client's own `geoip.dat`/
@@ -309,5 +369,28 @@ mod tests {
         assert!(y.contains("reuse-settings:"));
         assert!(y.contains("max-concurrency: \"16-32\""));
         assert!(y.contains("GEOIP,RU,DIRECT"));
+    }
+
+    #[test]
+    fn happ_subscription_bundles_link_and_routing() {
+        use base64::Engine;
+        let body = happ_subscription_body(&params(), RoutingProfile::RuSplit);
+        // Connection link present.
+        assert!(body.contains("vless://"));
+        assert!(body.contains("type=xhttp"));
+        // Routing deeplink present and decodes to a HAPP RU-split profile.
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("happ://routing/onadd/"))
+            .expect("routing deeplink");
+        let b64 = line.trim_start_matches("happ://routing/onadd/");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("valid base64");
+        let v: Value = serde_json::from_slice(&json).expect("valid json");
+        assert_eq!(v["DirectIp"][0], "geoip:ru");
+        assert_eq!(v["DirectSites"][0], "geosite:category-ru");
+        assert_eq!(v["BlockSites"][0], "geosite:category-ads-all");
+        assert_eq!(v["GlobalProxy"], "false");
     }
 }

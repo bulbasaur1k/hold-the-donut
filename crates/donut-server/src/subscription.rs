@@ -3,14 +3,18 @@
 //! Serves ready-to-import client configs for the `xhttp` inbound:
 //!
 //! ```text
-//! GET /sub/<uuid>?format=xray|clash|links&profile=ru|all
+//! GET /sub/<uuid>?format=xray|clash|links|happ&profile=ru|all
 //! ```
 //!
 //! * `format=xray`  (default) — full xray `client.json` (XMUX + pure-XUDP
-//!   mux + geoip routing).
+//!   mux + geoip routing). For standalone xray-core, NOT HAPP (its inbound
+//!   clashes with HAPP's own core on :1080).
 //! * `format=clash` — Clash-Meta (mihomo) YAML profile.
 //! * `format=links` — base64 of the `vless://` link list (the classic
-//!   subscription format v2rayN/NG understand).
+//!   subscription format v2rayN/NG understand). Connection only, no rules.
+//! * `format=happ` — base64 of the `vless://` link + a `happ://routing/onadd`
+//!   deeplink, so HAPP imports the connection AND applies the RU-split
+//!   routing profile (rules-from-subscription, no :1080 clash).
 //! * `profile=ru` (default) — RU split-tunnel; `profile=all` — proxy-all.
 //!
 //! `<uuid>` must be in the inbound's allowed-user set, otherwise 404 — the
@@ -131,6 +135,15 @@ fn handle(target: &str, cfg: &SubServeConfig, users: &UserAuth) -> String {
             // Classic subscription: base64 of the newline-joined link list.
             let body = base64::engine::general_purpose::STANDARD
                 .encode(format!("{}\n", subgen::vless_xhttp_link(&p)));
+            http_response(200, "text/plain; charset=utf-8", &body)
+        }
+        "happ" => {
+            // HAPP subscription: base64 of the vless link + a
+            // `happ://routing/onadd/...` deeplink, so HAPP imports the
+            // connection AND applies the RU-split routing profile. No xray
+            // inbound, so no :1080 clash with HAPP's own core.
+            let body = base64::engine::general_purpose::STANDARD
+                .encode(subgen::happ_subscription_body(&p, profile));
             http_response(200, "text/plain; charset=utf-8", &body)
         }
         _ => {
