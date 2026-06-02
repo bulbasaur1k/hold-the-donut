@@ -50,6 +50,14 @@ pub struct ServerConfig {
     /// looks like an ordinary site. `None` ⇒ 404 on non-tunnel requests.
     #[serde(default)]
     pub decoy: Option<SocketAddr>,
+
+    /// Expected `Host` / `:authority` value (xHTTP). When `Some`, a
+    /// request whose authority doesn't match is treated as non-tunnel —
+    /// it falls through to the decoy or a 404, exactly as Xray's hub
+    /// rejects a wrong Host with 404. `None` ⇒ any Host accepted (the
+    /// donut client and the reverse-proxy paths don't pin it).
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -67,6 +75,7 @@ impl Default for ServerConfig {
             max_buffered_posts: 30,
             stream_up_secs: (20, 80),
             decoy: None,
+            host: None,
         }
     }
 }

@@ -23,12 +23,73 @@ use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use donut_io::vision_xray::Unpadder;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::metrics::Metrics;
 use crate::vision_xray_splice::RecordTlsServer;
+
+/// Plaintext I/O the Mux relay needs, abstracted over the two carriers it
+/// runs on: the raw/vision path drives TLS *records* manually
+/// ([`RecordTlsServer`]); the xHTTP/carrier path is a plain byte stream.
+/// Mux frames don't care about record boundaries — the relay just needs
+/// "read some plaintext", "write some plaintext", "close" — so one relay
+/// serves both. Futures are `Send` so the relay can run inside `spawn`.
+pub trait MuxIo {
+    /// Read the next plaintext chunk; `Ok(None)` on clean EOF.
+    fn read_chunk(
+        &mut self,
+    ) -> impl std::future::Future<Output = io::Result<Option<Vec<u8>>>> + Send;
+    /// Write a complete plaintext frame.
+    fn write_chunk(
+        &mut self,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send;
+    /// Close the downstream half.
+    fn close(&mut self) -> impl std::future::Future<Output = io::Result<()>> + Send;
+}
+
+impl MuxIo for RecordTlsServer {
+    async fn read_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.read_record_opt().await
+    }
+    async fn write_chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write_plaintext(data).await
+    }
+    async fn close(&mut self) -> io::Result<()> {
+        self.shutdown().await
+    }
+}
+
+/// [`MuxIo`] over a plain duplex byte stream (the xHTTP/carrier session).
+pub struct CarrierMuxIo<S> {
+    inner: S,
+    buf: Box<[u8; 32 * 1024]>,
+}
+
+impl<S> CarrierMuxIo<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            buf: Box::new([0u8; 32 * 1024]),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> MuxIo for CarrierMuxIo<S> {
+    async fn read_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let n = self.inner.read(&mut self.buf[..]).await?;
+        Ok((n != 0).then(|| self.buf[..n].to_vec()))
+    }
+    async fn write_chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        self.inner.write_all(data).await
+    }
+    async fn close(&mut self) -> io::Result<()> {
+        self.inner.shutdown().await
+    }
+}
 
 /// De-pad an inbound chunk: when the Mux stream rides inside Vision
 /// (`flow=xtls-rprx-vision` + XUDP, e.g. HAPP), the client pads the frames, so
@@ -242,8 +303,8 @@ impl Drop for UdpSession {
 // The session is created with async work (resolve/bind/spawn) between the
 // lookup and the insert, so the Entry API doesn't fit cleanly.
 #[allow(clippy::map_entry)]
-pub async fn mux_relay(
-    mut tunnel: RecordTlsServer,
+pub async fn mux_relay<T: MuxIo>(
+    mut tunnel: T,
     leftover: Vec<u8>,
     metrics: &Metrics,
     vision_uuid: Option<[u8; 16]>,
@@ -323,7 +384,7 @@ pub async fn mux_relay(
 
         let ev = tokio::time::timeout(idle, async {
             tokio::select! {
-                r = tunnel.read_record_opt() => Some(Ev::Tunnel(r)),
+                r = tunnel.read_chunk() => Some(Ev::Tunnel(r)),
                 Some(p) = resp_rx.recv() => Some(Ev::Resp(p)),
             }
         })
@@ -348,12 +409,12 @@ pub async fn mux_relay(
             },
             Ok(Some(Ev::Resp((sid, src, data)))) => {
                 let frame = keep_frame(sid, src, &data);
-                tunnel.write_plaintext(&frame).await?;
+                tunnel.write_chunk(&frame).await?;
                 metrics.add_bytes(0, data.len() as u64);
             }
         }
     }
-    let _ = tunnel.shutdown().await;
+    let _ = tunnel.close().await;
     Ok(())
 }
 
@@ -407,6 +468,83 @@ mod tests {
     fn parse_incomplete_returns_none() {
         let mut buf = BytesMut::from(&[0x00, 0x0c, 0x00][..]); // says meta-len 12 but short
         assert!(parse_frame(&mut buf).unwrap().is_none());
+    }
+
+    /// End-to-end XUDP over the **carrier** byte stream (the xHTTP path):
+    /// feed a NEW+UDP frame through `mux_relay` over `CarrierMuxIo` to a real
+    /// local UDP echo, and read the echoed datagram back as a KEEP frame.
+    /// This is the deterministic stand-in for "HAPP mux over xHTTP".
+    #[tokio::test]
+    async fn carrier_mux_relay_echoes_xudp_datagram() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Local UDP echo server.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 1500];
+            while let Ok((n, src)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], src).await;
+            }
+        });
+
+        // Craft a NEW+UDP+Data Mux frame targeting the echo (IPv4 127.0.0.1).
+        let port = echo_addr.port();
+        let payload = b"ping-xudp";
+        let mut meta = vec![
+            0x00,
+            0x01, // sid = 1
+            STATUS_NEW,
+            OPTION_DATA,
+            NET_UDP,
+            (port >> 8) as u8,
+            port as u8,
+            0x01, // addr type IPv4
+            127,
+            0,
+            0,
+            1,
+        ];
+        meta.extend_from_slice(&[0u8; 8]); // New+UDP+Data → 8-byte global id
+        let mut frame = Vec::new();
+        frame.push((meta.len() >> 8) as u8);
+        frame.push(meta.len() as u8);
+        frame.extend_from_slice(&meta);
+        frame.push((payload.len() >> 8) as u8);
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload);
+
+        // Drive mux_relay over a plain duplex (the carrier), feeding the frame
+        // as the post-request leftover.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let metrics = Metrics::new();
+        let m = metrics.clone();
+        let relay = tokio::spawn(async move {
+            let _ = mux_relay(
+                CarrierMuxIo::new(server),
+                frame,
+                &m,
+                None,
+                Duration::from_secs(5),
+            )
+            .await;
+        });
+
+        // Read the KEEP frame carrying the echoed datagram.
+        let mut buf = vec![0u8; 1500];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("relay response timeout")
+            .expect("read");
+        let mut rb = BytesMut::from(&buf[..n]);
+        let f = parse_frame(&mut rb).unwrap().unwrap();
+        assert_eq!(f.status, STATUS_KEEP);
+        assert_eq!(f.data.as_deref(), Some(&payload[..]));
+
+        // Closing the carrier ends the relay.
+        let _ = client.shutdown().await;
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
     }
 
     #[test]

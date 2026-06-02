@@ -98,6 +98,21 @@ impl Dispatcher {
         let (user_side, bridge_side) = tokio::io::duplex(PIPE_CAPACITY);
         let (bridge_rd, mut bridge_wr) = tokio::io::split(bridge_side);
 
+        // Xray's xHTTP client sends a `Referer` (carrying x_padding) and
+        // expects the uplink POST response to act as a keepalive channel.
+        // The donut client sends none → it gets a plain empty 200 (and the
+        // existing tests stay unchanged).
+        let keepalive =
+            req.headers().contains_key(http::header::REFERER) && self.config.stream_up_secs.1 > 0;
+        let stream_up_secs = self.config.stream_up_secs;
+        let ok_response = move || {
+            if keepalive {
+                super::uplink_keepalive_response(stream_up_secs)
+            } else {
+                empty_response(StatusCode::OK)
+            }
+        };
+
         // Pump the uplink body chunks into bridge_wr (so user_side reads).
         tokio::spawn(async move {
             let mut body = req.into_body();
@@ -154,9 +169,9 @@ impl Dispatcher {
                 if self.accept.send(session).await.is_err() {
                     tracing::warn!("stream-up: accept channel closed");
                 }
-                Ok(empty_response(StatusCode::OK))
+                Ok(ok_response())
             }
-            Action::Park => Ok(empty_response(StatusCode::OK)),
+            Action::Park => Ok(ok_response()),
             Action::Conflict => {
                 tracing::warn!(?sid, "duplicate stream-up uplink");
                 Ok(empty_response(StatusCode::CONFLICT))
@@ -221,10 +236,7 @@ impl Dispatcher {
             }
         }
 
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(body)
-            .expect("static builder"))
+        Ok(super::downlink_response(body))
     }
 }
 

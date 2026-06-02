@@ -65,6 +65,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
 
+pub mod subgen;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading {path}: {source}")]
@@ -147,6 +149,10 @@ pub struct ServerConfig {
     /// Optional Prometheus metrics endpoint.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Optional subscription endpoint that serves ready client configs
+    /// (xray JSON / vless:// links / Clash YAML) for `transport = "xhttp"`.
+    #[serde(default)]
+    pub subscription: SubscriptionConfig,
     /// Runtime tuning knobs (idle timeouts, accept backoff). Defaults match
     /// the historical hardcoded values, so an absent or partial section is a
     /// no-op vs prior behaviour.
@@ -215,6 +221,49 @@ impl Default for TuningConfig {
 pub struct MetricsConfig {
     #[serde(default)]
     pub listen: Option<String>,
+}
+
+/// Subscription endpoint config. When `listen` is set, donut-server serves
+/// `GET /sub/<uuid>?format=xray|clash|links[&profile=ru|all]` returning a
+/// ready client config for that user (only for `transport = "xhttp"`).
+/// `public_address` + `server_name` are required when `listen` is set — the
+/// daemon can't derive its public domain from a `0.0.0.0` bind. `host`,
+/// `path` and `mode` default to the inbound's values.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SubscriptionConfig {
+    /// Listen address for the subscription HTTP endpoint (e.g.
+    /// `127.0.0.1:8080` behind a reverse proxy). Absent ⇒ disabled.
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Public `host:port` clients dial (your domain + port). Required.
+    #[serde(default)]
+    pub public_address: Option<String>,
+    /// TLS SNI / `serverName` clients present. Required.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// xHTTP `Host`. Defaults to `inbound.host`, else `server_name`.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Secret path prefix. Defaults to `inbound.path`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Framing mode. Defaults to `inbound.mode` (stream-up for xhttp).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// uTLS fingerprint baked into the served configs. Default `firefox`.
+    #[serde(default = "default_sub_fp")]
+    pub fp: String,
+    /// Local SOCKS5 the generated client opens. Default `127.0.0.1:1080`.
+    #[serde(default = "default_sub_socks")]
+    pub socks: String,
+}
+
+fn default_sub_fp() -> String {
+    "firefox".to_string()
+}
+
+fn default_sub_socks() -> String {
+    "127.0.0.1:1080".to_string()
 }
 
 /// Paths to v2fly `.dat` geo databases (optional).
@@ -302,9 +351,18 @@ fn load_geosite(path: &str) -> Result<GeoSiteDb, ConfigError> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInbound {
     pub listen: String,
-    /// Inbound transport: `"veil"` (REALITY veiled-TLS, default) or
-    /// `"carrier"` (plain HTTP/1.1 carrier backend behind a TLS/HTTP-3
-    /// reverse proxy such as Caddy — cert-based, no REALITY).
+    /// Inbound transport:
+    /// * `"veil"` — REALITY veiled-TLS (default).
+    /// * `"carrier"` — plain HTTP/1.1 carrier backend behind a TLS/HTTP-3
+    ///   reverse proxy such as Caddy (cert-based, no REALITY).
+    /// * `"tls"` — donut's own carrier over cert-TLS terminated here.
+    /// * `"xhttp"` — **Xray-wire-compatible** xHTTP over cert-TLS+H2,
+    ///   terminated here. Off-the-shelf VLESS clients (HAPP, Xray) connect
+    ///   with `network=xhttp`. Uses `cert`/`key`, `path` (secret prefix),
+    ///   `mode` (`stream-up` recommended), `host` (pinned authority) and
+    ///   `dest` (self-steal decoy).
+    /// * `"quic"` — direct QUIC/HTTP-3 termination.
+    /// * `"raw"` — VLESS directly over TLS (Xray RAW/TCP analogue).
     #[serde(default = "default_server_transport")]
     pub transport: String,
     /// REALITY parameters. Required for `transport = "veil"`; ignored
@@ -329,11 +387,18 @@ pub struct ServerInbound {
     /// get a 404.
     #[serde(default)]
     pub dest: Option<String>,
-    /// Carrier framing mode for `transport = "tls"`: `"stream-one"`
-    /// (default), `"stream-up"`, or `"packet-up"`. Must match the
-    /// client's `outbound.mode`. Ignored by other transports.
+    /// Carrier framing mode for `transport = "tls"` / `"xhttp"`:
+    /// `"stream-one"` (default), `"stream-up"`, or `"packet-up"`. Must
+    /// match the client's `outbound.mode` (xHTTP clients default to
+    /// `stream-up` over H2+TLS). Ignored by other transports.
     #[serde(default = "default_carrier_mode")]
     pub mode: String,
+    /// Pinned `Host`/`:authority` for `transport = "xhttp"`: requests with
+    /// a different Host are self-stolen to `dest` (or 404), mirroring
+    /// Xray's host check. Should equal the client's TLS SNI / xHTTP host.
+    /// `None` ⇒ any Host accepted. Ignored by other transports.
+    #[serde(default)]
+    pub host: Option<String>,
     /// Vision data-plane dialect for `transport = "raw"` + `flow =
     /// "xtls-rprx-vision"`: `"donut"` (default, our simpler padding —
     /// for the donut client) or `"xray"` (byte-faithful Xray Vision —

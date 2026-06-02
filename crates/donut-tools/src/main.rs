@@ -75,6 +75,12 @@ enum TransportKind {
     /// Store clients** (HAPP, Streisand, …): emits the server config plus a
     /// ready-to-paste `vless://` link — no donut-client needed.
     Raw,
+    /// Cert-based **Xray-compatible xHTTP** (server `xhttp`, TLS+H2,
+    /// stream-up). The DPI-evasion interop path for off-the-shelf clients
+    /// (HAPP, Xray, …): traffic looks like ordinary web requests. Emits the
+    /// server config plus a ready-to-paste `vless://…type=xhttp…` link — no
+    /// donut-client needed.
+    Xhttp,
 }
 
 /// Carrier framing mode for the cert-based TLS carrier (`tls`/`xhttp`).
@@ -133,9 +139,19 @@ struct ConfigGenArgs {
     #[arg(long)]
     path: Option<String>,
     /// Carrier framing mode for `tls` (`stream-one` default, `stream-up`,
-    /// `packet-up`). Ignored by `veil`/`quic`.
+    /// `packet-up`). Ignored by `veil`/`quic`. For `xhttp` the canonical
+    /// mode is `stream-up`; `stream-one` is treated as unset → `stream-up`.
     #[arg(long, value_enum, default_value = "stream-one")]
     carrier_mode: CarrierMode,
+    /// Pinned `Host`/`:authority` for `xhttp` (and the `host=` field in the
+    /// share link). Defaults to `server_name` (the TLS SNI). Ignored by
+    /// other transports.
+    #[arg(long)]
+    host: Option<String>,
+    /// uTLS ClientHello fingerprint for the `xhttp` share link + client JSON.
+    /// Default `firefox`. Ignored by other transports.
+    #[arg(long, default_value = "firefox")]
+    fp: String,
 }
 
 #[cfg(test)]
@@ -152,6 +168,8 @@ impl Default for ConfigGenArgs {
             key: "/etc/donut/privkey.pem".into(),
             path: None,
             carrier_mode: CarrierMode::StreamOne,
+            host: None,
+            fp: "firefox".into(),
         }
     }
 }
@@ -234,6 +252,40 @@ fn config_gen(args: &ConfigGenArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if args.transport == TransportKind::Xhttp {
+        use donut_config::subgen::{self, RoutingProfile};
+        let (server, uuid, path, host, mode) = xhttp_server(args);
+        let p = subgen::XhttpParams {
+            uuid,
+            server_addr: args.server_addr.clone(),
+            sni: args.server_name.clone(),
+            host,
+            path,
+            mode: mode.to_string(),
+            fp: args.fp.clone(),
+            socks: args.socks.clone(),
+            label: format!("donut-xhttp-{}", host_of(&args.server_addr)),
+        };
+        println!("// ===== server.json =====");
+        println!("{}", serde_json::to_string_pretty(&server)?);
+        println!();
+        println!("// ===== share link (paste into HAPP / Streisand / v2box / etc.) =====");
+        println!("{}", subgen::vless_xhttp_link(&p));
+        println!();
+        println!(
+            "// ===== xray client.json (fp={}, XMUX + pure-XUDP mux, RU split-tunnel) =====",
+            args.fp
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&subgen::xray_client_json(&p, RoutingProfile::RuSplit))?
+        );
+        println!();
+        println!("// ===== clash.yaml (mihomo, experimental xHTTP) =====");
+        println!("{}", subgen::clash_yaml(&p, RoutingProfile::RuSplit));
+        return Ok(());
+    }
+
     let (server, client) = generate_pair(args);
     println!("// ===== server.json =====");
     println!("{}", serde_json::to_string_pretty(&server)?);
@@ -260,8 +312,48 @@ fn raw_server(args: &ConfigGenArgs) -> (ServerConfig, String) {
         dest: Some(args.dest.clone()),
         mode: "stream-one".into(),
         vision: "xray".into(),
+        host: None,
     };
     (server_config(inbound), uuid)
+}
+
+/// Cert-based **Xray-compatible xHTTP** server (`transport="xhttp"`, TLS+H2).
+/// Returns the server config, the fresh user UUID, the secret path, the
+/// pinned host, and the effective framing mode — everything the share link
+/// needs. Like [`raw_server`] there is no paired donut-client: this targets
+/// off-the-shelf clients (HAPP, Xray), which connect from the `vless://` link.
+fn xhttp_server(args: &ConfigGenArgs) -> (ServerConfig, String, String, String, &'static str) {
+    let path = args
+        .path
+        .clone()
+        .unwrap_or_else(|| format!("/donut-{}", hex::encode(rand::random::<[u8; 8]>())));
+    let uuid = donut_core::UserId::new_v4().to_string();
+    let host = args
+        .host
+        .clone()
+        .unwrap_or_else(|| args.server_name.clone());
+    // xHTTP's canonical mode is stream-up; treat the global stream-one default
+    // as unset so the server config and the share link agree (the server's
+    // xhttp arm makes the same substitution).
+    let mode = match args.carrier_mode {
+        CarrierMode::StreamOne => "stream-up",
+        other => other.as_str(),
+    };
+
+    let inbound = ServerInbound {
+        listen: args.listen.clone(),
+        transport: "xhttp".into(),
+        users: vec![uuid.clone()],
+        reality: None,
+        path: path.clone(),
+        cert: Some(args.cert.clone()),
+        key: Some(args.key.clone()),
+        dest: Some(args.dest.clone()),
+        mode: mode.into(),
+        vision: "donut".into(),
+        host: Some(host.clone()),
+    };
+    (server_config(inbound), uuid, path, host, mode)
 }
 
 /// Build a standard `vless://` share URI:
@@ -317,9 +409,10 @@ fn generate_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
         TransportKind::Tls => cert_pair(args, "tls", "xhttp", args.carrier_mode.as_str()),
         // QUIC/H3 ignore the carrier mode; pin it to the default.
         TransportKind::Quic => cert_pair(args, "quic", "h3", "stream-one"),
-        // RAW emits a server + share-link (no donut-client) via raw_server,
+        // RAW and XHTTP emit a server + share-link (no donut-client),
         // handled directly in config_gen before this is reached.
         TransportKind::Raw => unreachable!("raw transport is handled by raw_server"),
+        TransportKind::Xhttp => unreachable!("xhttp transport is handled by xhttp_server"),
     }
 }
 
@@ -347,6 +440,7 @@ fn veil_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
         dest: None,
         mode: "stream-one".into(),
         vision: "donut".into(),
+        host: None,
     };
 
     let outbound = ClientOutbound {
@@ -395,6 +489,7 @@ fn cert_pair(
         dest: Some(args.dest.clone()),
         mode: mode.into(),
         vision: "donut".into(),
+        host: None,
     };
 
     let outbound = ClientOutbound {
@@ -420,6 +515,7 @@ fn server_config(inbound: ServerInbound) -> ServerConfig {
         geo: Default::default(),
         dns: Default::default(),
         metrics: Default::default(),
+        subscription: Default::default(),
         tuning: Default::default(),
     }
 }
@@ -571,6 +667,67 @@ mod tests {
     fn link_omits_flow_when_none() {
         let link = vless_link("u", "h:443", "sni.example", "chrome", "none", "lbl");
         assert!(!link.contains("flow="));
+    }
+
+    #[test]
+    fn xhttp_server_is_host_pinned_and_link_is_wellformed() {
+        let mut args = args_for(TransportKind::Xhttp);
+        args.server_name = "edge.example".into();
+        // Default carrier_mode is stream-one → must surface as stream-up.
+        let (server, uuid, path, host, mode) = xhttp_server(&args);
+
+        assert_eq!(server.inbound.transport, "xhttp");
+        assert_eq!(server.inbound.mode, "stream-up");
+        assert_eq!(mode, "stream-up");
+        assert!(server.inbound.reality.is_none());
+        // Host pin defaults to the SNI and is carried into the config.
+        assert_eq!(host, "edge.example");
+        assert_eq!(server.inbound.host.as_deref(), Some("edge.example"));
+        // Cert/key/decoy + a fresh secret path materialised server-side.
+        assert_eq!(server.inbound.cert.as_deref(), Some(args.cert.as_str()));
+        assert_eq!(server.inbound.dest.as_deref(), Some(args.dest.as_str()));
+        assert!(path.starts_with("/donut-"));
+        // The generated UUID authenticates against the server's user set.
+        let auth = server.inbound.user_auth().unwrap();
+        assert!(auth.is_authorized(&uuid.parse().unwrap()));
+
+        let link = donut_config::subgen::vless_xhttp_link(&donut_config::subgen::XhttpParams {
+            uuid: uuid.clone(),
+            server_addr: args.server_addr.clone(),
+            sni: args.server_name.clone(),
+            host: host.clone(),
+            path: path.clone(),
+            mode: mode.to_string(),
+            fp: "chrome".into(),
+            socks: args.socks.clone(),
+            label: "donut-xhttp".into(),
+        });
+        assert!(link.starts_with(&format!("vless://{uuid}@203.0.113.1:443?")));
+        assert!(link.contains("type=xhttp"));
+        assert!(link.contains("security=tls"));
+        assert!(link.contains("encryption=none"));
+        assert!(link.contains("mode=stream-up"));
+        assert!(link.contains("host=edge.example"));
+        assert!(link.contains("alpn=h2"));
+        // The secret path is percent-encoded ('/' → %2F).
+        assert!(link.contains(&format!("path={}", pct(&path))));
+        assert!(link.contains("path=%2Fdonut-"));
+        assert!(link.ends_with("#donut-xhttp"));
+    }
+
+    // The xray client.json shape (firefox fp, XMUX, pure-XUDP mux, RU
+    // split-tunnel) is covered by `donut_config::subgen` unit tests.
+
+    #[test]
+    fn xhttp_explicit_host_and_mode_are_honoured() {
+        let mut args = args_for(TransportKind::Xhttp);
+        args.host = Some("front.cdn.example".into());
+        args.carrier_mode = CarrierMode::PacketUp;
+        let (server, _uuid, _path, host, mode) = xhttp_server(&args);
+        assert_eq!(host, "front.cdn.example");
+        assert_eq!(server.inbound.host.as_deref(), Some("front.cdn.example"));
+        assert_eq!(mode, "packet-up");
+        assert_eq!(server.inbound.mode, "packet-up");
     }
 
     #[test]

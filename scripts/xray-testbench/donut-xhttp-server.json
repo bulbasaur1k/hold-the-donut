@@ -1,0 +1,21 @@
+{
+  "log": { "level": "debug" },
+  "inbound": {
+    "listen": "0.0.0.0:8444",
+    "transport": "xhttp",
+    "mode": "stream-up",
+    "path": "/donut-secret",
+    "host": "tunnel.example",
+    "cert": "scripts/xray-testbench/certs/cert.pem",
+    "key": "scripts/xray-testbench/certs/key.pem",
+    "users": ["b831381d-6324-4d53-ad4f-8cda48b30811"]
+  },
+  "metrics": { "listen": "127.0.0.1:9099" },
+  "subscription": {
+    "listen": "127.0.0.1:8088",
+    "public_address": "tunnel.example:8444",
+    "server_name": "tunnel.example"
+  },
+  "dns": { "doh": ["1.1.1.1", "8.8.8.8"], "doh_tls_name": "cloudflare-dns.com" },
+  "routing": { "default": "freedom" }
+}
