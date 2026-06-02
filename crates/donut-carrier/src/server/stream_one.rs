@@ -93,9 +93,5 @@ fn spawn_session(
         tracing::warn!("stream-one: accept channel full or closed");
     }
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/grpc")
-        .body(response_body)
-        .expect("static response builder")
+    super::downlink_response(response_body)
 }

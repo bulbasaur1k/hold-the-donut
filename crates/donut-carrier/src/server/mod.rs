@@ -226,6 +226,18 @@ async fn drive_connection<IO>(
 pub(crate) type ResponseBody = BoxBody<Bytes, std::io::Error>;
 pub(crate) type Result<T> = std::result::Result<T, CarrierError>;
 pub(crate) use http::StatusCode;
+
+/// Random alphanumeric `X-Padding` value (Xray default range 100–1000
+/// bytes, fresh per response). Without it a DPI box can fingerprint the
+/// server by the fixed length of its response header block, so xHTTP
+/// mandates random padding on every reply.
+pub(crate) fn x_padding() -> String {
+    use rand::distributions::{Alphanumeric, DistString};
+    use rand::Rng;
+    let len = rand::thread_rng().gen_range(100..=1000);
+    Alphanumeric.sample_string(&mut rand::thread_rng(), len)
+}
+
 pub(crate) fn empty_response(code: StatusCode) -> Response<ResponseBody> {
     use http_body_util::{BodyExt, Empty};
     let body = Empty::<Bytes>::new()
@@ -233,8 +245,69 @@ pub(crate) fn empty_response(code: StatusCode) -> Response<ResponseBody> {
         .boxed();
     Response::builder()
         .status(code)
+        .header("X-Padding", x_padding())
         .body(body)
         .expect("static empty body")
+}
+
+/// Build the **uplink-POST** keepalive response for `stream-up`.
+///
+/// In Xray's xHTTP the uplink POST's *response* body is otherwise unused
+/// (downlink data rides the separate GET), so the server repurposes it as
+/// a keepalive channel: every `secs` (random in range) it writes a chunk
+/// of `X` padding. That keeps a middlebox from reaping the long-lived POST
+/// (and thus the H2 connection) as idle, without touching the downlink
+/// data stream. The client reads and discards this body. The stream is
+/// unbounded — hyper drops it (cancelling the timer) when the request /
+/// connection ends, mirroring Xray's `request.Context().Done()` exit.
+pub(crate) fn uplink_keepalive_response(secs: (u32, u32)) -> Response<ResponseBody> {
+    use futures_util::stream;
+    use http_body_util::{BodyExt, StreamBody};
+    use hyper::body::Frame;
+    use rand::Rng;
+
+    let lo = secs.0.max(1);
+    let hi = secs.1.max(lo);
+    let body_stream = stream::unfold((), move |()| async move {
+        let wait = rand::thread_rng().gen_range(lo..=hi) as u64;
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        // Xray writes `bytes.Repeat([]byte{'X'}, rand(xPaddingBytes))`.
+        let len = rand::thread_rng().gen_range(100..=1000);
+        let pad = Bytes::from(vec![b'X'; len]);
+        Some((Ok::<Frame<Bytes>, std::io::Error>(Frame::data(pad)), ()))
+    });
+    let body = StreamBody::new(body_stream).boxed();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("X-Accel-Buffering", "no")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("X-Padding", x_padding())
+        .body(body)
+        .expect("static keepalive builder")
+}
+
+/// Build the streaming **downlink** response shared by every mode's
+/// server→client direction, carrying the Xray-faithful header set:
+///
+/// * `Content-Type: text/event-stream` — masks the long-lived stream as
+///   Server-Sent Events so middleboxes treat it as a push channel and
+///   don't buffer it. The body is raw tunnel bytes, *not* SSE event
+///   lines — this is masking only.
+/// * `X-Accel-Buffering: no` + `Cache-Control: no-store` — stop an
+///   nginx/apache reverse proxy from buffering or caching the body.
+/// * `X-Padding` — random per-response padding (see [`x_padding`]).
+/// * permissive CORS so a Browser-Dialer xHTTP client isn't blocked.
+pub(crate) fn downlink_response(body: ResponseBody) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/event-stream")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("X-Accel-Buffering", "no")
+        .header("X-Padding", x_padding())
+        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(http::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST")
+        .body(body)
+        .expect("static downlink builder")
 }
 
 /// Reverse-proxy a non-tunnel request to the self-steal `decoy` backend

@@ -204,10 +204,7 @@ impl Dispatcher {
             }
         }
 
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(body)
-            .expect("static builder"))
+        Ok(super::downlink_response(body))
     }
 }
 

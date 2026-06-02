@@ -15,6 +15,7 @@ pub mod metrics;
 mod mux;
 mod proxy;
 mod selfsteal;
+pub mod subscription;
 mod veil_server;
 mod vision_xray_splice;
 
@@ -24,4 +25,5 @@ pub use proxy::{
     run_veil_proxy, ProxyError, RuntimeTuning, VisionDialect,
 };
 pub use selfsteal::{triage, Triage};
+pub use subscription::SubServeConfig;
 pub use veil_server::{PrefixedStream, VeilServer};

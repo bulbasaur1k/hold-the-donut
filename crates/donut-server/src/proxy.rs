@@ -150,6 +150,7 @@ pub async fn run_carrier_proxy(
                     router,
                     resolver,
                     metrics,
+                    RuntimeTuning::default().mux_idle,
                 )
                 .await
                 {
@@ -212,6 +213,7 @@ pub async fn run_carrier_backend(
                     router,
                     resolver,
                     metrics,
+                    RuntimeTuning::default().mux_idle,
                 )
                 .await
                 {
@@ -262,6 +264,7 @@ pub async fn run_quic_proxy(
                     router,
                     resolver,
                     metrics,
+                    RuntimeTuning::default().mux_idle,
                 )
                 .await
                 {
@@ -289,6 +292,7 @@ pub async fn run_tls_carrier_proxy(
     secret_path: String,
     mode: donut_carrier::Mode,
     decoy: Option<SocketAddr>,
+    host: Option<String>,
     auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
@@ -317,6 +321,7 @@ pub async fn run_tls_carrier_proxy(
             mode,
             path_prefix: secret_path,
             decoy,
+            host,
             ..donut_carrier::ServerConfig::default()
         });
 
@@ -342,6 +347,7 @@ pub async fn run_tls_carrier_proxy(
                         router,
                         resolver,
                         metrics,
+                        tuning.mux_idle,
                     )
                     .await
                     {
@@ -454,6 +460,7 @@ pub async fn run_veil_proxy(
                                     router,
                                     resolver,
                                     metrics,
+                                    tuning.mux_idle,
                                 )
                                 .await
                                 {
@@ -484,9 +491,10 @@ async fn handle_session<S>(
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
+    mux_idle: std::time::Duration,
 ) -> Result<(), ProxyError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     // Read enough bytes to parse the inner-frame request header. The
     // header is short (≤ ~280 bytes), so a single buffered read is
@@ -524,6 +532,31 @@ where
         metrics.rejected_unauthorized();
         tracing::debug!(user = %request.user, "vless auth: unknown UUID — dropping session");
         return Ok(());
+    }
+
+    // Mux.Cool / XUDP over the carrier (xHTTP, TLS-carrier): a client with
+    // `mux` enabled multiplexes UDP/QUIC sub-sessions over one `Command::Mux`
+    // VLESS connection (target `v1.mux.cool`). This is the correct mux for
+    // xHTTP — pure XUDP, since XMUX already multiplexes TCP at the H2 layer.
+    // flow is `none` on the carrier, so the Mux frames are un-padded.
+    if matches!(request.command, Command::Mux) {
+        let mut response_buf = BytesMut::with_capacity(8);
+        Response::default().encode(&mut response_buf);
+        session.write_all(&response_buf).await?;
+        let _active = metrics.tunnel_started_kind(SessionKind::Mux);
+        let result = crate::mux::mux_relay(
+            crate::mux::CarrierMuxIo::new(session),
+            leftover.to_vec(),
+            &metrics,
+            None,
+            mux_idle,
+        )
+        .await;
+        match &result {
+            Ok(()) => metrics.session_ok(),
+            Err(e) => metrics.session_error(SessErr::from_io(e)),
+        }
+        return result.map_err(ProxyError::from);
     }
 
     let target_endpoint = request.target.ok_or(ProxyError::UnsupportedCommand)?;
@@ -924,9 +957,16 @@ pub async fn run_raw_proxy(
                 if first[0] == VLESS_VERSION {
                     let stream = Prefixed::new(vec![first[0]], tls);
                     let _active = metrics.tunnel_started();
-                    if let Err(e) =
-                        handle_session(stream, auth, vision_dialect, router, resolver, metrics)
-                            .await
+                    if let Err(e) = handle_session(
+                        stream,
+                        auth,
+                        vision_dialect,
+                        router,
+                        resolver,
+                        metrics,
+                        tuning.mux_idle,
+                    )
+                    .await
                     {
                         tracing::trace!(?e, "raw proxy session ended with error");
                     }

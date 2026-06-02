@@ -68,6 +68,60 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
+    // Optional subscription endpoint: serves ready xHTTP client configs
+    // (xray JSON / Clash YAML / base64 vless:// links) per authorised UUID.
+    if let Some(addr) = &cfg.subscription.listen {
+        let sub = &cfg.subscription;
+        let public_address = sub
+            .public_address
+            .clone()
+            .context("subscription.public_address is required when subscription.listen is set")?;
+        let server_name = sub
+            .server_name
+            .clone()
+            .context("subscription.server_name is required when subscription.listen is set")?;
+        if cfg.inbound.transport != "xhttp" {
+            tracing::warn!(
+                transport = %cfg.inbound.transport,
+                "subscription serves xHTTP-shaped configs but inbound.transport is not \"xhttp\""
+            );
+        }
+        // xHTTP serves stream-up where the config says the stream-one default.
+        let effective_mode = match cfg.inbound.mode.as_str() {
+            "stream-one" => "stream-up",
+            other => other,
+        };
+        let serve_cfg = std::sync::Arc::new(donut_server::SubServeConfig {
+            public_address,
+            host: sub
+                .host
+                .clone()
+                .or_else(|| cfg.inbound.host.clone())
+                .unwrap_or_else(|| server_name.clone()),
+            server_name,
+            path: sub.path.clone().unwrap_or_else(|| cfg.inbound.path.clone()),
+            mode: sub
+                .mode
+                .clone()
+                .unwrap_or_else(|| effective_mode.to_string()),
+            fp: sub.fp.clone(),
+            socks: sub.socks.clone(),
+        });
+        let saddr: SocketAddr = addr
+            .parse()
+            .with_context(|| format!("parsing subscription.listen {addr}"))?;
+        let listener = tokio::net::TcpListener::bind(saddr)
+            .await
+            .with_context(|| format!("binding subscription listener {saddr}"))?;
+        tracing::info!(%saddr, "subscription endpoint listening on /sub/<uuid>");
+        tokio::spawn(donut_server::subscription::serve(
+            listener,
+            serve_cfg,
+            auth.clone(),
+            tuning.accept_backoff,
+        ));
+    }
+
     match cfg.inbound.transport.as_str() {
         // Cert-based carrier backend behind a TLS/HTTP-3 reverse proxy
         // (e.g. Caddy). No REALITY: the front holds the certificate and
@@ -141,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
                 path.clone(),
                 mode,
                 decoy,
+                None, // "tls" does not pin a Host; xhttp does.
                 auth,
                 router,
                 resolver,
@@ -150,6 +205,51 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("starting tls carrier proxy")?;
             tracing::info!(%bound, %path, ?mode, ?decoy, "donut-server listening (TLS carrier, cert-based, self-steal)");
+        }
+        // Xray-wire-compatible xHTTP over cert-TLS+H2, terminated here.
+        // Off-the-shelf VLESS clients (HAPP, Xray) connect with
+        // `network=xhttp`. Shares the cert-TLS carrier engine as `"tls"`
+        // but defaults to `stream-up`, pins the `host`, and the carrier
+        // server decorates every response with Xray-faithful X-Padding +
+        // SSE/no-buffer headers so the traffic reads as an ordinary site.
+        "xhttp" => {
+            let cert_chain = cfg.inbound.cert_chain()?;
+            let key = cfg.inbound.private_key_pem()?;
+            let path = cfg.inbound.path.clone();
+            // xHTTP clients default to stream-up over H2+TLS (Xray's `auto`
+            // picks stream-up for TLS+H2). The carrier serves one mode, so
+            // treat the global "stream-one" default as "unset → stream-up";
+            // an explicit "stream-up"/"packet-up" is honoured as written.
+            let mode = match cfg.inbound.mode.as_str() {
+                "stream-one" => donut_carrier::Mode::StreamUp,
+                other => donut_carrier::Mode::parse(other)
+                    .with_context(|| format!("unknown inbound.mode {other:?}"))?,
+            };
+            let host = cfg.inbound.host.clone();
+            let decoy: Option<SocketAddr> = match cfg.inbound.dest.as_deref() {
+                Some(d) => Some(
+                    d.parse()
+                        .with_context(|| format!("parsing inbound.dest {d}"))?,
+                ),
+                None => None,
+            };
+            let bound = donut_server::run_tls_carrier_proxy(
+                listen,
+                cert_chain,
+                key,
+                path.clone(),
+                mode,
+                decoy,
+                host.clone(),
+                auth,
+                router,
+                resolver,
+                metrics,
+                tuning,
+            )
+            .await
+            .context("starting xhttp proxy")?;
+            tracing::info!(%bound, %path, ?mode, ?host, ?decoy, "donut-server listening (xHTTP, Xray-compatible, cert-based, self-steal)");
         }
         // Cert-based RAW: VLESS directly over TLS on TCP (no carrier
         // wrapping); first decrypted byte triages VLESS-vs-probe, probes
@@ -199,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%bound, %dest, "donut-server listening (VLESS+REALITY+XHTTP)");
         }
         other => anyhow::bail!(
-            "unknown inbound.transport {other:?} (expected \"veil\", \"carrier\", \"quic\", \"tls\" or \"raw\")"
+            "unknown inbound.transport {other:?} (expected \"veil\", \"carrier\", \"quic\", \"tls\", \"xhttp\" or \"raw\")"
         ),
     }
 
