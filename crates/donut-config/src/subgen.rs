@@ -125,9 +125,15 @@ fn xray_routing(profile: RoutingProfile) -> Value {
     ];
     if profile == RoutingProfile::RuSplit {
         // Russian sites + IPs stay off the tunnel (split-tunnel).
+        // RU domains → direct. `category-ru` is the universal RU umbrella
+        // (present in v2fly/Loyalsoldier, MetaCubeX and runetfreedom dats);
+        // the `.ru` regexp needs no geo data at all. We deliberately avoid
+        // dat-specific subcategories (e.g. `yandex`, `vk`, `category-gov-ru`)
+        // because xray rejects the WHOLE config if one is missing from the
+        // client's geosite.dat.
         rules.push(json!({
             "type": "field",
-            "domain": ["geosite:category-ru", "geosite:yandex", "geosite:vk", "regexp:.+\\.ru$"],
+            "domain": ["geosite:category-ru", "regexp:.+\\.ru$"],
             "outboundTag": "direct"
         }));
         rules.push(json!({ "type": "field", "ip": ["geoip:ru"], "outboundTag": "direct" }));

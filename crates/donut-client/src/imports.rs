@@ -100,7 +100,10 @@ pub fn cmd_import(args: ImportArgs) -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 RuleConfig {
-                    geosite: vec!["category-ru".into(), "yandex".into(), "vk".into()],
+                    // `category-ru` is the universal RU umbrella present in every
+                    // geosite.dat; dat-specific subcategories (yandex/vk/…) are
+                    // avoided since a missing one rejects the whole config.
+                    geosite: vec!["category-ru".into()],
                     outbound: "direct".into(),
                     ..Default::default()
                 },
