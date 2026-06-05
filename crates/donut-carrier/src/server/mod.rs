@@ -192,7 +192,21 @@ async fn drive_connection<IO>(
     // streams the request and response bodies concurrently (full duplex),
     // as `stream-one` requires.
     let io = TokioIo::new(io);
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    // H2 keepalive: PING the client every 30s so a stateful middlebox / NAT
+    // (and TSPU's flow tracking) doesn't reap an xHTTP connection whose
+    // downlink GET happens to sit idle, and a dead peer is detected within
+    // ~20s instead of hanging. Applies to the h2 path (xhttp/stream-up);
+    // the h1 veil/stream-one path ignores it.
+    //
+    // `.timer()` is MANDATORY here: hyper's keep-alive arms a Sleep on every
+    // h2 connection and panics ("You must supply a timer") without one — the
+    // executor alone is not enough.
+    builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(std::time::Duration::from_secs(30))
+        .keep_alive_timeout(std::time::Duration::from_secs(20));
     let result = match dispatcher {
         SharedDispatcher::StreamOne => {
             let svc = service_fn(move |req: Request<Incoming>| {
