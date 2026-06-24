@@ -39,6 +39,15 @@ pub(crate) fn derive_auth_key(shared: &mut [u8; 32], random_prefix: &[u8]) {
         .expect("HKDF expand to 32 bytes never fails");
 }
 
+/// Read the 4-byte big-endian unix timestamp the client stamped into the
+/// opened plaintext (offset 4..8 — see [`build_plaintext`]). Used by the
+/// server for the anti-replay clock-skew check.
+pub(crate) fn parse_timestamp(plaintext: &[u8; PLAINTEXT_LEN]) -> u32 {
+    let mut ts = [0u8; 4];
+    ts.copy_from_slice(&plaintext[4..8]);
+    u32::from_be_bytes(ts)
+}
+
 /// Plaintext SessionID layout (16 bytes) before sealing.
 pub(crate) fn build_plaintext(version: &[u8; 3], unix_ts: u32, short_id: &ShortId) -> [u8; 16] {
     let mut out = [0u8; 16];

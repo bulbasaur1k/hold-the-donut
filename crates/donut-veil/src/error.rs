@@ -28,4 +28,7 @@ pub enum VeilError {
 
     #[error("decoded short id is not in the configured set")]
     UnknownShortId,
+
+    #[error("building REALITY TLS server config: {0}")]
+    TlsConfig(String),
 }

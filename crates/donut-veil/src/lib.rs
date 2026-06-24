@@ -28,6 +28,7 @@ mod fingerprint;
 mod kx;
 mod parse;
 mod proof;
+mod reality_cert;
 mod server;
 mod verifier;
 
@@ -39,8 +40,15 @@ pub use error::VeilError;
 pub use fingerprint::{Fingerprint, UnknownFingerprint};
 pub use kx::{crypto_provider, VeilX25519, VEIL_X25519};
 pub use proof::{server_proof, PROOF_LEN};
+pub use reality_cert::{
+    build_reality_certificate, reality_certified_key, reality_public_key, reality_signing_key,
+    reality_signing_key_der,
+};
 pub use verifier::NoCertVerification;
 pub use {
     client::{build_client_hello_mutator, build_client_hello_mutator_capturing, AuthKeySink},
-    server::{build_raw_client_hello_hook, server_verdict, Verdict},
+    server::{
+        build_raw_client_hello_hook, build_reality_client_hello_hook, build_reality_server_config,
+        server_verdict, Verdict,
+    },
 };

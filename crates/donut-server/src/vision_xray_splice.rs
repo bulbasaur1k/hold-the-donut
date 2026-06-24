@@ -50,12 +50,26 @@ pub struct RecordTlsServer {
 
 impl RecordTlsServer {
     pub fn new(tcp: TcpStream, config: Arc<ServerConfig>) -> io::Result<Self> {
+        Self::new_with_prefix(tcp, config, Vec::new())
+    }
+
+    /// Like [`new`](Self::new), but seed the input buffer with `prefix` —
+    /// bytes already read off the socket (e.g. the ClientHello captured by the
+    /// selfsteal triage). The handshake replays them before reading more.
+    pub fn new_with_prefix(
+        tcp: TcpStream,
+        config: Arc<ServerConfig>,
+        prefix: Vec<u8>,
+    ) -> io::Result<Self> {
         let conn = ServerConnection::new(config).map_err(io::Error::other)?;
+        let read_total = prefix.len() as u64;
+        let mut inbuf = BytesMut::with_capacity(READ_CHUNK.max(prefix.len()));
+        inbuf.extend_from_slice(&prefix);
         Ok(Self {
             tcp,
             conn,
-            inbuf: BytesMut::with_capacity(READ_CHUNK),
-            read_total: 0,
+            inbuf,
+            read_total,
         })
     }
 

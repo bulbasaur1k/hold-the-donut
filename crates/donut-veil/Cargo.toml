@@ -15,6 +15,7 @@ aes-gcm.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+rcgen.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 bytes.workspace = true
@@ -22,6 +23,3 @@ hex.workspace = true
 ahash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-rcgen = { version = "0.14", features = ["pem", "ring"], default-features = false }

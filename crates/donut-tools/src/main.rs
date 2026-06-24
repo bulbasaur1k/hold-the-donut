@@ -29,6 +29,108 @@ enum Cmd {
     /// Build a `vless://` share-link from explicit parameters (for pasting
     /// into off-the-shelf App Store clients like HAPP / Streisand / v2box).
     Link(LinkArgs),
+    /// Generate admin credentials (username + Argon2 password hash) for the
+    /// protected `/metrics` + `/healthz` endpoint. Prints the cleartext
+    /// password once and a ready-to-paste `[metrics]` config snippet.
+    AdminPasswd(AdminPasswdArgs),
+    /// Mint a fresh per-device VLESS credential (one UUID per device, like
+    /// xray-core). Prints the UUID, a registry line for the device list, and
+    /// — when the entry's REALITY params are given — a ready donut-client
+    /// `client.json` for that device.
+    DeviceAdd(DeviceAddArgs),
+    /// Probe a candidate REALITY masquerade target (like `xray tls ping`):
+    /// checks TLS 1.3 + X25519, ALPN h2, and prints the certificate SANs to
+    /// use as `serverNames`/`sni`. `target` is `host` or `host:port` (443).
+    TlsPing { target: String },
+    /// Scan an IPv4 subnet for REALITY-suitable masquerade hosts (like
+    /// RealiTLScanner): TLS 1.3 + X25519 + ALPN h2, printing each host's
+    /// certificate domains. Pick a neighbour in your VPS's own subnet/ASN so
+    /// the cover's SNI/IP geolocation matches your server.
+    RealityScan(RealityScanArgs),
+    /// Build a `vless://…security=reality…flow=xtls-rprx-vision` share-link for
+    /// `transport="reality"` — import straight into HAPP / Shadowrocket / v2box.
+    /// Validated against real xray-core.
+    RealityLink(RealityLinkArgs),
+}
+
+/// Parameters for `reality-link`.
+#[derive(Debug, Clone, Args)]
+struct RealityLinkArgs {
+    /// VLESS user UUID (must match a server `inbound.users` entry).
+    #[arg(long)]
+    uuid: String,
+    /// Public address the client dials (`host:port`).
+    #[arg(long)]
+    server: String,
+    /// Server REALITY public key (X25519, base64-url) — from `keygen`.
+    #[arg(long)]
+    pbk: String,
+    /// Server REALITY short id (hex).
+    #[arg(long)]
+    sid: String,
+    /// SNI / serverName to mimic (your chosen masquerade target).
+    #[arg(long, default_value = "www.microsoft.com")]
+    sni: String,
+    /// uTLS fingerprint.
+    #[arg(long, default_value = "chrome")]
+    fp: String,
+    /// Display label (URL fragment). Empty ⇒ derived from the host.
+    #[arg(long, default_value = "")]
+    label: String,
+}
+
+/// Parameters for `reality-scan`.
+#[derive(Debug, Clone, Args)]
+struct RealityScanArgs {
+    /// IPv4 CIDR to scan (e.g. `203.0.113.0/24`) or a single IP.
+    cidr: String,
+    /// Port to probe.
+    #[arg(long, default_value_t = 443)]
+    port: u16,
+    /// Per-host handshake timeout (ms).
+    #[arg(long, default_value_t = 2500)]
+    timeout_ms: u64,
+    /// Concurrent probes.
+    #[arg(long, default_value_t = 64)]
+    concurrency: usize,
+}
+
+/// Parameters for `device-add`.
+#[derive(Debug, Clone, Args)]
+struct DeviceAddArgs {
+    /// Device label (e.g. "pixel-8", "macbook"). One UUID per device.
+    #[arg(long)]
+    name: String,
+    /// Entry node the device dials (`host:port`).
+    #[arg(long)]
+    server: Option<String>,
+    /// Entry REALITY public key (base64-url or hex). Enables client.json.
+    #[arg(long)]
+    reality_pub: Option<String>,
+    /// Entry REALITY short id (hex). Required with `--reality-pub`.
+    #[arg(long)]
+    short_id: Option<String>,
+    /// TLS SNI the client presents (the entry's selfsteal domain).
+    #[arg(long, default_value = "www.microsoft.com")]
+    sni: String,
+    /// uTLS ClientHello fingerprint to mimic.
+    #[arg(long, default_value = "randomized")]
+    fp: String,
+    /// Local SOCKS5 listen address the device's donut-client opens.
+    #[arg(long, default_value = "127.0.0.1:1080")]
+    socks: String,
+}
+
+/// Parameters for `admin-passwd`.
+#[derive(Debug, Clone, Args)]
+struct AdminPasswdArgs {
+    /// Admin username.
+    #[arg(long, default_value = "admin")]
+    user: String,
+    /// Password to hash. Omit to mint a fresh random 24-char password
+    /// (printed once — copy it now, it is not recoverable from the hash).
+    #[arg(long)]
+    password: Option<String>,
 }
 
 /// Parameters for the `link` subcommand — a standalone `vless://` builder.
@@ -202,8 +304,360 @@ fn main() -> anyhow::Result<()> {
                 )
             );
         }
+        Cmd::AdminPasswd(args) => admin_passwd(&args)?,
+        Cmd::DeviceAdd(args) => device_add(&args)?,
+        Cmd::TlsPing { target } => tls_ping(&target)?,
+        Cmd::RealityScan(args) => reality_scan(&args)?,
+        Cmd::RealityLink(args) => {
+            let label = if args.label.is_empty() {
+                host_of(&args.server)
+            } else {
+                args.label.clone()
+            };
+            println!(
+                "{}",
+                vless_reality_link(
+                    &args.uuid, &args.server, &args.pbk, &args.sid, &args.sni, &args.fp, &label
+                )
+            );
+        }
     }
     Ok(())
+}
+
+/// Build a faithful-REALITY `vless://` share URI (validated against xray-core):
+/// `vless://UUID@host:port?type=tcp&security=reality&encryption=none&pbk=..&sid=..&sni=..&fp=..&flow=xtls-rprx-vision#label`
+fn vless_reality_link(
+    uuid: &str,
+    addr: &str,
+    pbk: &str,
+    sid: &str,
+    sni: &str,
+    fp: &str,
+    label: &str,
+) -> String {
+    let params: [(&str, &str); 8] = [
+        ("type", "tcp"),
+        ("security", "reality"),
+        ("encryption", "none"),
+        ("pbk", pbk),
+        ("sid", sid),
+        ("sni", sni),
+        ("fp", fp),
+        ("flow", "xtls-rprx-vision"),
+    ];
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", pct(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("vless://{uuid}@{addr}?{query}#{}", pct(label))
+}
+
+/// Extract the DNS SubjectAltNames from a leaf certificate DER.
+fn cert_san_dns(der: &[u8]) -> Vec<String> {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for ext in cert.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            ext.parsed_extension()
+        {
+            for gn in &san.general_names {
+                if let x509_parser::extensions::GeneralName::DNSName(d) = gn {
+                    names.push(d.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// A REALITY-suitable host discovered by the scan.
+struct ScanHit {
+    ip: std::net::Ipv4Addr,
+    alpn: String,
+    sans: Vec<String>,
+}
+
+/// Probe one IP for REALITY suitability: a TLS 1.3 handshake offering only
+/// X25519, no cert validation (we just read the cert). Returns a hit on
+/// success. Connects by IP (no SNI) so the server returns its default cert.
+fn probe_reality_target(
+    ip: std::net::Ipv4Addr,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Option<ScanHit> {
+    use std::io::Write as _;
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::Arc;
+
+    use rustls::pki_types::ServerName;
+
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .kx_groups
+        .retain(|g| g.name() == rustls::NamedGroup::X25519);
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .ok()?
+        .dangerous()
+        .with_custom_certificate_verifier(donut_veil::NoCertVerification::arc())
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let addr = SocketAddr::from((ip, port));
+    let mut sock = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    sock.set_read_timeout(Some(timeout)).ok()?;
+    sock.set_write_timeout(Some(timeout)).ok()?;
+
+    let server_name = ServerName::IpAddress(std::net::IpAddr::V4(ip).into());
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).ok()?;
+    // Drive the handshake; flush triggers it.
+    conn.complete_io(&mut sock).ok()?;
+    let _ = sock.flush();
+
+    if conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3) {
+        return None;
+    }
+    let alpn = match conn.alpn_protocol() {
+        Some(p) => String::from_utf8_lossy(p).into_owned(),
+        None => "-".to_string(),
+    };
+    let sans = conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|leaf| cert_san_dns(leaf.as_ref()))
+        .unwrap_or_default();
+    Some(ScanHit { ip, alpn, sans })
+}
+
+/// Scan an IPv4 CIDR for REALITY-suitable hosts.
+fn reality_scan(args: &RealityScanArgs) -> anyhow::Result<()> {
+    let ips = parse_cidr_v4(&args.cidr)?;
+    let timeout = std::time::Duration::from_millis(args.timeout_ms);
+    eprintln!(
+        "# scanning {} host(s) in {} on :{} (X25519 TLS 1.3, h2)…",
+        ips.len(),
+        args.cidr,
+        args.port
+    );
+
+    let mut hits = 0usize;
+    for chunk in ips.chunks(args.concurrency.max(1)) {
+        let results: Vec<Option<ScanHit>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|&ip| s.spawn(move || probe_reality_target(ip, args.port, timeout)))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        for hit in results.into_iter().flatten() {
+            hits += 1;
+            let h2 = if hit.alpn == "h2" { "h2 ✓" } else { &hit.alpn };
+            let sans = if hit.sans.is_empty() {
+                "<no SAN>".to_string()
+            } else {
+                hit.sans.join(", ")
+            };
+            println!("{}:{}  TLS1.3 X25519 {}  SAN: {}", hit.ip, args.port, h2, sans);
+        }
+    }
+    eprintln!("# done — {hits} REALITY-suitable host(s). Validate a pick with `tls-ping`.");
+    Ok(())
+}
+
+/// Expand an IPv4 `a.b.c.d/prefix` (or bare IP = /32) into host addresses.
+/// Capped at 65536 hosts (prefix >= 16) to keep scans bounded.
+fn parse_cidr_v4(s: &str) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
+    let (ip_str, prefix) = match s.split_once('/') {
+        Some((i, p)) => (i, p.parse::<u32>()?),
+        None => (s, 32),
+    };
+    let ip: std::net::Ipv4Addr = ip_str.parse()?;
+    anyhow::ensure!((16..=32).contains(&prefix), "prefix must be /16../32 (bounded scan)");
+    let bits = 32 - prefix;
+    let mask = if bits == 32 { 0 } else { u32::MAX << bits };
+    let base = u32::from(ip) & mask;
+    let count = 1u32 << bits;
+    Ok((0..count)
+        .map(|i| std::net::Ipv4Addr::from(base + i))
+        .collect())
+}
+
+/// Probe a REALITY masquerade candidate (the donut analogue of `xray tls
+/// ping`). A successful TLS 1.3 handshake offering ONLY X25519 proves the
+/// target meets the REALITY minimum; the cert SANs become `serverNames`.
+fn tls_ping(target: &str) -> anyhow::Result<()> {
+    use std::net::TcpStream;
+    use std::sync::Arc;
+
+    use rustls::pki_types::ServerName;
+
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), p.parse::<u16>()?)
+        }
+        _ => (target.to_string(), 443u16),
+    };
+
+    // Offer ONLY X25519: a completed TLS 1.3 handshake then proves the target
+    // supports the REALITY minimum (TLS 1.3 + X25519) in one shot.
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .kx_groups
+        .retain(|g| g.name() == rustls::NamedGroup::X25519);
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let server_name = ServerName::try_from(host.clone())?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
+    let mut sock = TcpStream::connect((host.as_str(), port))?;
+    conn.complete_io(&mut sock)?;
+
+    println!("# tls-ping {host}:{port}");
+    println!("tls_version: {:?}", conn.protocol_version());
+    println!("x25519: yes (TLS 1.3 handshake completed with X25519-only)");
+    if let Some(cs) = conn.negotiated_cipher_suite() {
+        println!("cipher: {:?}", cs.suite());
+    }
+    match conn.alpn_protocol() {
+        Some(b"h2") => println!("alpn: h2 (HTTP/2 — good for REALITY)"),
+        Some(p) => println!("alpn: {} (h2 preferred)", String::from_utf8_lossy(p)),
+        None => println!("alpn: none (h2 preferred — target may not offer HTTP/2)"),
+    }
+
+    if let Some(leaf) = conn.peer_certificates().and_then(|c| c.first()) {
+        println!("leaf_cert_size: {} bytes", leaf.as_ref().len());
+        let sans = cert_san_dns(leaf.as_ref());
+        println!(
+            "serverNames (cert SANs): {}",
+            if sans.is_empty() {
+                "<none>".to_string()
+            } else {
+                sans.join(", ")
+            }
+        );
+    }
+
+    println!();
+    println!("# REALITY suitability:");
+    println!("#  [auto] TLS 1.3 + X25519 .......... PASS");
+    println!("#  [manual] same ASN as your VPS (steal a datacenter-neighbour's cert)");
+    println!("#  [manual] NOT behind a CDN you don't control (e.g. Cloudflare)");
+    println!("#  [manual] foreign, stable, popular; use a SAN above as serverName/sni");
+    Ok(())
+}
+
+/// Mint a per-device VLESS credential: a fresh UUID, a registry line for the
+/// declarative device list, and (when REALITY params are supplied) a ready
+/// donut-client config so the device can connect to the cascade entry.
+fn device_add(args: &DeviceAddArgs) -> anyhow::Result<()> {
+    let uuid = donut_core::UserId::new_v4().to_string();
+
+    println!("# device: {}", args.name);
+    println!("uuid: {uuid}");
+    println!();
+    println!("# add this line to your declarative device registry (devices.json):");
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({ "name": args.name, "uuid": uuid }))?
+    );
+
+    // Emit a client.json only when the entry's REALITY identity is known.
+    let (Some(server), Some(pub_key), Some(short_id)) =
+        (&args.server, &args.reality_pub, &args.short_id)
+    else {
+        println!();
+        println!(
+            "# (pass --server --reality-pub --short-id to also emit a donut-client client.json)"
+        );
+        return Ok(());
+    };
+
+    let outbound = ClientOutbound {
+        server: server.clone(),
+        uuid: uuid.clone(),
+        transport: "veil".into(),
+        reality: Some(RealityClient {
+            public_key: pub_key.clone(),
+            short_id: short_id.clone(),
+            server_name: args.sni.clone(),
+            version: [26, 4, 15],
+            fingerprint: args.fp.clone(),
+        }),
+        server_name: String::new(),
+        path: "/".into(),
+        mode: "stream-one".into(),
+        flow: "none".into(),
+    };
+    let client = ClientConfig {
+        log: Default::default(),
+        inbound: ClientInbound {
+            socks: args.socks.clone(),
+        },
+        outbound,
+        routing: RoutingConfig {
+            default: "proxy".to_string(),
+            rules: Vec::new(),
+        },
+        geo: Default::default(),
+        dns: Default::default(),
+    };
+    println!();
+    println!("// ===== client.json (device: {}) =====", args.name);
+    println!("{}", serde_json::to_string_pretty(&client)?);
+    Ok(())
+}
+
+/// Generate admin Basic-Auth credentials: an Argon2 PHC password hash plus a
+/// `[metrics]` config snippet. The cleartext password is shown once.
+fn admin_passwd(args: &AdminPasswdArgs) -> anyhow::Result<()> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::Argon2;
+
+    let (password, generated) = match &args.password {
+        Some(p) => (p.clone(), false),
+        None => (random_password(24), true),
+    };
+
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))?
+        .to_string();
+
+    if generated {
+        println!("# generated password (shown ONCE — copy it now):");
+        println!("password: {password}");
+        println!();
+    }
+    println!("# paste into the server config [metrics] section:");
+    println!("[metrics]");
+    println!("listen = \"127.0.0.1:9090\"   # bind to loopback / WireGuard, never 0.0.0.0");
+    println!("username = \"{}\"", args.user);
+    println!("password_hash = \"{hash}\"");
+    println!();
+    println!("# Prometheus scrape (basic_auth):");
+    println!("#   basic_auth: {{ username: {}, password: <the password above> }}", args.user);
+    Ok(())
+}
+
+/// A random alphanumeric password of `len` characters (CSPRNG).
+fn random_password(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
 }
 
 /// Generate a fresh X25519 keypair + an 8-byte ShortID, printing them
@@ -433,6 +887,7 @@ fn veil_pair(args: &ConfigGenArgs) -> (ServerConfig, ClientConfig) {
             dest: args.dest.clone(),
             cert: args.cert.clone(),
             key: args.key.clone(),
+            anti_replay_skew_secs: None,
         }),
         path: "/".into(),
         cert: None,
@@ -517,6 +972,8 @@ fn server_config(inbound: ServerInbound) -> ServerConfig {
         metrics: Default::default(),
         subscription: Default::default(),
         tuning: Default::default(),
+        outbounds: Vec::new(),
+        fragment: None,
     }
 }
 

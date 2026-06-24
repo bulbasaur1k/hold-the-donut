@@ -131,6 +131,7 @@ pub async fn run_carrier_proxy(
 
     // Plain path has no routing table — everything goes direct (freedom).
     let router = Arc::new(Router::new("freedom"));
+    let outbounds = Arc::new(crate::outbound::Outbounds::default());
     let resolver =
         Arc::new(Resolver::system().unwrap_or_else(|_| {
             Resolver::doh(&["1.1.1.1".parse().unwrap()], "cloudflare-dns.com")
@@ -141,6 +142,7 @@ pub async fn run_carrier_proxy(
             let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
+            let outbounds = outbounds.clone();
             let metrics = metrics.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_session(
@@ -149,6 +151,7 @@ pub async fn run_carrier_proxy(
                     VisionDialect::Donut,
                     router,
                     resolver,
+                    outbounds,
                     metrics,
                     RuntimeTuning::default().mux_idle,
                 )
@@ -197,11 +200,13 @@ pub async fn run_carrier_backend(
         },
     );
 
+    let outbounds = Arc::new(crate::outbound::Outbounds::default());
     tokio::spawn(async move {
         while let Some(session) = server.accept().await {
             let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
+            let outbounds = outbounds.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
@@ -212,6 +217,7 @@ pub async fn run_carrier_backend(
                     VisionDialect::Donut,
                     router,
                     resolver,
+                    outbounds,
                     metrics,
                     RuntimeTuning::default().mux_idle,
                 )
@@ -248,11 +254,13 @@ pub async fn run_quic_proxy(
         .map_err(|e| ProxyError::Tls(e.to_string()))?;
     let local = server.addr;
 
+    let outbounds = Arc::new(crate::outbound::Outbounds::default());
     tokio::spawn(async move {
         while let Some(session) = server.accept().await {
             let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
+            let outbounds = outbounds.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
@@ -263,6 +271,7 @@ pub async fn run_quic_proxy(
                     VisionDialect::Donut,
                     router,
                     resolver,
+                    outbounds,
                     metrics,
                     RuntimeTuning::default().mux_idle,
                 )
@@ -331,12 +340,14 @@ pub async fn run_tls_carrier_proxy(
         let auth = auth.clone();
         let router = router.clone();
         let resolver = resolver.clone();
+        let outbounds = Arc::new(crate::outbound::Outbounds::default());
         let metrics = metrics.clone();
         tokio::spawn(async move {
             while let Some(session) = rx.recv().await {
                 let auth = auth.clone();
                 let router = router.clone();
                 let resolver = resolver.clone();
+                let outbounds = outbounds.clone();
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
                     let _active = metrics.tunnel_started();
@@ -346,6 +357,7 @@ pub async fn run_tls_carrier_proxy(
                         VisionDialect::Donut,
                         router,
                         resolver,
+                        outbounds,
                         metrics,
                         tuning.mux_idle,
                     )
@@ -407,6 +419,7 @@ pub async fn run_veil_proxy(
     auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
+    outbounds: Arc<crate::outbound::Outbounds>,
     metrics: Arc<Metrics>,
     tuning: RuntimeTuning,
 ) -> Result<SocketAddr, ProxyError> {
@@ -432,6 +445,7 @@ pub async fn run_veil_proxy(
             let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
+            let outbounds = outbounds.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
@@ -451,6 +465,7 @@ pub async fn run_veil_proxy(
                             let auth = auth.clone();
                             let router = router.clone();
                             let resolver = resolver.clone();
+                            let outbounds = outbounds.clone();
                             let metrics = metrics.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_session(
@@ -459,6 +474,7 @@ pub async fn run_veil_proxy(
                                     VisionDialect::Donut,
                                     router,
                                     resolver,
+                                    outbounds,
                                     metrics,
                                     tuning.mux_idle,
                                 )
@@ -484,12 +500,14 @@ pub async fn run_veil_proxy(
     Ok(local)
 }
 
+#[allow(clippy::too_many_arguments)] // wired from the daemon entry point
 async fn handle_session<S>(
     mut session: S,
     auth: Arc<UserAuth>,
     vision_dialect: VisionDialect,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
+    outbounds: Arc<crate::outbound::Outbounds>,
     metrics: Arc<Metrics>,
     mux_idle: std::time::Duration,
 ) -> Result<(), ProxyError>
@@ -564,21 +582,32 @@ where
         return Err(ProxyError::UnsupportedCommand);
     }
 
-    // Routing decision. A `block`/`blackhole` outbound drops the
-    // connection (the client sees its tunnel close); anything else falls
-    // through to the freedom (direct) outbound.
-    match router.route(&target_endpoint) {
-        "block" | "blackhole" => {
-            metrics.blackholed();
-            tracing::debug!(target = %target_endpoint, "routing: blackhole — dropping");
-            return Ok(());
-        }
-        _ => {}
+    // Routing decision selects an outbound tag. `block`/`blackhole` drops
+    // the connection; a tag naming a configured chain outbound relays to an
+    // upstream proxy (cascade); anything else egresses directly (freedom).
+    let tag = router.route(&target_endpoint);
+    if matches!(tag, "block" | "blackhole") {
+        metrics.blackholed();
+        tracing::debug!(target = %target_endpoint, "routing: blackhole — dropping");
+        return Ok(());
     }
 
-    let target_addr = resolve(&resolver, &target_endpoint).await?;
-    let mut upstream = tokio::net::TcpStream::connect(target_addr).await?;
-    let _ = upstream.set_nodelay(true);
+    let dial_start = std::time::Instant::now();
+    let is_direct = outbounds.get(tag).is_none();
+    let mut upstream: Box<dyn crate::outbound::Duplex> = if let Some(chain) = outbounds.get(tag) {
+        // Cascade: forward the original target through the upstream exit.
+        let stream = chain.dial(&target_endpoint).await?;
+        metrics.observe_dial(dial_start.elapsed());
+        tracing::debug!(target = %target_endpoint, outbound = chain.tag(), "routing: chain outbound");
+        stream
+    } else {
+        // Freedom: direct egress.
+        let target_addr = resolve(&resolver, &target_endpoint).await?;
+        let tcp = tokio::net::TcpStream::connect(target_addr).await?;
+        let _ = tcp.set_nodelay(true);
+        metrics.observe_dial(dial_start.elapsed());
+        Box::new(tcp)
+    };
 
     // Echo the response prefix back to the client so it can verify
     // the version byte and addons-len before payload starts.
@@ -616,8 +645,23 @@ where
         // Plain VLESS: raw bidirectional copy. Push any leftover client
         // bytes that came in the same read as the inner-frame header.
         FlowKind::None => {
-            if !leftover.is_empty() {
-                upstream.write_all(&leftover).await?;
+            // Native ClientHello fragmentation on the direct egress only
+            // (sidecar-free SNI de-throttle, e.g. YouTube on the RU node).
+            // The chain hop is our own REALITY tunnel, so it's left intact.
+            match (is_direct, outbounds.fragment()) {
+                (true, Some(frag)) => {
+                    let (record, extra) =
+                        crate::fragment::read_first_record(&leftover, &mut session).await?;
+                    crate::fragment::write_fragmented(&mut upstream, &record, frag).await?;
+                    if !extra.is_empty() {
+                        upstream.write_all(&extra).await?;
+                    }
+                }
+                _ => {
+                    if !leftover.is_empty() {
+                        upstream.write_all(&leftover).await?;
+                    }
+                }
             }
             if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut session, &mut upstream).await
             {
@@ -854,6 +898,9 @@ pub async fn run_raw_proxy(
 
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
+    // RAW inbound is the HAPP-interop direct transport, not a cascade entry:
+    // chain outbounds are unused here (egress is always freedom).
+    let outbounds = Arc::new(crate::outbound::Outbounds::default());
 
     tokio::spawn(async move {
         loop {
@@ -878,6 +925,7 @@ pub async fn run_raw_proxy(
             let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
+            let outbounds = outbounds.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
@@ -963,6 +1011,7 @@ pub async fn run_raw_proxy(
                         vision_dialect,
                         router,
                         resolver,
+                        outbounds,
                         metrics,
                         tuning.mux_idle,
                     )
@@ -1000,16 +1049,123 @@ where
     }
 }
 
+/// Bind a **faithful xray-REALITY** proxy on `bind_addr` (TCP): every
+/// connection is triaged by the selfsteal front door (unknown callers relayed
+/// byte-for-byte to the real `dest`); authenticated REALITY peers get a
+/// per-connection REALITY certificate (HMAC-signed, no Let's Encrypt) and the
+/// raw VLESS + XTLS-Vision data plane — exactly what HAPP / Shadowrocket speak.
+/// This is the off-the-shelf-client interop path (`security=reality`).
+#[allow(clippy::too_many_arguments)] // daemon wiring entry point
+pub async fn run_reality_proxy(
+    bind_addr: SocketAddr,
+    veil: VeilServerConfig,
+    dest: SocketAddr,
+    auth: Arc<UserAuth>,
+    router: Arc<Router>,
+    resolver: Arc<Resolver>,
+    metrics: Arc<Metrics>,
+    tuning: RuntimeTuning,
+) -> Result<SocketAddr, ProxyError> {
+    let tls_config = Arc::new(
+        donut_veil::build_reality_server_config(veil.clone())
+            .map_err(|e| ProxyError::Tls(e.to_string()))?,
+    );
+    let veil = Arc::new(veil);
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(?e, "reality accept error");
+                    tokio::time::sleep(tuning.accept_backoff).await;
+                    continue;
+                }
+            };
+            let _ = tcp.set_nodelay(true);
+            let tls_config = tls_config.clone();
+            let veil = veil.clone();
+            let auth = auth.clone();
+            let router = router.clone();
+            let resolver = resolver.clone();
+            let metrics = metrics.clone();
+            metrics.connection_accepted();
+            tokio::spawn(async move {
+                // Pre-TLS triage: probes/browsers are relayed verbatim to the
+                // real `dest` (active-probing defence); an authenticated peer's
+                // ClientHello is captured to replay into the REALITY handshake.
+                let triaged = match crate::selfsteal::triage(tcp, &veil, dest).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::trace!(%peer, ?e, "reality triage error");
+                        return;
+                    }
+                };
+                let (client, prefix) = match triaged {
+                    crate::selfsteal::Triage::Forwarded => {
+                        metrics.forwarded();
+                        return;
+                    }
+                    crate::selfsteal::Triage::Tunnel { client, prefix, .. } => (client, prefix),
+                };
+
+                let mut tunnel = match vision_xray_splice::RecordTlsServer::new_with_prefix(
+                    client, tls_config, prefix,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::trace!(%peer, ?e, "reality rustls init failed");
+                        return;
+                    }
+                };
+                match tokio::time::timeout(tuning.tls_handshake_timeout, tunnel.handshake()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::debug!(%peer, ?e, "reality handshake failed");
+                        metrics.session_error(SessErr::Tls);
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!(%peer, "reality handshake timeout");
+                        metrics.session_error(SessErr::Tls);
+                        return;
+                    }
+                }
+
+                let _active = metrics.tunnel_started();
+                if let Err(e) = handle_xray_vision_session(
+                    tunnel,
+                    Some(dest),
+                    auth,
+                    router,
+                    resolver,
+                    metrics,
+                    tuning,
+                )
+                .await
+                {
+                    tracing::debug!(%peer, ?e, "reality vision session ended with error");
+                }
+            });
+        }
+    });
+
+    Ok(local)
+}
+
 /// An `AsyncRead + AsyncWrite` that replays `prefix` bytes before the
-/// inner stream — used to "un-read" the byte(s) peeked during triage.
-struct Prefixed<S> {
+/// inner stream — used to "un-read" the byte(s) peeked during triage, and
+/// to replay early payload after a chain outbound's response prefix.
+pub(crate) struct Prefixed<S> {
     prefix: Vec<u8>,
     pos: usize,
     inner: S,
 }
 
 impl<S> Prefixed<S> {
-    fn new(prefix: Vec<u8>, inner: S) -> Self {
+    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
         Self {
             prefix,
             pos: 0,

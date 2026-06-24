@@ -364,6 +364,23 @@ mod client_hello {
                 cx.common.handshake_kind = Some(HandshakeKind::Resumed);
             }
 
+            // REALITY: if the veil hook produced a per-connection certificate,
+            // emit it (and its ephemeral signing key) instead of the configured
+            // `cert_resolver`'s. The client authenticates the server by the
+            // HMAC in this cert's signature, not by PKI.
+            let reality_key = cx.data.reality.clone();
+            let server_key = match reality_key.as_deref() {
+                Some(ck) => ActiveCertifiedKey::from_certified_key(ck),
+                None => server_key,
+            };
+            if reality_key.is_some() {
+                // REALITY signs the server certificate with ed25519 regardless
+                // of the client's advertised `signature_algorithms` (real xray
+                // clients use a Chrome uTLS fingerprint, which doesn't offer
+                // ED25519). Mirrors REALITY's unconditional `sigAlg = Ed25519`.
+                sigschemes_ext = vec![SignatureScheme::ED25519];
+            }
+
             let mut ocsp_response = server_key.get_ocsp();
             let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
             let doing_early_data = emit_encrypted_extensions(
@@ -380,7 +397,9 @@ mod client_hello {
             let doing_client_auth = if full_handshake {
                 let client_auth = emit_certificate_req_tls13(&mut flight, &self.config)?;
 
-                if let Some(compressor) = cert_compressor {
+                // REALITY needs the exact certificate bytes (the client checks
+                // the HMAC in the signature), so never compress in that mode.
+                if let Some(compressor) = cert_compressor.filter(|_| reality_key.is_none()) {
                     emit_compressed_certificate_tls13(
                         &mut flight,
                         &self.config,

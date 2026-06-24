@@ -85,6 +85,7 @@ async fn socks5_through_veiled_reality_tunnel_to_echo() {
             &["1.1.1.1".parse().unwrap()],
             "cloudflare-dns.com",
         )),
+        Arc::new(donut_server::Outbounds::default()),
         donut_server::Metrics::new(),
         donut_server::RuntimeTuning::default(),
     )
@@ -209,6 +210,7 @@ async fn blackhole_rule_drops_proxied_connection() {
             &["1.1.1.1".parse().unwrap()],
             "cloudflare-dns.com",
         )),
+        Arc::new(donut_server::Outbounds::default()),
         donut_server::Metrics::new(),
         donut_server::RuntimeTuning::default(),
     )

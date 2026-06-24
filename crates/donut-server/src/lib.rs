@@ -11,18 +11,22 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod fragment;
 pub mod metrics;
 mod mux;
+pub mod outbound;
 mod proxy;
 mod selfsteal;
 pub mod subscription;
 mod veil_server;
 mod vision_xray_splice;
 
+pub use fragment::FragmentParams;
 pub use metrics::Metrics;
+pub use outbound::{ChainOutbound, Outbounds};
 pub use proxy::{
-    run_carrier_backend, run_carrier_proxy, run_quic_proxy, run_raw_proxy, run_tls_carrier_proxy,
-    run_veil_proxy, ProxyError, RuntimeTuning, VisionDialect,
+    run_carrier_backend, run_carrier_proxy, run_quic_proxy, run_raw_proxy, run_reality_proxy,
+    run_tls_carrier_proxy, run_veil_proxy, ProxyError, RuntimeTuning, VisionDialect,
 };
 pub use selfsteal::{triage, Triage};
 pub use subscription::SubServeConfig;
