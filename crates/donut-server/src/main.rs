@@ -33,6 +33,27 @@ async fn main() -> anyhow::Result<()> {
 
     let router = std::sync::Arc::new(cfg.router()?);
     let resolver = std::sync::Arc::new(cfg.resolver()?);
+    let fragment = cfg
+        .fragment
+        .as_ref()
+        .map(|f| -> anyhow::Result<_> {
+            Ok(donut_server::FragmentParams {
+                len: f.length_range()?,
+                interval_ms: f.interval_range()?,
+            })
+        })
+        .transpose()
+        .context("parsing [fragment] config")?;
+    if fragment.is_some() {
+        tracing::info!("native ClientHello fragmentation enabled on freedom egress");
+    }
+    let outbounds = std::sync::Arc::new(
+        donut_server::Outbounds::build(&cfg.outbounds, fragment)
+            .context("building chain outbounds")?,
+    );
+    if !outbounds.is_empty() {
+        tracing::info!(count = cfg.outbounds.len(), "chain outbounds (cascade) enabled");
+    }
     let metrics = donut_server::Metrics::new();
     let tuning = donut_server::RuntimeTuning::from_config(&cfg.tuning);
     tracing::info!(
@@ -60,10 +81,27 @@ async fn main() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(maddr)
             .await
             .with_context(|| format!("binding metrics listener {maddr}"))?;
-        tracing::info!(%maddr, "metrics endpoint listening on /metrics");
+        // Optional HTTP Basic Auth guard. Both fields required together.
+        let admin_auth = match (&cfg.metrics.username, &cfg.metrics.password_hash) {
+            (Some(user), Some(hash)) => {
+                let guard = donut_server::metrics::AdminAuth::new(user.clone(), hash.clone())
+                    .context("metrics.password_hash is not a valid Argon2 PHC string")?;
+                tracing::info!(%maddr, user, "admin endpoint protected by Basic Auth");
+                Some(std::sync::Arc::new(guard))
+            }
+            (None, None) => {
+                tracing::warn!(%maddr, "metrics endpoint is UNAUTHENTICATED — bind it to a private interface only");
+                None
+            }
+            _ => anyhow::bail!(
+                "metrics.username and metrics.password_hash must both be set (or both absent)"
+            ),
+        };
+        tracing::info!(%maddr, "admin endpoint listening on /metrics and /healthz");
         tokio::spawn(donut_server::metrics::serve(
             listener,
             metrics.clone(),
+            admin_auth,
             tuning.accept_backoff,
         ));
     }
@@ -287,19 +325,55 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("parsing reality.dest {}", reality.dest))?;
             let private_key = reality.private_key_bytes()?;
             let short_ids = reality.short_id_set()?;
-            let veil = donut_veil::VeilServerConfig::new(private_key, short_ids)
+            let mut veil = donut_veil::VeilServerConfig::new(private_key, short_ids)
                 .context("building REALITY server config")?;
+            // Override the anti-replay window if configured (0 = disabled).
+            if let Some(secs) = reality.anti_replay_skew_secs {
+                veil = veil.with_max_time_skew(
+                    (secs > 0).then(|| std::time::Duration::from_secs(secs)),
+                );
+            }
             let cert_chain = reality.cert_chain()?;
             let key = reality.private_key_pem()?;
             let bound = donut_server::run_veil_proxy(
-                listen, cert_chain, key, veil, dest, auth, router, resolver, metrics, tuning,
+                listen, cert_chain, key, veil, dest, auth, router, resolver, outbounds, metrics,
+                tuning,
             )
             .await
             .context("starting veil proxy")?;
             tracing::info!(%bound, %dest, "donut-server listening (VLESS+REALITY+XHTTP)");
         }
+        // Faithful xray REALITY: per-connection HMAC-signed cert + raw VLESS +
+        // XTLS-Vision — what off-the-shelf clients (HAPP, Shadowrocket) speak.
+        // No cert/key needed (the REALITY cert is generated from the auth key).
+        "reality" => {
+            let reality = cfg
+                .inbound
+                .reality
+                .as_ref()
+                .context("inbound.reality is required for transport=\"reality\"")?;
+            let dest: SocketAddr = reality
+                .dest
+                .parse()
+                .with_context(|| format!("parsing reality.dest {}", reality.dest))?;
+            let private_key = reality.private_key_bytes()?;
+            let short_ids = reality.short_id_set()?;
+            let mut veil = donut_veil::VeilServerConfig::new(private_key, short_ids)
+                .context("building REALITY server config")?;
+            if let Some(secs) = reality.anti_replay_skew_secs {
+                veil = veil.with_max_time_skew(
+                    (secs > 0).then(|| std::time::Duration::from_secs(secs)),
+                );
+            }
+            let bound = donut_server::run_reality_proxy(
+                listen, veil, dest, auth, router, resolver, metrics, tuning,
+            )
+            .await
+            .context("starting reality proxy")?;
+            tracing::info!(%bound, %dest, "donut-server listening (faithful xray REALITY + Vision)");
+        }
         other => anyhow::bail!(
-            "unknown inbound.transport {other:?} (expected \"veil\", \"carrier\", \"quic\", \"tls\", \"xhttp\" or \"raw\")"
+            "unknown inbound.transport {other:?} (expected \"veil\", \"reality\", \"carrier\", \"quic\", \"tls\", \"xhttp\" or \"raw\")"
         ),
     }
 

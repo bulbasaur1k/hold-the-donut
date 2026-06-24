@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 donut-core.workspace = true
 donut-config.workspace = true
+donut-veil.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -20,5 +21,9 @@ tracing-subscriber.workspace = true
 x25519-dalek.workspace = true
 rand.workspace = true
 base64.workspace = true
+argon2.workspace = true
 hex.workspace = true
 serde_json.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+x509-parser.workspace = true

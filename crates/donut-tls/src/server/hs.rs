@@ -679,6 +679,10 @@ impl State<ServerConnectionData> for ExpectClientHello {
             if let MessagePayload::Handshake { encoded, .. } = &m.payload {
                 match hook.call(encoded.bytes()) {
                     VeilDecision::Tunnel => { /* proceed */ }
+                    VeilDecision::Reality { certified_key } => {
+                        // Proceed, but emit this REALITY cert at Certificate time.
+                        cx.data.reality = Some(certified_key);
+                    }
                     VeilDecision::Forward { raw_client_hello } => {
                         cx.data.forwarded = Some(raw_client_hello);
                         return Ok(Box::new(ForwardedVeil));

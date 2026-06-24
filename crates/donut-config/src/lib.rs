@@ -92,6 +92,8 @@ pub enum ConfigError {
     Pem(String),
     #[error("routing: {0}")]
     Routing(String),
+    #[error("fragment: {0}")]
+    Fragment(String),
     #[error("geo: {0}")]
     Geo(String),
     #[error("dns: {0}")]
@@ -158,6 +160,94 @@ pub struct ServerConfig {
     /// no-op vs prior behaviour.
     #[serde(default)]
     pub tuning: TuningConfig,
+    /// Chain outbounds: upstream proxies this node forwards to (cascade).
+    /// Routing rules reference them by `tag`; an unmatched tag falls through
+    /// to the direct `freedom` outbound. Empty ⇒ direct egress only.
+    #[serde(default)]
+    pub outbounds: Vec<OutboundConfig>,
+    /// Native TLS ClientHello fragmentation on the freedom (direct) egress —
+    /// the in-process analogue of xray's `freedom { fragment }` and a sidecar-
+    /// free de-throttle for SNI-throttled sites (YouTube on the RU node).
+    #[serde(default)]
+    pub fragment: Option<FragmentConfig>,
+}
+
+/// TLS ClientHello fragmentation knobs (xray `freedom.fragment` shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FragmentConfig {
+    /// Which packets to split. Only `"tlshello"` is implemented (split the
+    /// TLS ClientHello into smaller records).
+    #[serde(default = "default_fragment_packets")]
+    pub packets: String,
+    /// Fragment payload size in bytes, fixed (`"100"`) or a range (`"100-200"`).
+    #[serde(default = "default_fragment_length")]
+    pub length: String,
+    /// Delay between fragments in ms, fixed or a range (`"10-20"`).
+    #[serde(default = "default_fragment_interval")]
+    pub interval: String,
+}
+
+fn default_fragment_packets() -> String {
+    "tlshello".to_string()
+}
+fn default_fragment_length() -> String {
+    "100-200".to_string()
+}
+fn default_fragment_interval() -> String {
+    "10-20".to_string()
+}
+
+impl FragmentConfig {
+    pub fn length_range(&self) -> Result<(u32, u32), ConfigError> {
+        parse_u32_range(&self.length)
+    }
+    pub fn interval_range(&self) -> Result<(u32, u32), ConfigError> {
+        parse_u32_range(&self.interval)
+    }
+}
+
+/// Parse `"N"` or `"MIN-MAX"` into an inclusive (min, max) range.
+fn parse_u32_range(s: &str) -> Result<(u32, u32), ConfigError> {
+    let parse = |v: &str| {
+        v.trim()
+            .parse::<u32>()
+            .map_err(|_| ConfigError::Fragment(format!("bad number {v:?}")))
+    };
+    match s.split_once('-') {
+        Some((a, b)) => Ok((parse(a)?, parse(b)?)),
+        None => {
+            let v = parse(s)?;
+            Ok((v, v))
+        }
+    }
+}
+
+/// A chain outbound: an upstream donut/Xray proxy this node relays *to*
+/// (cascade entry → exit). After decrypting the client's VLESS tunnel the
+/// node dials `server`, presents `uuid`, and forwards the original target
+/// through it — so the exit node performs the real egress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundConfig {
+    /// Routing tag this outbound answers to (matched against rule outbounds).
+    pub tag: String,
+    /// Wire transport to the upstream. Currently `"veil"` (VLESS+REALITY).
+    pub transport: String,
+    /// Upstream exit address this node dials (`host:port`).
+    pub server: String,
+    /// VLESS user UUID the exit accepts.
+    pub uuid: String,
+    /// REALITY client parameters (public_key/short_id/server_name/…).
+    /// Required for `transport = "veil"`.
+    #[serde(default)]
+    pub reality: Option<RealityClient>,
+}
+
+impl OutboundConfig {
+    pub fn user_id(&self) -> Result<UserId, ConfigError> {
+        self.uuid
+            .parse::<UserId>()
+            .map_err(|_| ConfigError::User(self.uuid.clone()))
+    }
 }
 
 /// Runtime tuning. Each knob has a default that matches the value we shipped
@@ -216,11 +306,22 @@ impl Default for TuningConfig {
     }
 }
 
-/// Optional Prometheus `/metrics` listener. Absent ⇒ no metrics endpoint.
+/// Optional Prometheus `/metrics` + `/healthz` listener. Absent ⇒ no
+/// endpoint. When `username` + `password_hash` are both set the listener
+/// requires HTTP Basic Auth (Prometheus supports `basic_auth` natively);
+/// generate the credentials with `donut-tools admin-passwd`. Bind `listen`
+/// to a private interface (loopback / WireGuard mgmt net), never `0.0.0.0`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MetricsConfig {
     #[serde(default)]
     pub listen: Option<String>,
+    /// Basic Auth username for the admin endpoint. Requires `password_hash`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Argon2 PHC password hash (from `donut-tools admin-passwd`). Requires
+    /// `username`. When both are absent the endpoint is unauthenticated.
+    #[serde(default)]
+    pub password_hash: Option<String>,
 }
 
 /// Subscription endpoint config. When `listen` is set, donut-server serves
@@ -464,8 +565,17 @@ pub struct RealityServer {
     pub private_key: String,
     pub short_ids: Vec<String>,
     pub dest: String,
+    /// TLS cert/key for the selfsteal backdrop — required by `transport="veil"`,
+    /// but NOT by `transport="reality"` (faithful REALITY generates its cert
+    /// from the auth key, so these may be omitted there).
+    #[serde(default)]
     pub cert: String,
+    #[serde(default)]
     pub key: String,
+    /// Anti-replay clock-skew window in seconds. Absent → the library
+    /// default (120s). `0` disables the timestamp check entirely.
+    #[serde(default)]
+    pub anti_replay_skew_secs: Option<u64>,
 }
 
 impl RealityServer {

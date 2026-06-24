@@ -465,6 +465,14 @@ pub struct ServerConfig {
 pub enum VeilDecision {
     /// Continue the TLS handshake normally.
     Tunnel,
+    /// Continue the handshake, but emit `certified_key` as the server
+    /// Certificate + CertificateVerify instead of the configured
+    /// `cert_resolver` — the faithful-REALITY path, where the hook builds a
+    /// per-connection certificate signed with the connection's auth key.
+    Reality {
+        /// The REALITY certificate + ephemeral signing key to present.
+        certified_key: Arc<sign::CertifiedKey>,
+    },
     /// Stop the TLS state machine; surface the raw bytes via
     /// [`ServerConnection::take_forwarded`] so the caller can proxy
     /// the connection byte-for-byte to the fronted target.
@@ -1311,6 +1319,10 @@ pub struct ServerConnectionData {
     /// `VeilDecision::Forward`. Drained by
     /// [`ServerConnection::take_forwarded`].
     pub(crate) forwarded: Option<Vec<u8>>,
+    /// Set by the veil hook when it returns `VeilDecision::Reality`: the
+    /// per-connection REALITY certificate to emit in place of the configured
+    /// `cert_resolver`. Read at TLS 1.3 Certificate emission.
+    pub(crate) reality: Option<Arc<sign::CertifiedKey>>,
 }
 
 impl ServerConnectionData {

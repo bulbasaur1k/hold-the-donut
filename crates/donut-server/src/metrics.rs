@@ -9,8 +9,80 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// HTTP Basic Auth guard for the admin endpoint (`/metrics`, `/healthz`).
+/// Holds the admin username and an Argon2 PHC password hash; verification
+/// is constant-time on the password (Argon2) so a wrong password and a
+/// wrong username are indistinguishable by timing.
+#[derive(Debug)]
+pub struct AdminAuth {
+    username: String,
+    password_hash: String,
+}
+
+impl AdminAuth {
+    /// Build a guard from a username and an Argon2 PHC hash string (as
+    /// produced by `donut-tools admin-passwd`). Returns `None` if the hash
+    /// is not a parseable PHC string, so a misconfigured server fails closed
+    /// at startup rather than silently accepting everything.
+    pub fn new(username: String, password_hash: String) -> Option<Self> {
+        PasswordHash::new(&password_hash).ok()?;
+        Some(Self {
+            username,
+            password_hash,
+        })
+    }
+
+    /// Verify an `Authorization: Basic <base64(user:pass)>` header value.
+    fn verify(&self, b64: &str) -> bool {
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+            return false;
+        };
+        let Ok(creds) = std::str::from_utf8(&raw) else {
+            return false;
+        };
+        let Some((user, pass)) = creds.split_once(':') else {
+            return false;
+        };
+        if user != self.username {
+            // Still run a verify to keep timing roughly uniform.
+            if let Ok(parsed) = PasswordHash::new(&self.password_hash) {
+                let _ = Argon2::default().verify_password(pass.as_bytes(), &parsed);
+            }
+            return false;
+        }
+        let Ok(parsed) = PasswordHash::new(&self.password_hash) else {
+            return false;
+        };
+        Argon2::default()
+            .verify_password(pass.as_bytes(), &parsed)
+            .is_ok()
+    }
+}
+
+/// Extract the `Authorization: Basic …` credential blob from a raw request
+/// head, if present (header name is case-insensitive).
+fn basic_credentials(req: &str) -> Option<&str> {
+    req.lines()
+        .take_while(|l| !l.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("authorization").then_some(value)
+        })
+        .and_then(|v| v.trim().strip_prefix("Basic "))
+}
+
+/// Request path (the second whitespace-separated token of the request line).
+fn request_path(req: &str) -> &str {
+    req.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/")
+}
 
 /// Tunnel-session transport, for the per-kind active-session gauge. Lets a
 /// leak (sessions/tasks that never terminate) be localised to a subsystem —
@@ -368,11 +440,17 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// Serve `GET /metrics` on `listener` in Prometheus text format. Runs
-/// until the listener errors; spawn it on a dedicated address.
-/// `accept_backoff` is the pause between `accept()` retries on a persistent
-/// error (configurable via `[tuning] accept_backoff_ms`).
-pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>, accept_backoff: Duration) {
+/// Serve the admin endpoint on `listener`: `GET /metrics` (Prometheus text)
+/// and `GET /healthz` (liveness JSON). When `auth` is `Some`, every request
+/// must carry valid HTTP Basic Auth or gets `401`. Runs until the listener
+/// errors; spawn it on a dedicated, private address. `accept_backoff` is the
+/// pause between `accept()` retries on a persistent error.
+pub async fn serve(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    auth: Option<Arc<AdminAuth>>,
+    accept_backoff: Duration,
+) {
     loop {
         let (mut sock, _) = match listener.accept().await {
             Ok(v) => v,
@@ -385,19 +463,52 @@ pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>, accept_backoff:
             }
         };
         let metrics = metrics.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            // Drain the request line/headers (we serve the same body for
-            // any request); cap the read so a slow client can't pin us.
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
-            let body = metrics.render();
+            // Read the request head; cap so a slow client can't pin us.
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            // Authorise first when a guard is configured. A missing/invalid
+            // credential gets 401 + a Basic challenge, nothing else.
+            if let Some(guard) = auth.as_deref() {
+                let ok = basic_credentials(&req).is_some_and(|c| guard.verify(c));
+                if !ok {
+                    let body = "unauthorized";
+                    let response = format!(
+                        "HTTP/1.1 401 Unauthorized\r\n\
+                         WWW-Authenticate: Basic realm=\"donut admin\"\r\n\
+                         Content-Type: text/plain; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
+            }
+
+            let (content_type, body) = match request_path(&req) {
+                "/healthz" | "/health" => (
+                    "application/json; charset=utf-8",
+                    format!(
+                        "{{\"status\":\"ok\",\"version\":\"{}\"}}",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                ),
+                _ => (
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    metrics.render(),
+                ),
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                 Content-Type: {content_type}\r\n\
                  Content-Length: {}\r\n\
-                 Connection: close\r\n\r\n{}",
-                body.len(),
-                body
+                 Connection: close\r\n\r\n{body}",
+                body.len()
             );
             let _ = sock.write_all(response.as_bytes()).await;
             let _ = sock.flush().await;

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use ahash::AHashSet;
 use donut_core::ShortId;
@@ -8,17 +9,30 @@ use zeroize::Zeroizing;
 use crate::error::VeilError;
 use crate::fingerprint::Fingerprint;
 
+/// Default anti-replay clock-skew tolerance. A ClientHello whose stamped
+/// timestamp differs from the server clock by more than this is treated as
+/// a replay/forgery and forwarded to the decoy. Wide enough to absorb
+/// real client clock drift, narrow enough to bound a capture-replay window.
+pub const DEFAULT_MAX_TIME_SKEW: Duration = Duration::from_secs(120);
+
 /// Server-side static configuration for the veiled-TLS handshake.
 #[derive(Clone)]
 pub struct VeilServerConfig {
     pub(crate) private: Arc<Zeroizing<StaticSecret>>,
     pub(crate) public: PublicKey,
     pub(crate) short_ids: Arc<AHashSet<ShortId>>,
+    /// Anti-replay clock-skew window. `Some(d)` rejects (forwards) any
+    /// ClientHello whose sealed unix timestamp is more than `d` away from
+    /// the server clock; `None` disables the check entirely.
+    pub(crate) max_time_skew: Option<Duration>,
 }
 
 impl VeilServerConfig {
     /// Build a server config from a 32-byte X25519 private key and at
-    /// least one configured short id.
+    /// least one configured short id. Anti-replay defaults to
+    /// [`DEFAULT_MAX_TIME_SKEW`]; override with [`with_max_time_skew`].
+    ///
+    /// [`with_max_time_skew`]: Self::with_max_time_skew
     pub fn new(
         private_key: [u8; 32],
         short_ids: impl IntoIterator<Item = ShortId>,
@@ -33,7 +47,15 @@ impl VeilServerConfig {
             private: Arc::new(Zeroizing::new(private)),
             public,
             short_ids: Arc::new(short_ids),
+            max_time_skew: Some(DEFAULT_MAX_TIME_SKEW),
         })
+    }
+
+    /// Set the anti-replay clock-skew tolerance. `None` disables the
+    /// timestamp check (e.g. for replaying a fixed test vector).
+    pub fn with_max_time_skew(mut self, skew: Option<Duration>) -> Self {
+        self.max_time_skew = skew;
+        self
     }
 
     pub fn public_key_bytes(&self) -> [u8; 32] {

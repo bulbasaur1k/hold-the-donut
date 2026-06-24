@@ -128,6 +128,81 @@ fn full_handshake_through_veil_hooks() {
 }
 
 #[test]
+fn reality_handshake_emits_reality_certificate() {
+    // The faithful-REALITY hook: an authenticated ClientHello makes the server
+    // emit a per-connection REALITY certificate + ed25519 CertificateVerify
+    // (not the configured cert). A real xray client verifies the cert's HMAC;
+    // here a no-PKI verifier (as REALITY clients use) accepts it, and we assert
+    // the server presented the REALITY cert, not the configured backdrop one.
+    let provider = provider();
+
+    let priv_bytes = [0x77u8; 32];
+    let short_id: ShortId = "deadbeef".parse().unwrap();
+    let veil_server = VeilServerConfig::new(priv_bytes, [short_id]).unwrap();
+    let server_pub = veil_server.public_key_bytes();
+    let veil_client = VeilClientConfig::new(server_pub, short_id, [26, 4, 15]);
+
+    let server_hook = crate::server::build_reality_client_hello_hook(veil_server);
+    let client_mutator = build_client_hello_mutator(veil_client);
+
+    let (cert, key) = gen_cert();
+
+    let server_cfg = {
+        let mut c = ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        c.raw_client_hello_hook = Some(server_hook);
+        Arc::new(c)
+    };
+
+    let client_cfg = {
+        // REALITY clients don't validate via PKI — the server's cert is
+        // ephemeral; authentication is the HMAC in its signature.
+        let mut c = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(crate::NoCertVerification::arc())
+            .with_no_client_auth();
+        c.client_hello_mutator = Some(client_mutator);
+        Arc::new(c)
+    };
+
+    let mut c =
+        ClientConnection::new(client_cfg, ServerName::try_from("localhost").unwrap()).unwrap();
+    let mut s = ServerConnection::new(server_cfg).unwrap();
+
+    assert!(
+        drive(&mut c, &mut s),
+        "REALITY handshake must complete (server emits REALITY cert + ed25519 CertVerify)"
+    );
+    assert!(s.take_forwarded().is_none(), "authenticated → not forwarded");
+
+    // The server presented the REALITY certificate (its fixed ed25519 pubkey),
+    // not the configured self-signed backdrop cert.
+    let leaf = c
+        .peer_certificates()
+        .expect("server presented a certificate")
+        .first()
+        .unwrap()
+        .as_ref()
+        .to_vec();
+    let reality_pub = crate::reality_public_key();
+    assert!(
+        leaf.windows(32).any(|w| w == reality_pub),
+        "server must present the REALITY cert (its ed25519 pubkey)"
+    );
+    assert_ne!(
+        leaf,
+        cert.as_ref().to_vec(),
+        "REALITY cert must differ from the configured backdrop cert"
+    );
+}
+
+#[test]
 fn randomized_fingerprint_handshake_still_authenticates() {
     // Same as `full_handshake_through_veil_hooks`, but the client enables
     // the uTLS-style `randomized` fingerprint, which shuffles the
@@ -242,6 +317,106 @@ fn unknown_short_id_is_forwarded() {
         s.take_forwarded().is_some(),
         "unknown short_id must surface as Forward"
     );
+}
+
+/// Drive a fresh client ClientHello and return its handshake-message bytes
+/// (record header stripped — offset 0 = `HandshakeType`, the form
+/// [`crate::server::decide`] parses). The client mutator stamps the current
+/// unix time into the sealed plaintext, so the returned bytes carry a
+/// ~now timestamp for the anti-replay tests below.
+fn capture_client_hello(veil_client: VeilClientConfig) -> Vec<u8> {
+    let provider = provider();
+    let (cert, _key) = gen_cert();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let mut c = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    c.client_hello_mutator = Some(build_client_hello_mutator(veil_client));
+    let mut conn =
+        ClientConnection::new(Arc::new(c), ServerName::try_from("localhost").unwrap()).unwrap();
+    let mut buf = Vec::new();
+    conn.write_tls(&mut buf).unwrap();
+    // A single TLS record: 5-byte record header + handshake message.
+    assert!(buf.len() > 5, "ClientHello record must be non-empty");
+    buf[5..].to_vec()
+}
+
+fn now_unix() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
+}
+
+#[test]
+fn fresh_timestamp_authenticates() {
+    let priv_bytes = [0x42u8; 32];
+    let short_id: ShortId = "deadbeef".parse().unwrap();
+    let veil_server = VeilServerConfig::new(priv_bytes, [short_id]).unwrap();
+    let veil_client = VeilClientConfig::new(veil_server.public_key_bytes(), short_id, [26, 4, 15]);
+    let ch = capture_client_hello(veil_client);
+
+    let v = crate::server::decide(
+        &veil_server.short_ids,
+        &veil_server.private,
+        Some(std::time::Duration::from_secs(120)),
+        now_unix(),
+        &ch,
+    );
+    assert!(matches!(v, crate::server::Verdict::Tunnel { .. }));
+}
+
+#[test]
+fn stale_timestamp_is_forwarded() {
+    let priv_bytes = [0x42u8; 32];
+    let short_id: ShortId = "deadbeef".parse().unwrap();
+    let veil_server = VeilServerConfig::new(priv_bytes, [short_id]).unwrap();
+    let veil_client = VeilClientConfig::new(veil_server.public_key_bytes(), short_id, [26, 4, 15]);
+    let ch = capture_client_hello(veil_client);
+
+    // Server clock 1 hour ahead of the stamped timestamp → captured replay.
+    let v = crate::server::decide(
+        &veil_server.short_ids,
+        &veil_server.private,
+        Some(std::time::Duration::from_secs(120)),
+        now_unix() + 3600,
+        &ch,
+    );
+    assert_eq!(v, crate::server::Verdict::Forward);
+
+    // Symmetric: a forged future timestamp (server clock 1 hour behind).
+    let v = crate::server::decide(
+        &veil_server.short_ids,
+        &veil_server.private,
+        Some(std::time::Duration::from_secs(120)),
+        now_unix().saturating_sub(3600),
+        &ch,
+    );
+    assert_eq!(v, crate::server::Verdict::Forward);
+}
+
+#[test]
+fn disabled_skew_accepts_any_timestamp() {
+    let priv_bytes = [0x42u8; 32];
+    let short_id: ShortId = "deadbeef".parse().unwrap();
+    let veil_server = VeilServerConfig::new(priv_bytes, [short_id])
+        .unwrap()
+        .with_max_time_skew(None);
+    let veil_client = VeilClientConfig::new(veil_server.public_key_bytes(), short_id, [26, 4, 15]);
+    let ch = capture_client_hello(veil_client);
+
+    // Wildly skewed clock, but the window is disabled → still authenticates.
+    let v = crate::server::decide(
+        &veil_server.short_ids,
+        &veil_server.private,
+        veil_server.max_time_skew,
+        now_unix() + 86_400,
+        &ch,
+    );
+    assert!(matches!(v, crate::server::Verdict::Tunnel { .. }));
 }
 
 #[test]
