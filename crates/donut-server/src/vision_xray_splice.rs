@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use rustls::{ServerConfig, ServerConnection};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use donut_io::vision_xray::{
@@ -246,12 +246,15 @@ impl RecordTlsServer {
 /// `initial_to_target` is any plaintext already read that belongs to `target`.
 /// `metrics` counts proxied bytes when `Some` (the flow=none tunnel path);
 /// pass `None` for decoy/self-steal relays so they don't inflate tunnel bytes.
-pub async fn tls_plain_relay(
+pub async fn tls_plain_relay<G>(
     mut tunnel: RecordTlsServer,
-    mut target: TcpStream,
+    mut target: G,
     initial_to_target: Vec<u8>,
     metrics: Option<&Metrics>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    G: AsyncRead + AsyncWrite + Unpin + Send,
+{
     if !initial_to_target.is_empty() {
         target.write_all(&initial_to_target).await?;
         if let Some(m) = metrics {
@@ -422,13 +425,16 @@ async fn read_uplink(
 /// caller already decrypted past the VLESS request (the start of the first
 /// Vision block). `upstream` is the plaintext target connection. `uuid` is the
 /// authenticated VLESS user.
-pub async fn vision_server_splice(
+pub async fn vision_server_splice<G>(
     mut tunnel: RecordTlsServer,
-    mut upstream: TcpStream,
+    mut upstream: G,
     leftover: Vec<u8>,
     uuid: [u8; 16],
     metrics: &Metrics,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    G: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut filter = FilterState::default();
 
     // uplink (client -> server): unpad + filter -> upstream

@@ -366,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let bound = donut_server::run_reality_proxy(
-                listen, veil, dest, auth, router, resolver, metrics, tuning,
+                listen, veil, dest, auth, router, resolver, outbounds, metrics, tuning,
             )
             .await
             .context("starting reality proxy")?;
