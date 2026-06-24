@@ -839,7 +839,13 @@ async fn handle_xray_vision_session(
                 }
             };
             let _ = tcp.set_nodelay(true);
-            Box::new(tcp)
+            // Native ClientHello fragmentation on the direct egress (sidecar-
+            // free SNI de-throttle, e.g. YouTube/Discord on the RU REALITY node).
+            match outbounds.fragment() {
+                Some(frag) => Box::new(crate::fragment::FragmentWriter::new(tcp, frag.clone()))
+                    as Box<dyn crate::outbound::Duplex>,
+                None => Box::new(tcp),
+            }
         }
     };
     tunnel.write_plaintext(&response_buf).await?;
