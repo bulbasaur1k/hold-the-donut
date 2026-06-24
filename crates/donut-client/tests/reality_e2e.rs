@@ -76,6 +76,7 @@ async fn reality_client_reaches_echo() {
             &["1.1.1.1".parse().unwrap()],
             "cloudflare-dns.com",
         )),
+        Arc::new(donut_server::Outbounds::default()),
         donut_server::Metrics::new(),
         donut_server::RuntimeTuning::default(),
     )

@@ -687,6 +687,7 @@ async fn handle_xray_vision_session(
     auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
+    outbounds: Arc<crate::outbound::Outbounds>,
     metrics: Arc<Metrics>,
     tuning: RuntimeTuning,
 ) -> Result<(), ProxyError> {
@@ -776,21 +777,21 @@ async fn handle_xray_vision_session(
             return Err(ProxyError::UnsupportedCommand);
         }
     };
-    if let "block" | "blackhole" = router.route(&target_endpoint) {
+    let tag = router.route(&target_endpoint);
+    if matches!(tag, "block" | "blackhole") {
         metrics.blackholed();
         tracing::debug!(target = %target_endpoint, "routing: blackhole — dropping");
         return Ok(());
     }
-
-    let target_addr = resolve(&resolver, &target_endpoint).await?;
 
     // VLESS response prefix — raw, through the outer TLS, before any payload.
     let mut response_buf = BytesMut::with_capacity(8);
     Response::default().encode(&mut response_buf);
 
     // UDP (QUIC etc.): length-prefixed datagrams to a single target — Vision
-    // never applies to UDP, so no dial/splice, just a UDP-socket bridge.
+    // and chain outbounds don't apply, so this is always a direct UDP bridge.
     if matches!(command, Command::Udp) {
+        let target_addr = resolve(&resolver, &target_endpoint).await?;
         tunnel.write_plaintext(&response_buf).await?;
         let _active = metrics.tunnel_started_kind(SessionKind::Udp);
         let result = vision_xray_splice::vision_udp_relay(
@@ -808,18 +809,39 @@ async fn handle_xray_vision_session(
         return result.map_err(ProxyError::from);
     }
 
+    // TCP egress: a chain outbound (cascade → upstream exit) or the direct
+    // freedom outbound. Either way it's an opaque duplex the Vision data plane
+    // relays to.
     let dial_start = std::time::Instant::now();
-    let upstream = match tokio::net::TcpStream::connect(target_addr).await {
-        Ok(u) => {
+    let upstream: Box<dyn crate::outbound::Duplex> = match outbounds.get(tag) {
+        Some(chain) => {
+            let stream = match chain.dial(&target_endpoint).await {
+                Ok(s) => s,
+                Err(e) => {
+                    metrics.session_error(SessErr::Dial);
+                    return Err(e.into());
+                }
+            };
             metrics.observe_dial(dial_start.elapsed());
-            u
+            tracing::debug!(target = %target_endpoint, outbound = chain.tag(), "routing: chain outbound");
+            stream
         }
-        Err(e) => {
-            metrics.session_error(SessErr::Dial);
-            return Err(e.into());
+        None => {
+            let target_addr = resolve(&resolver, &target_endpoint).await?;
+            let tcp = match tokio::net::TcpStream::connect(target_addr).await {
+                Ok(u) => {
+                    metrics.observe_dial(dial_start.elapsed());
+                    u
+                }
+                Err(e) => {
+                    metrics.session_error(SessErr::Dial);
+                    return Err(e.into());
+                }
+            };
+            let _ = tcp.set_nodelay(true);
+            Box::new(tcp)
         }
     };
-    let _ = upstream.set_nodelay(true);
     tunnel.write_plaintext(&response_buf).await?;
 
     let _active = metrics.tunnel_started();
@@ -981,7 +1003,14 @@ pub async fn run_raw_proxy(
                         return;
                     }
                     if let Err(e) = handle_xray_vision_session(
-                        tunnel, decoy, auth, router, resolver, metrics, tuning,
+                        tunnel,
+                        decoy,
+                        auth,
+                        router,
+                        resolver,
+                        Arc::new(crate::outbound::Outbounds::default()),
+                        metrics,
+                        tuning,
                     )
                     .await
                     {
@@ -1063,6 +1092,7 @@ pub async fn run_reality_proxy(
     auth: Arc<UserAuth>,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
+    outbounds: Arc<crate::outbound::Outbounds>,
     metrics: Arc<Metrics>,
     tuning: RuntimeTuning,
 ) -> Result<SocketAddr, ProxyError> {
@@ -1090,6 +1120,7 @@ pub async fn run_reality_proxy(
             let auth = auth.clone();
             let router = router.clone();
             let resolver = resolver.clone();
+            let outbounds = outbounds.clone();
             let metrics = metrics.clone();
             metrics.connection_accepted();
             tokio::spawn(async move {
@@ -1141,6 +1172,7 @@ pub async fn run_reality_proxy(
                     auth,
                     router,
                     resolver,
+                    outbounds,
                     metrics,
                     tuning,
                 )
