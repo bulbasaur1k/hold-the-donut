@@ -132,14 +132,18 @@ UUID = отдельный credential на устройство (можно от�
 без рестарта и без редеплоя** — через admin-API за Basic-Auth (см.
 [docs/LIVE_USER_MANAGEMENT.md](docs/LIVE_USER_MANAGEMENT.md)):
 
+`donut-tools` ставится деплоем на каждый узел, так что проще всего — **прямо на
+узле** (admin-API там локальный, туннель не нужен):
+
 ```sh
-# на машине сборки, по admin-туннелю (ssh -L 9090:127.0.0.1:9090 <server>):
+ssh <server>
 export DONUT_ADMIN_PASSWORD=<ops-password>
 donut-tools remote-user add --name pixel-8 --link \
   --server <HOST>:443 --pbk <REALITY_PUB> --sid <SHORT_ID> --sni <SNI>
 # → печатает UUID и готовую vless://…reality-ссылку; юзер работает сразу
 donut-tools remote-user list
 donut-tools remote-user remove --uuid <UUID>
+# с личной машины: сначала проброс `ssh -L 9090:127.0.0.1:9090 <server>`, потом те же команды
 ```
 
 Или напрямую curl'ом на loopback узла:

@@ -53,20 +53,24 @@ curl -s -u ops:<PASS> -X DELETE http://127.0.0.1:9090/admin/users/<uuid>
 
 ## `donut-tools remote-user`
 
-A thin CLI over the API. Reach the loopback endpoint with
-`ssh -L 9090:127.0.0.1:9090 <server>`; pass the password via
-`DONUT_ADMIN_PASSWORD` (kept out of shell history / the process list).
+A thin CLI over the API. The deploy installs `donut-tools` on every node
+(`/usr/local/bin/donut-tools`), so the simplest path is to run it **on the node
+itself** against the loopback admin API — no tunnel:
 
 ```sh
+ssh <server>
 export DONUT_ADMIN_PASSWORD=<ops-password>
-
-# add + print a ready HAPP import link in one step (REALITY params from cascade.yaml):
+# --admin defaults to http://127.0.0.1:9090, which is local here:
 donut-tools remote-user add --name pixel-8 --link \
   --server 212.111.87.26:443 --pbk <REALITY_PUB> --sid <SHORT_ID> --sni s84.fishservices.ru
-
 donut-tools remote-user list
 donut-tools remote-user remove --uuid <UUID>
 ```
+
+From your own machine instead, tunnel the loopback port first
+(`ssh -L 9090:127.0.0.1:9090 <server>`) and run the same commands locally. Pass
+the password via `DONUT_ADMIN_PASSWORD` (keeps it out of shell history / the
+process list).
 
 Flags: `--admin http://127.0.0.1:9090` (default), `--user ops` (default),
 `--password` (or `DONUT_ADMIN_PASSWORD`). `add` mints the UUID server-side
