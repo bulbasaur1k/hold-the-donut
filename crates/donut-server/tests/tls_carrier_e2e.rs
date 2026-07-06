@@ -100,7 +100,7 @@ async fn tls_carrier_tunnel_and_self_steal() {
         donut_carrier::Mode::StreamOne,
         Some(decoy_addr),
         None,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -227,7 +227,7 @@ async fn tls_carrier_self_steal_over_h2() {
         donut_carrier::Mode::StreamOne,
         Some(decoy_addr),
         None,
-        Arc::new(UserAuth::new(vec![UserId::new_v4()])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![UserId::new_v4()])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],

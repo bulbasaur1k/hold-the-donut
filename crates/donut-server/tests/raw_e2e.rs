@@ -91,7 +91,7 @@ async fn spawn_decoy() -> SocketAddr {
 async fn start_server(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
-    auth: Arc<UserAuth>,
+    auth: donut_core::AuthHandle,
 ) -> (SocketAddr, SocketAddr) {
     let echo_addr = spawn_echo().await;
     let decoy_addr = spawn_decoy().await;
@@ -121,7 +121,12 @@ async fn raw_tunnel_echo() {
     let (cert, key) = gen_cert();
     let connector = client_connector(cert.clone());
     let user = UserId::new_v4();
-    let (addr, echo_addr) = start_server(cert, key, Arc::new(UserAuth::new(vec![user]))).await;
+    let (addr, echo_addr) = start_server(
+        cert,
+        key,
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
+    )
+    .await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let sni = ServerName::try_from("localhost").unwrap();
@@ -168,7 +173,12 @@ async fn raw_vision_tunnel_echo() {
     let (cert, key) = gen_cert();
     let connector = client_connector(cert.clone());
     let user = UserId::new_v4();
-    let (addr, echo_addr) = start_server(cert, key, Arc::new(UserAuth::new(vec![user]))).await;
+    let (addr, echo_addr) = start_server(
+        cert,
+        key,
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
+    )
+    .await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let sni = ServerName::try_from("localhost").unwrap();
@@ -230,8 +240,12 @@ async fn raw_self_steal() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (cert, key) = gen_cert();
     let connector = client_connector(cert.clone());
-    let (addr, _echo) =
-        start_server(cert, key, Arc::new(UserAuth::new(vec![UserId::new_v4()]))).await;
+    let (addr, _echo) = start_server(
+        cert,
+        key,
+        donut_core::AuthHandle::new(UserAuth::new(vec![UserId::new_v4()])),
+    )
+    .await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let sni = ServerName::try_from("localhost").unwrap();
@@ -274,7 +288,12 @@ async fn raw_rejects_unknown_uuid() {
 
     // The server allows exactly one UUID; the client presents a different one.
     let allowed = UserId::new_v4();
-    let (addr, echo_addr) = start_server(cert, key, Arc::new(UserAuth::new(vec![allowed]))).await;
+    let (addr, echo_addr) = start_server(
+        cert,
+        key,
+        donut_core::AuthHandle::new(UserAuth::new(vec![allowed])),
+    )
+    .await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let sni = ServerName::try_from("localhost").unwrap();

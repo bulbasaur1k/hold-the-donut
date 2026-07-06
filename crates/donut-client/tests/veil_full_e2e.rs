@@ -79,7 +79,7 @@ async fn socks5_through_veiled_reality_tunnel_to_echo() {
         key,
         veil_server,
         decoy_addr,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -204,7 +204,7 @@ async fn blackhole_rule_drops_proxied_connection() {
         key,
         veil_server,
         decoy_addr,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         router,
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],

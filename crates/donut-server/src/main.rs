@@ -52,7 +52,10 @@ async fn main() -> anyhow::Result<()> {
             .context("building chain outbounds")?,
     );
     if !outbounds.is_empty() {
-        tracing::info!(count = cfg.outbounds.len(), "chain outbounds (cascade) enabled");
+        tracing::info!(
+            count = cfg.outbounds.len(),
+            "chain outbounds (cascade) enabled"
+        );
     }
     let metrics = donut_server::Metrics::new();
     let tuning = donut_server::RuntimeTuning::from_config(&cfg.tuning);
@@ -64,14 +67,35 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // The allowed-user set is the proxy's credential check; it applies to
-    // every transport. Fails closed: `user_auth()` errors if `inbound.users`
-    // is empty, so the daemon refuses to start a wide-open proxy.
-    let auth = std::sync::Arc::new(
-        cfg.inbound
-            .user_auth()
-            .context("materialising inbound.users")?,
-    );
-    tracing::info!(users = auth.len(), "VLESS user authentication enabled");
+    // every transport. It lives in a durable, live-editable store (a JSON
+    // file beside the config) so devices can be provisioned over the admin
+    // API without a restart or redeploy. On first boot the file is seeded
+    // from `inbound.users`; thereafter the file is authoritative and every
+    // add/remove is written through (atomic + fsync) so a crash/restart
+    // recovers the exact set. `auth` is the lock-free hot handle readers use.
+    let users_path = std::path::Path::new(&args.config)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("users.json");
+    let seed = cfg
+        .inbound
+        .seed_user_ids()
+        .context("parsing inbound.users")?;
+    let store = donut_server::UserStore::load_or_seed(&users_path, &seed)
+        .with_context(|| format!("loading user store {}", users_path.display()))?;
+    let auth = store.handle();
+    if auth.is_empty() {
+        tracing::warn!(
+            path = %users_path.display(),
+            "no users configured — the proxy will authorise nobody until one is added via the admin API"
+        );
+    } else {
+        tracing::info!(
+            users = auth.len(),
+            path = %users_path.display(),
+            "VLESS user authentication enabled (durable live store)"
+        );
+    }
 
     // Optional Prometheus /metrics endpoint on its own listener.
     if let Some(addr) = &cfg.metrics.listen {
@@ -102,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
             listener,
             metrics.clone(),
             admin_auth,
+            store.clone(),
             tuning.accept_backoff,
         ));
     }

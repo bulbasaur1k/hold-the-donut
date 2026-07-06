@@ -2,6 +2,7 @@
 //!
 //! `keygen` and `config-gen` are implemented (M6/M9); `probe` lands later.
 
+use anyhow::Context;
 use base64::prelude::*;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use donut_config::{
@@ -51,6 +52,10 @@ enum Cmd {
     /// `transport="reality"` — import straight into HAPP / Shadowrocket / v2box.
     /// Validated against real xray-core.
     RealityLink(RealityLinkArgs),
+    /// Manage the entry's live users over its admin API — add/list/remove a
+    /// device UUID with no restart and no redeploy. Talks to the loopback
+    /// admin endpoint (reach it over your admin tunnel / `ssh -L`).
+    RemoteUser(RemoteUserArgs),
 }
 
 /// Parameters for `reality-link`.
@@ -77,6 +82,82 @@ struct RealityLinkArgs {
     /// Display label (URL fragment). Empty ⇒ derived from the host.
     #[arg(long, default_value = "")]
     label: String,
+}
+
+/// Parameters for `remote-user`.
+#[derive(Debug, Clone, Args)]
+struct RemoteUserArgs {
+    #[command(subcommand)]
+    action: RemoteUserAction,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum RemoteUserAction {
+    /// Add a device: mint a UUID (or pass `--uuid`), register it live on the
+    /// entry, and print it. With `--link` (+ `--server/--pbk/--sid/--sni`)
+    /// also prints a ready HAPP import link.
+    Add(RemoteAddArgs),
+    /// List provisioned devices (count + records).
+    List(RemoteConn),
+    /// Remove a device by UUID.
+    Remove(RemoteRemoveArgs),
+}
+
+/// Shared connection args for the admin API.
+#[derive(Debug, Clone, Args)]
+struct RemoteConn {
+    /// Admin endpoint base URL (the metrics/admin listener). Reach the
+    /// loopback endpoint over an SSH tunnel, e.g. `ssh -L 9090:127.0.0.1:9090`.
+    #[arg(long, default_value = "http://127.0.0.1:9090")]
+    admin: String,
+    /// Admin username.
+    #[arg(long, default_value = "ops")]
+    user: String,
+    /// Admin password. Omit to read `DONUT_ADMIN_PASSWORD` from the env
+    /// (keeps it out of shell history / the process list).
+    #[arg(long)]
+    password: Option<String>,
+}
+
+/// Parameters for `remote-user add`.
+#[derive(Debug, Clone, Args)]
+struct RemoteAddArgs {
+    #[command(flatten)]
+    conn: RemoteConn,
+    /// Device label (e.g. "pixel-8").
+    #[arg(long)]
+    name: String,
+    /// Use a specific UUID instead of minting a fresh one server-side.
+    #[arg(long)]
+    uuid: Option<String>,
+    /// Also print a `vless://…reality…` import link for the new UUID.
+    #[arg(long)]
+    link: bool,
+    /// Public address the client dials for the link (`host:port`).
+    #[arg(long)]
+    server: Option<String>,
+    /// Entry REALITY public key (base64-url) for the link.
+    #[arg(long)]
+    pbk: Option<String>,
+    /// Entry REALITY short id (hex) for the link.
+    #[arg(long)]
+    sid: Option<String>,
+    /// SNI / serverName to mimic for the link.
+    #[arg(long, default_value = "www.microsoft.com")]
+    sni: String,
+    /// uTLS fingerprint for the link.
+    #[arg(long, default_value = "chrome")]
+    fp: String,
+}
+
+/// Parameters for `remote-user remove`.
+#[derive(Debug, Clone, Args)]
+struct RemoteRemoveArgs {
+    #[command(flatten)]
+    conn: RemoteConn,
+    /// UUID of the device to remove.
+    #[arg(long)]
+    uuid: String,
 }
 
 /// Parameters for `reality-scan`.
@@ -317,12 +398,182 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "{}",
                 vless_reality_link(
-                    &args.uuid, &args.server, &args.pbk, &args.sid, &args.sni, &args.fp, &label
+                    &args.uuid,
+                    &args.server,
+                    &args.pbk,
+                    &args.sid,
+                    &args.sni,
+                    &args.fp,
+                    &label
                 )
             );
         }
+        Cmd::RemoteUser(args) => remote_user(&args)?,
     }
     Ok(())
+}
+
+/// Dispatch `remote-user <add|list|remove>` against the admin API.
+fn remote_user(args: &RemoteUserArgs) -> anyhow::Result<()> {
+    match &args.action {
+        RemoteUserAction::Add(a) => remote_user_add(a),
+        RemoteUserAction::List(c) => remote_user_list(c),
+        RemoteUserAction::Remove(r) => remote_user_remove(r),
+    }
+}
+
+fn remote_user_add(a: &RemoteAddArgs) -> anyhow::Result<()> {
+    let body = if let Some(uuid) = &a.uuid {
+        format!(
+            r#"{{"name":{},"uuid":{}}}"#,
+            json_str(&a.name),
+            json_str(uuid)
+        )
+    } else {
+        format!(r#"{{"name":{}}}"#, json_str(&a.name))
+    };
+    let (code, resp) = admin_request(&a.conn, "POST", "/admin/users", Some(&body))?;
+    if code != 201 {
+        anyhow::bail!("admin API returned {code}: {}", resp.trim());
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&resp).with_context(|| format!("parsing admin response: {resp}"))?;
+    let uuid = parsed
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .context("admin response missing uuid")?;
+    println!("# device: {}", a.name);
+    println!("uuid: {uuid}");
+    println!("\n# registry line (devices.json):");
+    println!(
+        r#"{{"name":{},"uuid":{}}}"#,
+        json_str(&a.name),
+        json_str(uuid)
+    );
+
+    if a.link {
+        let (server, pbk, sid) = match (&a.server, &a.pbk, &a.sid) {
+            (Some(s), Some(p), Some(i)) => (s, p, i),
+            _ => anyhow::bail!("--link requires --server, --pbk and --sid"),
+        };
+        let label = if a.name.is_empty() {
+            host_of(server)
+        } else {
+            a.name.clone()
+        };
+        println!("\n# import link (HAPP / Shadowrocket):");
+        println!(
+            "{}",
+            vless_reality_link(uuid, server, pbk, sid, &a.sni, &a.fp, &label)
+        );
+    }
+    Ok(())
+}
+
+fn remote_user_list(c: &RemoteConn) -> anyhow::Result<()> {
+    let (code, resp) = admin_request(c, "GET", "/admin/users", None)?;
+    if code != 200 {
+        anyhow::bail!("admin API returned {code}: {}", resp.trim());
+    }
+    // Pretty-print if it parses; otherwise echo raw.
+    match serde_json::from_str::<serde_json::Value>(&resp) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or(resp)),
+        Err(_) => println!("{resp}"),
+    }
+    Ok(())
+}
+
+fn remote_user_remove(r: &RemoteRemoveArgs) -> anyhow::Result<()> {
+    let path = format!("/admin/users/{}", r.uuid);
+    let (code, resp) = admin_request(&r.conn, "DELETE", &path, None)?;
+    match code {
+        200 => println!("removed {}", r.uuid),
+        404 => anyhow::bail!("no such user: {}", r.uuid),
+        _ => anyhow::bail!("admin API returned {code}: {}", resp.trim()),
+    }
+    Ok(())
+}
+
+/// Minimal JSON string literal (quotes + escapes the few chars that matter
+/// for a device name / UUID). Avoids pulling a serializer for two fields.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One blocking HTTP/1.1 request to the admin endpoint. Returns
+/// `(status_code, body)`. Plain HTTP only — the endpoint is loopback-bound,
+/// so run it over an SSH tunnel, never across the open internet.
+fn admin_request(
+    conn: &RemoteConn,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<(u16, String)> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let password = conn
+        .password
+        .clone()
+        .or_else(|| std::env::var("DONUT_ADMIN_PASSWORD").ok())
+        .context("admin password required: pass --password or set DONUT_ADMIN_PASSWORD")?;
+
+    let hostport = conn
+        .admin
+        .strip_prefix("http://")
+        .unwrap_or(&conn.admin)
+        .trim_end_matches('/');
+    if hostport.contains("://") {
+        anyhow::bail!(
+            "--admin must be a plain http://host:port URL (the endpoint is loopback HTTP)"
+        );
+    }
+
+    let cred = BASE64_STANDARD.encode(format!("{}:{}", conn.user, password));
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\n\
+         Host: {hostport}\r\n\
+         Authorization: Basic {cred}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    let mut stream = TcpStream::connect(hostport)
+        .with_context(|| format!("connecting to admin endpoint {hostport}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, resp_body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let code = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .context("no HTTP status in admin response")?;
+    Ok((code, resp_body.to_string()))
 }
 
 /// Build a faithful-REALITY `vless://` share URI (validated against xray-core):
@@ -455,13 +706,20 @@ fn reality_scan(args: &RealityScanArgs) -> anyhow::Result<()> {
         });
         for hit in results.into_iter().flatten() {
             hits += 1;
-            let h2 = if hit.alpn == "h2" { "h2 ✓" } else { &hit.alpn };
+            let h2 = if hit.alpn == "h2" {
+                "h2 ✓"
+            } else {
+                &hit.alpn
+            };
             let sans = if hit.sans.is_empty() {
                 "<no SAN>".to_string()
             } else {
                 hit.sans.join(", ")
             };
-            println!("{}:{}  TLS1.3 X25519 {}  SAN: {}", hit.ip, args.port, h2, sans);
+            println!(
+                "{}:{}  TLS1.3 X25519 {}  SAN: {}",
+                hit.ip, args.port, h2, sans
+            );
         }
     }
     eprintln!("# done — {hits} REALITY-suitable host(s). Validate a pick with `tls-ping`.");
@@ -476,7 +734,10 @@ fn parse_cidr_v4(s: &str) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
         None => (s, 32),
     };
     let ip: std::net::Ipv4Addr = ip_str.parse()?;
-    anyhow::ensure!((16..=32).contains(&prefix), "prefix must be /16../32 (bounded scan)");
+    anyhow::ensure!(
+        (16..=32).contains(&prefix),
+        "prefix must be /16../32 (bounded scan)"
+    );
     let bits = 32 - prefix;
     let mask = if bits == 32 { 0 } else { u32::MAX << bits };
     let base = u32::from(ip) & mask;
@@ -646,7 +907,10 @@ fn admin_passwd(args: &AdminPasswdArgs) -> anyhow::Result<()> {
     println!("password_hash = \"{hash}\"");
     println!();
     println!("# Prometheus scrape (basic_auth):");
-    println!("#   basic_auth: {{ username: {}, password: <the password above> }}", args.user);
+    println!(
+        "#   basic_auth: {{ username: {}, password: <the password above> }}",
+        args.user
+    );
     Ok(())
 }
 
@@ -1124,6 +1388,50 @@ mod tests {
     fn link_omits_flow_when_none() {
         let link = vless_link("u", "h:443", "sni.example", "chrome", "none", "lbl");
         assert!(!link.contains("flow="));
+    }
+
+    #[test]
+    fn json_str_quotes_and_escapes() {
+        assert_eq!(json_str("pixel-8"), r#""pixel-8""#);
+        assert_eq!(json_str(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn admin_request_formats_and_parses() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"uuid":"ba62af9d-8c38-4a4f-8cb4-0e8941d5c9bc","name":"x"}"#;
+            let resp = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            req
+        });
+
+        let conn = RemoteConn {
+            admin: format!("http://{addr}"),
+            user: "ops".into(),
+            password: Some("pw".into()),
+        };
+        let (code, body) =
+            admin_request(&conn, "POST", "/admin/users", Some(r#"{"name":"x"}"#)).unwrap();
+        assert_eq!(code, 201);
+        assert!(body.contains("ba62af9d-8c38-4a4f-8cb4-0e8941d5c9bc"));
+
+        let req = server.join().unwrap();
+        assert!(req.starts_with("POST /admin/users HTTP/1.1"));
+        assert!(req.contains("Authorization: Basic "));
+        assert!(req.contains(r#"{"name":"x"}"#));
     }
 
     #[test]

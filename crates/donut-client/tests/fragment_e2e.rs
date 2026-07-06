@@ -68,7 +68,7 @@ async fn freedom_egress_fragments_clienthello() {
         key,
         veil_server,
         target_addr, // decoy (unused on the authed path)
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -158,5 +158,8 @@ async fn freedom_egress_fragments_clienthello() {
         "ClientHello must arrive fragmented (got {records} record(s), {} bytes)",
         got.len()
     );
-    assert_eq!(reassembled, body, "fragmentation must preserve the ClientHello body");
+    assert_eq!(
+        reassembled, body,
+        "fragmentation must preserve the ClientHello body"
+    );
 }

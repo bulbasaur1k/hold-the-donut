@@ -99,7 +99,7 @@ async fn cascade_entry_chains_to_exit() {
         exit_key,
         exit_veil,
         decoy_addr,
-        Arc::new(UserAuth::new(vec![exit_uuid])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![exit_uuid])),
         Arc::new(Router::new("freedom")),
         resolver(),
         Arc::new(Outbounds::default()),
@@ -138,7 +138,7 @@ async fn cascade_entry_chains_to_exit() {
         entry_key,
         entry_veil,
         decoy_addr,
-        Arc::new(UserAuth::new(vec![entry_uuid])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![entry_uuid])),
         Arc::new(Router::new("exit")), // default outbound → chain "exit"
         resolver(),
         outbounds,
@@ -198,5 +198,8 @@ async fn cascade_entry_chains_to_exit() {
         .await
         .expect("echo read timeout")
         .unwrap();
-    assert_eq!(got, b"cascade-hello", "payload must round-trip through the cascade");
+    assert_eq!(
+        got, b"cascade-hello",
+        "payload must round-trip through the cascade"
+    );
 }

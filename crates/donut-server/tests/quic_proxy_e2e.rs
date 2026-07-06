@@ -60,7 +60,7 @@ async fn quic_proxy_relays_payload_over_h3() {
         key,
         "/".to_string(),
         None,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],

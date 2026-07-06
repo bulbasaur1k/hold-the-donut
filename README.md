@@ -127,17 +127,26 @@ cargo build --release -p donut-client
 
 ### Добавить ещё пользователя
 
-UUID = отдельный credential на устройство (можно отзывать независимо). На VPS
-добавь новый UUID в массив `users` в `/etc/donut/server.toml` и перезапусти:
+UUID = отдельный credential на устройство (можно отзывать независимо).
+Пользователи живут в durable-сторе `/etc/donut/users.json` и правятся **live —
+без рестарта и без редеплоя** — через admin-API за Basic-Auth (см.
+[docs/LIVE_USER_MANAGEMENT.md](docs/LIVE_USER_MANAGEMENT.md)):
 
 ```sh
-NEW=$(uuidgen)
-sed -i "s#^users = \[\(.*\)\]#users = [\1, \"$NEW\"]#" /etc/donut/server.toml
-systemctl restart donut-server
-# ссылка для нового юзера (на машине сборки):
-cargo run -p donut-tools -- link --uuid "$NEW" --server-addr <DOMAIN>:443 --sni <DOMAIN>
+# на машине сборки, по admin-туннелю (ssh -L 9090:127.0.0.1:9090 <server>):
+export DONUT_ADMIN_PASSWORD=<ops-password>
+donut-tools remote-user add --name pixel-8 --link \
+  --server <HOST>:443 --pbk <REALITY_PUB> --sid <SHORT_ID> --sni <SNI>
+# → печатает UUID и готовую vless://…reality-ссылку; юзер работает сразу
+donut-tools remote-user list
+donut-tools remote-user remove --uuid <UUID>
 ```
-Отозвать = убрать UUID из `users` + `systemctl restart donut-server`.
+
+Или напрямую curl'ом на loopback узла:
+`curl -u ops:<PASS> -X POST http://127.0.0.1:9090/admin/users -d '{"name":"pixel-8"}'`.
+
+`inbound.users` в конфиге теперь лишь **seed при первом старте** (когда
+`users.json` ещё нет); дальше источник правды — файл, и он переживает редеплой.
 
 ## Структура
 

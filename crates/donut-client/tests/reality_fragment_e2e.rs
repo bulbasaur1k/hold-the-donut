@@ -13,7 +13,10 @@ use donut_core::{Address, Command, Endpoint, FlowKind, ShortId, UserAuth, UserId
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_server::{run_reality_proxy, FragmentParams, Outbounds};
-use donut_veil::{build_client_hello_mutator, crypto_provider, NoCertVerification, VeilClientConfig, VeilServerConfig};
+use donut_veil::{
+    build_client_hello_mutator, crypto_provider, NoCertVerification, VeilClientConfig,
+    VeilServerConfig,
+};
 use donut_wire::{Request, Response};
 use rustls::pki_types::ServerName;
 use rustls::{version, ClientConfig};
@@ -43,15 +46,25 @@ async fn reality_freedom_fragments_clienthello() {
     let server_pub = veil.public_key_bytes();
     let user = UserId::new_v4();
     let outbounds = Arc::new(
-        Outbounds::build(&[], Some(FragmentParams { len: (64, 64), interval_ms: (0, 0) })).unwrap(),
+        Outbounds::build(
+            &[],
+            Some(FragmentParams {
+                len: (64, 64),
+                interval_ms: (0, 0),
+            }),
+        )
+        .unwrap(),
     );
     let server_addr = run_reality_proxy(
         "127.0.0.1:0".parse().unwrap(),
         veil,
         target_addr, // decoy (unused on the authed path)
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
-        Arc::new(Resolver::doh(&["1.1.1.1".parse().unwrap()], "cloudflare-dns.com")),
+        Arc::new(Resolver::doh(
+            &["1.1.1.1".parse().unwrap()],
+            "cloudflare-dns.com",
+        )),
         outbounds,
         donut_server::Metrics::new(),
         donut_server::RuntimeTuning::default(),
@@ -92,7 +105,13 @@ async fn reality_freedom_fragments_clienthello() {
     };
     // Payload = a synthetic ClientHello record (what would go to e.g. YouTube).
     let body = vec![0x01u8; 250];
-    let mut hello = vec![0x16, 0x03, 0x01, (body.len() >> 8) as u8, (body.len() & 0xff) as u8];
+    let mut hello = vec![
+        0x16,
+        0x03,
+        0x01,
+        (body.len() >> 8) as u8,
+        (body.len() & 0xff) as u8,
+    ];
     hello.extend_from_slice(&body);
 
     let mut framed = BytesMut::with_capacity(request.encoded_len() + hello.len());
@@ -126,6 +145,9 @@ async fn reality_freedom_fragments_clienthello() {
         i += 5 + l;
         records += 1;
     }
-    assert!(records > 1, "ClientHello must arrive fragmented (got {records} record(s))");
+    assert!(
+        records > 1,
+        "ClientHello must arrive fragmented (got {records} record(s))"
+    );
     assert_eq!(reassembled, body, "fragmentation preserves the ClientHello");
 }

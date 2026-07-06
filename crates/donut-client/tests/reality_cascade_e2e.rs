@@ -14,7 +14,10 @@ use donut_core::{Address, Command, Endpoint, FlowKind, ShortId, UserAuth, UserId
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_server::{run_reality_proxy, run_veil_proxy, Outbounds};
-use donut_veil::{build_client_hello_mutator, crypto_provider, NoCertVerification, VeilClientConfig, VeilServerConfig};
+use donut_veil::{
+    build_client_hello_mutator, crypto_provider, NoCertVerification, VeilClientConfig,
+    VeilServerConfig,
+};
 use donut_wire::{Request, Response};
 use rcgen::CertificateParams;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -95,7 +98,7 @@ async fn reality_entry_chains_to_exit() {
         exit_key,
         exit_veil,
         decoy_addr,
-        Arc::new(UserAuth::new(vec![link_uuid])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![link_uuid])),
         Arc::new(Router::new("freedom")),
         resolver(),
         Arc::new(Outbounds::default()),
@@ -131,7 +134,7 @@ async fn reality_entry_chains_to_exit() {
         "127.0.0.1:0".parse().unwrap(),
         entry_veil,
         decoy_addr,
-        Arc::new(UserAuth::new(vec![device_uuid])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![device_uuid])),
         Arc::new(Router::new("exit")), // default → chain
         resolver(),
         outbounds,

@@ -49,7 +49,7 @@ async fn carrier_backend_relays_over_secret_path() {
         "127.0.0.1:0".parse().unwrap(),
         SECRET_PATH.to_string(),
         donut_carrier::Mode::StreamOne,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -141,7 +141,7 @@ async fn carrier_backend_stream_up_pairs_separate_connections() {
         "127.0.0.1:0".parse().unwrap(),
         SECRET_PATH.to_string(),
         donut_carrier::Mode::StreamUp,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],

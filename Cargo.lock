@@ -773,6 +773,7 @@ dependencies = [
 name = "donut-core"
 version = "0.0.1"
 dependencies = [
+ "arc-swap",
  "bytes",
  "hex",
  "serde",
@@ -896,6 +897,7 @@ dependencies = [
  "rand 0.8.5",
  "rcgen",
  "rustls 0.23.38",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

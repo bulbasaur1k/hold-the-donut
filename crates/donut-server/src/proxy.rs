@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth};
+use donut_core::{Address, AuthHandle, Command, Endpoint, FlowKind};
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_veil::VeilServerConfig;
@@ -116,7 +116,7 @@ pub enum ProxyError {
 /// address (useful when `bind_addr` had port 0 — e.g. in tests).
 pub async fn run_carrier_proxy(
     bind_addr: SocketAddr,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
 ) -> Result<SocketAddr, ProxyError> {
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
@@ -178,7 +178,7 @@ pub async fn run_carrier_backend(
     bind_addr: SocketAddr,
     path_prefix: String,
     mode: donut_carrier::Mode,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -245,7 +245,7 @@ pub async fn run_quic_proxy(
     key: PrivateKeyDer<'static>,
     secret_path: String,
     decoy: Option<SocketAddr>,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -302,7 +302,7 @@ pub async fn run_tls_carrier_proxy(
     mode: donut_carrier::Mode,
     decoy: Option<SocketAddr>,
     host: Option<String>,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -416,7 +416,7 @@ pub async fn run_veil_proxy(
     key: PrivateKeyDer<'static>,
     veil: VeilServerConfig,
     dest: SocketAddr,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     outbounds: Arc<crate::outbound::Outbounds>,
@@ -503,7 +503,7 @@ pub async fn run_veil_proxy(
 #[allow(clippy::too_many_arguments)] // wired from the daemon entry point
 async fn handle_session<S>(
     mut session: S,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     vision_dialect: VisionDialect,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
@@ -684,7 +684,7 @@ where
 async fn handle_xray_vision_session(
     mut tunnel: vision_xray_splice::RecordTlsServer,
     decoy: Option<SocketAddr>,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     outbounds: Arc<crate::outbound::Outbounds>,
@@ -902,7 +902,7 @@ pub async fn run_raw_proxy(
     key: PrivateKeyDer<'static>,
     decoy: Option<SocketAddr>,
     vision_dialect: VisionDialect,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
@@ -1095,7 +1095,7 @@ pub async fn run_reality_proxy(
     bind_addr: SocketAddr,
     veil: VeilServerConfig,
     dest: SocketAddr,
-    auth: Arc<UserAuth>,
+    auth: AuthHandle,
     router: Arc<Router>,
     resolver: Arc<Resolver>,
     outbounds: Arc<crate::outbound::Outbounds>,

@@ -9,7 +9,6 @@
 //!    asks for CONNECT to the echo server, sends "hello-socks", and
 //!    verifies the echoed payload.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use donut_core::{UserAuth, UserId};
@@ -40,7 +39,7 @@ async fn socks5_to_donut_client_to_donut_server_to_echo() {
     let user = UserId::new_v4();
     let proxy_addr = donut_server::run_carrier_proxy(
         "127.0.0.1:0".parse().unwrap(),
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
     )
     .await
     .expect("bind donut-server");

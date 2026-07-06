@@ -125,7 +125,7 @@ async fn tunnel_roundtrip(mode: Mode) {
         mode,
         Some(decoy_addr),
         None,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],

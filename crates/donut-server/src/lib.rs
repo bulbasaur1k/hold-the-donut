@@ -18,6 +18,7 @@ pub mod outbound;
 mod proxy;
 mod selfsteal;
 pub mod subscription;
+pub mod users;
 mod veil_server;
 mod vision_xray_splice;
 
@@ -30,4 +31,5 @@ pub use proxy::{
 };
 pub use selfsteal::{triage, Triage};
 pub use subscription::SubServeConfig;
+pub use users::{UserRecord, UserStore, UserStoreError};
 pub use veil_server::{PrefixedStream, VeilServer};

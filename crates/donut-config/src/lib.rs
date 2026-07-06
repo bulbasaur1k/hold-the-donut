@@ -524,15 +524,20 @@ impl ServerInbound {
         if self.users.is_empty() {
             return Err(ConfigError::NoUsers);
         }
-        let users = self
-            .users
+        Ok(UserAuth::new(self.seed_user_ids()?))
+    }
+
+    /// Parse `users` into [`UserId`]s **without** the fail-closed empty
+    /// check. Used to seed the durable live user store, which may
+    /// legitimately start empty and be populated over the admin API.
+    pub fn seed_user_ids(&self) -> Result<Vec<UserId>, ConfigError> {
+        self.users
             .iter()
             .map(|s| {
                 s.parse::<UserId>()
                     .map_err(|_| ConfigError::User(s.clone()))
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(UserAuth::new(users))
+            .collect()
     }
 
     /// Load the PEM certificate chain (`transport = "quic"`).

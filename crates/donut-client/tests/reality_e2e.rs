@@ -13,7 +13,10 @@ use donut_core::{Address, Command, Endpoint, FlowKind, ShortId, UserAuth, UserId
 use donut_dns::Resolver;
 use donut_routing::Router;
 use donut_server::run_reality_proxy;
-use donut_veil::{build_client_hello_mutator, crypto_provider, NoCertVerification, VeilClientConfig, VeilServerConfig};
+use donut_veil::{
+    build_client_hello_mutator, crypto_provider, NoCertVerification, VeilClientConfig,
+    VeilServerConfig,
+};
 use donut_wire::{Request, Response};
 use rustls::pki_types::ServerName;
 use rustls::{version, ClientConfig};
@@ -70,7 +73,7 @@ async fn reality_client_reaches_echo() {
         "127.0.0.1:0".parse().unwrap(),
         veil,
         decoy_addr,
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
         Arc::new(Router::new("freedom")),
         Arc::new(Resolver::doh(
             &["1.1.1.1".parse().unwrap()],
@@ -138,5 +141,8 @@ async fn reality_client_reaches_echo() {
         .await
         .expect("echo read timeout")
         .unwrap();
-    assert_eq!(got, b"hello-reality", "payload must round-trip through REALITY+VLESS");
+    assert_eq!(
+        got, b"hello-reality",
+        "payload must round-trip through REALITY+VLESS"
+    );
 }

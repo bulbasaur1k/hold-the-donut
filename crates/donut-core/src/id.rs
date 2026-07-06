@@ -1,6 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -85,6 +87,43 @@ impl UserAuth {
             found |= ((diff as u16).wrapping_sub(1) >> 8) as u8;
         }
         found != 0
+    }
+}
+
+/// A hot-swappable handle to the allowed-user set.
+///
+/// Readers on the proxy hot path clone this cheaply (it is an `Arc`) and
+/// call [`AuthHandle::is_authorized`], which loads the current snapshot
+/// lock-free — cheap enough to do once per session handshake. The owner
+/// (the server's durable user store) atomically replaces the snapshot with
+/// [`AuthHandle::store`] when a user is added or removed live, so the next
+/// session sees the new set with no restart. In-flight snapshots keep the
+/// old set until dropped.
+#[derive(Clone)]
+pub struct AuthHandle(Arc<ArcSwap<UserAuth>>);
+
+impl AuthHandle {
+    pub fn new(auth: UserAuth) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(auth)))
+    }
+
+    /// Constant-time membership on the current snapshot
+    /// (see [`UserAuth::is_authorized`]).
+    pub fn is_authorized(&self, candidate: &UserId) -> bool {
+        self.0.load().is_authorized(candidate)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.load().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.load().is_empty()
+    }
+
+    /// Atomically replace the live allowed-user set.
+    pub fn store(&self, auth: UserAuth) {
+        self.0.store(Arc::new(auth));
     }
 }
 

@@ -11,8 +11,11 @@ use std::time::Duration;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine;
+use donut_core::UserId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+
+use crate::users::{UserRecord, UserStore, UserStoreError};
 
 /// HTTP Basic Auth guard for the admin endpoint (`/metrics`, `/healthz`).
 /// Holds the admin username and an Argon2 PHC password hash; verification
@@ -71,7 +74,9 @@ fn basic_credentials(req: &str) -> Option<&str> {
         .take_while(|l| !l.is_empty())
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("authorization").then_some(value)
+            name.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then_some(value)
         })
         .and_then(|v| v.trim().strip_prefix("Basic "))
 }
@@ -82,6 +87,163 @@ fn request_path(req: &str) -> &str {
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/")
+}
+
+/// Request method (the first token of the request line).
+fn request_method(req: &str) -> &str {
+    req.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or("GET")
+}
+
+/// The request body — everything after the blank line that ends the headers.
+fn request_body(req: &str) -> &str {
+    req.split_once("\r\n\r\n")
+        .or_else(|| req.split_once("\n\n"))
+        .map(|(_, body)| body)
+        .unwrap_or("")
+}
+
+/// Read the request head, plus its body when the head declares a
+/// `Content-Length`. Bounded by `cap` so a slow/oversized client can't pin
+/// the task. Returns whatever was read on EOF/error.
+async fn read_request(sock: &mut TcpStream, cap: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(2048);
+    let mut tmp = [0u8; 2048];
+    loop {
+        if let Some(total) = request_total_len(&data) {
+            if data.len() >= total {
+                break;
+            }
+        }
+        if data.len() >= cap {
+            break;
+        }
+        match sock.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => data.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+    }
+    data
+}
+
+/// Once the header terminator is present, the full request length is
+/// `header_end + Content-Length` (Content-Length 0 when absent). `None`
+/// while the headers are still incomplete.
+fn request_total_len(data: &[u8]) -> Option<usize> {
+    let sep = b"\r\n\r\n";
+    let pos = data.windows(sep.len()).position(|w| w == sep)?;
+    let header_end = pos + sep.len();
+    let content_length = std::str::from_utf8(&data[..header_end])
+        .ok()
+        .and_then(|head| {
+            head.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim())
+            })
+        })
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    Some(header_end + content_length)
+}
+
+/// Body of `POST /admin/users`: optional label and optional explicit UUID
+/// (minted when omitted).
+#[derive(serde::Deserialize)]
+struct AddUserReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    uuid: Option<String>,
+}
+
+fn render_users(users: &[UserRecord]) -> String {
+    let arr = serde_json::to_string(users).unwrap_or_else(|_| "[]".to_string());
+    format!("{{\"count\":{},\"users\":{}}}", users.len(), arr)
+}
+
+async fn add_user(store: &UserStore, body: &str) -> (&'static str, &'static str, String) {
+    let req: AddUserReq = if body.trim().is_empty() {
+        AddUserReq {
+            name: String::new(),
+            uuid: None,
+        }
+    } else {
+        match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    format!("invalid json: {e}"),
+                )
+            }
+        }
+    };
+    let uuid = match req.uuid.as_deref() {
+        Some(s) => match s.parse::<UserId>() {
+            Ok(u) => Some(u),
+            Err(_) => {
+                return (
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    format!("invalid uuid: {s}"),
+                )
+            }
+        },
+        None => None,
+    };
+    match store.add(req.name, uuid).await {
+        Ok(rec) => (
+            "201 Created",
+            "application/json; charset=utf-8",
+            serde_json::to_string(&rec).unwrap_or_else(|_| "{}".to_string()),
+        ),
+        Err(UserStoreError::Duplicate(u)) => (
+            "409 Conflict",
+            "text/plain; charset=utf-8",
+            format!("user already exists: {u}"),
+        ),
+        Err(e) => (
+            "500 Internal Server Error",
+            "text/plain; charset=utf-8",
+            format!("{e}"),
+        ),
+    }
+}
+
+async fn remove_user(store: &UserStore, raw_id: &str) -> (&'static str, &'static str, String) {
+    let uuid = match raw_id.parse::<UserId>() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                format!("invalid uuid: {raw_id}"),
+            )
+        }
+    };
+    match store.remove(&uuid).await {
+        Ok(true) => (
+            "200 OK",
+            "application/json; charset=utf-8",
+            format!("{{\"removed\":\"{uuid}\"}}"),
+        ),
+        Ok(false) => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "no such user".to_string(),
+        ),
+        Err(e) => (
+            "500 Internal Server Error",
+            "text/plain; charset=utf-8",
+            format!("{e}"),
+        ),
+    }
 }
 
 /// Tunnel-session transport, for the per-kind active-session gauge. Lets a
@@ -449,6 +611,7 @@ pub async fn serve(
     listener: TcpListener,
     metrics: Arc<Metrics>,
     auth: Option<Arc<AdminAuth>>,
+    store: Arc<UserStore>,
     accept_backoff: Duration,
 ) {
     loop {
@@ -464,47 +627,84 @@ pub async fn serve(
         };
         let metrics = metrics.clone();
         let auth = auth.clone();
+        let store = store.clone();
         tokio::spawn(async move {
-            // Read the request head; cap so a slow client can't pin us.
-            let mut buf = [0u8; 2048];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
+            // Read the request head + (for POST) its body, capped so a slow
+            // client can't pin us.
+            let raw = read_request(&mut sock, 16 * 1024).await;
+            let req = String::from_utf8_lossy(&raw);
 
             // Authorise first when a guard is configured. A missing/invalid
             // credential gets 401 + a Basic challenge, nothing else.
-            if let Some(guard) = auth.as_deref() {
-                let ok = basic_credentials(&req).is_some_and(|c| guard.verify(c));
-                if !ok {
-                    let body = "unauthorized";
-                    let response = format!(
-                        "HTTP/1.1 401 Unauthorized\r\n\
-                         WWW-Authenticate: Basic realm=\"donut admin\"\r\n\
-                         Content-Type: text/plain; charset=utf-8\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                    return;
-                }
+            let authed = match auth.as_deref() {
+                Some(guard) => basic_credentials(&req).is_some_and(|c| guard.verify(c)),
+                None => true,
+            };
+            if !authed {
+                let body = "unauthorized";
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\n\
+                     WWW-Authenticate: Basic realm=\"donut admin\"\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+                return;
             }
 
-            let (content_type, body) = match request_path(&req) {
-                "/healthz" | "/health" => (
+            let method = request_method(&req);
+            let path = request_path(&req);
+            // User provisioning must sit behind credentials: refuse it when
+            // the endpoint is unauthenticated, even though the read above
+            // "passed" (no guard configured).
+            let creds_required_missing = auth.is_none();
+
+            let (status, content_type, body) = match (method, path) {
+                ("GET", "/healthz") | ("GET", "/health") => (
+                    "200 OK",
                     "application/json; charset=utf-8",
                     format!(
                         "{{\"status\":\"ok\",\"version\":\"{}\"}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 ),
-                _ => (
+                (_, p) if p.starts_with("/admin/users") && creds_required_missing => (
+                    "403 Forbidden",
+                    "text/plain; charset=utf-8",
+                    "user management requires metrics.username/password_hash".to_string(),
+                ),
+                ("GET", "/admin/users") => {
+                    let users = store.list().await;
+                    (
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        render_users(&users),
+                    )
+                }
+                ("POST", "/admin/users") => {
+                    let body = request_body(&req);
+                    add_user(&store, body).await
+                }
+                ("DELETE", p) if p.starts_with("/admin/users/") => {
+                    let raw_id = p.trim_start_matches("/admin/users/").trim_end_matches('/');
+                    remove_user(&store, raw_id).await
+                }
+                ("GET", _) => (
+                    "200 OK",
                     "text/plain; version=0.0.4; charset=utf-8",
                     metrics.render(),
                 ),
+                _ => (
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    "not found".to_string(),
+                ),
             };
             let response = format!(
-                "HTTP/1.1 200 OK\r\n\
+                "HTTP/1.1 {status}\r\n\
                  Content-Type: {content_type}\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",

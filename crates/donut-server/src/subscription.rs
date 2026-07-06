@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use donut_config::subgen::{self, RoutingProfile, XhttpParams};
-use donut_core::UserAuth;
+use donut_core::AuthHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -58,7 +58,7 @@ pub struct SubServeConfig {
 pub async fn serve(
     listener: TcpListener,
     cfg: Arc<SubServeConfig>,
-    users: Arc<UserAuth>,
+    users: AuthHandle,
     accept_backoff: Duration,
 ) {
     loop {
@@ -96,7 +96,7 @@ pub async fn serve(
 }
 
 /// Build the response for a request target like `/sub/<uuid>?format=clash`.
-fn handle(target: &str, cfg: &SubServeConfig, users: &UserAuth) -> String {
+fn handle(target: &str, cfg: &SubServeConfig, users: &AuthHandle) -> String {
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p, q),
         None => (target, ""),

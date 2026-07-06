@@ -13,8 +13,6 @@
 
 use std::time::Duration;
 
-use std::sync::Arc;
-
 use bytes::BytesMut;
 use donut_core::{Address, Command, Endpoint, FlowKind, UserAuth, UserId};
 use donut_wire::{Request, Response};
@@ -45,7 +43,7 @@ async fn proxy_relays_payload_to_freedom_target() {
     let user = UserId::new_v4();
     let proxy_addr = donut_server::run_carrier_proxy(
         "127.0.0.1:0".parse().unwrap(),
-        Arc::new(UserAuth::new(vec![user])),
+        donut_core::AuthHandle::new(UserAuth::new(vec![user])),
     )
     .await
     .expect("bind proxy");
