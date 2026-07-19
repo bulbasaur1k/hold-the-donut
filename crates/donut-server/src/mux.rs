@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use donut_io::vision_xray::Unpadder;
+use donut_io::vision_xray::{
+    xtls_padding, Unpadder, BUF_SIZE, COMMAND_PADDING_CONTINUE, COMMAND_PADDING_END, DEFAULT_SEED,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -99,6 +101,50 @@ fn devision(unp: &mut Option<Unpadder>, data: &[u8]) -> Vec<u8> {
         Some(u) => u.push(data),
         None => data.to_vec(),
     }
+}
+
+/// Vision-pad the **first** downlink frame, the mirror of [`devision`] on the
+/// uplink. When the Mux stream rides inside Vision (`flow=xtls-rprx-vision` +
+/// XUDP), the client's Vision reader treats the whole server→client stream as
+/// padding-framed and validates the user UUID on the very first frame — so an
+/// un-padded Mux frame is read as a bogus UUID and the session is dropped with
+/// `XTLS Vision server responded unknown UUID`. We emit `[uuid][cmd][len][pad]`
+/// blocks (UUID on the first block) ending with a `PaddingEnd` command, after
+/// which the client switches to raw for the rest of the session — mirroring what
+/// the client itself does on its uplink for a non-TLS stream. Content is split
+/// into `BUF_SIZE`-bounded blocks (matching Xray's reshape) so the 16-bit length
+/// field can't overflow on a jumbo datagram.
+fn revision(uuid: [u8; 16], frame: &[u8]) -> Vec<u8> {
+    const MAX: usize = BUF_SIZE - 21; // per-block content budget (Xray reshape)
+    let mut uuid_once = Some(uuid);
+    // A keep_frame always carries a datagram, but guard the empty case so the
+    // UUID + End still go out.
+    if frame.is_empty() {
+        return xtls_padding(
+            &[],
+            COMMAND_PADDING_END,
+            &mut uuid_once,
+            false,
+            &DEFAULT_SEED,
+        );
+    }
+    let mut out = Vec::with_capacity(frame.len() + 21);
+    let mut chunks = frame.chunks(MAX).peekable();
+    while let Some(chunk) = chunks.next() {
+        let command = if chunks.peek().is_none() {
+            COMMAND_PADDING_END
+        } else {
+            COMMAND_PADDING_CONTINUE
+        };
+        out.extend_from_slice(&xtls_padding(
+            chunk,
+            command,
+            &mut uuid_once,
+            false, // non-TLS inner: short padding
+            &DEFAULT_SEED,
+        ));
+    }
+    out
 }
 
 const STATUS_NEW: u8 = 0x01;
@@ -310,10 +356,14 @@ pub async fn mux_relay<T: MuxIo>(
     vision_uuid: Option<[u8; 16]>,
     idle: Duration,
 ) -> io::Result<()> {
-    // When the Mux stream is Vision-wrapped (flow=vision + XUDP), un-pad the
-    // uplink; the downlink stays raw (the client's reader passes through
-    // un-prefixed bytes). UDP/Mux never triggers a Vision splice (no inner TLS).
+    // When the Mux stream is Vision-wrapped (flow=vision + XUDP) the client pads
+    // and reads *both* directions: we un-pad the uplink and must Vision-pad the
+    // downlink (UUID on the first frame, then PaddingEnd → raw). Leaving the
+    // downlink un-padded makes the client misread the first Mux frame as the
+    // Vision UUID and drop the session. UDP/Mux never triggers a Vision splice
+    // (no inner TLS).
     let mut unp = vision_uuid.map(Unpadder::new);
+    let mut downlink_pad = vision_uuid; // Some(uuid) until the first frame is padded
     let mut inbuf = BytesMut::from(&devision(&mut unp, &leftover)[..]);
     let mut sessions: HashMap<u16, UdpSession> = HashMap::new();
     let (resp_tx, mut resp_rx) = mpsc::channel::<(u16, SocketAddr, Vec<u8>)>(512);
@@ -409,7 +459,12 @@ pub async fn mux_relay<T: MuxIo>(
             },
             Ok(Some(Ev::Resp((sid, src, data)))) => {
                 let frame = keep_frame(sid, src, &data);
-                tunnel.write_chunk(&frame).await?;
+                // Vision-pad the first downlink frame (UUID first), raw after.
+                let out = match downlink_pad.take() {
+                    Some(uuid) => revision(uuid, &frame),
+                    None => frame,
+                };
+                tunnel.write_chunk(&out).await?;
                 metrics.add_bytes(0, data.len() as u64);
             }
         }
@@ -542,6 +597,106 @@ mod tests {
         assert_eq!(f.data.as_deref(), Some(&payload[..]));
 
         // Closing the carrier ends the relay.
+        let _ = client.shutdown().await;
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
+    }
+
+    /// Regression: when the Mux stream is Vision-wrapped, the server's downlink
+    /// must be Vision-padded (UUID on the first frame) — otherwise the client
+    /// reads the raw Mux KEEP frame, mistakes its first 16 bytes for the Vision
+    /// UUID, and drops the session ("XTLS Vision server responded unknown UUID").
+    #[tokio::test]
+    async fn vision_mux_relay_pads_downlink_with_uuid() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let uuid: [u8; 16] = [
+            0xcf, 0x77, 0x6d, 0x70, 0xc6, 0xa8, 0x43, 0x6b, 0xa1, 0x40, 0xe9, 0xb4, 0x66, 0xc0,
+            0x06, 0x63,
+        ];
+
+        // Local UDP echo server.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 1500];
+            while let Ok((n, src)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], src).await;
+            }
+        });
+
+        // NEW+UDP+Data Mux frame targeting the echo.
+        let port = echo_addr.port();
+        let payload = b"vision-xudp";
+        let mut meta = vec![
+            0x00,
+            0x01, // sid = 1
+            STATUS_NEW,
+            OPTION_DATA,
+            NET_UDP,
+            (port >> 8) as u8,
+            port as u8,
+            0x01, // IPv4
+            127,
+            0,
+            0,
+            1,
+        ];
+        meta.extend_from_slice(&[0u8; 8]); // New+UDP+Data → 8-byte global id
+        let mut mux_frame = Vec::new();
+        mux_frame.push((meta.len() >> 8) as u8);
+        mux_frame.push(meta.len() as u8);
+        mux_frame.extend_from_slice(&meta);
+        mux_frame.push((payload.len() >> 8) as u8);
+        mux_frame.push(payload.len() as u8);
+        mux_frame.extend_from_slice(payload);
+
+        // The client Vision-pads its uplink (UUID first, End → raw after).
+        let mut up_uuid = Some(uuid);
+        let padded_uplink = xtls_padding(
+            &mux_frame,
+            COMMAND_PADDING_END,
+            &mut up_uuid,
+            false,
+            &DEFAULT_SEED,
+        );
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let metrics = Metrics::new();
+        let m = metrics.clone();
+        let relay = tokio::spawn(async move {
+            let _ = mux_relay(
+                CarrierMuxIo::new(server),
+                padded_uplink,
+                &m,
+                Some(uuid),
+                Duration::from_secs(5),
+            )
+            .await;
+        });
+
+        // The first downlink bytes MUST be a Vision frame carrying the UUID,
+        // not a raw Mux frame (that was the bug).
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("relay response timeout")
+            .expect("read");
+        assert!(n >= 16, "downlink too short: {n}");
+        assert_eq!(
+            &buf[..16],
+            &uuid[..],
+            "first downlink frame must start with the Vision UUID"
+        );
+
+        // Un-pad as the client would; the echoed datagram is inside a KEEP frame.
+        let mut unp = Unpadder::new(uuid);
+        let content = unp.push(&buf[..n]);
+        let mut rb = BytesMut::from(&content[..]);
+        let f = parse_frame(&mut rb).unwrap().unwrap();
+        assert_eq!(f.status, STATUS_KEEP);
+        assert_eq!(f.data.as_deref(), Some(&payload[..]));
+
         let _ = client.shutdown().await;
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
