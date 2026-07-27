@@ -430,6 +430,26 @@ mod tests {
         assert_eq!(router.route(&ep("8.8.8.8", 22)), "freedom");
     }
 
+    /// The cascade entry pins some domains to its own egress: a `keyword` rule
+    /// must win over the chain default for the domain and every mirror/subdomain
+    /// carrying it, while unrelated hosts still fall through to the next hop.
+    #[test]
+    fn keyword_domain_rule_pins_host_to_local_egress() {
+        let json = r#"{
+            "default": "exit",
+            "rules": [
+                { "domain": [{"keyword": "intimcity"}], "outbound": "freedom" }
+            ]
+        }"#;
+        let cfg: RoutingConfig = serde_json::from_str(json).unwrap();
+        let router = cfg.build().unwrap();
+        assert_eq!(router.route(&ep("m.intimcity.cash", 443)), "freedom");
+        assert_eq!(router.route(&ep("intimcity.cash", 443)), "freedom");
+        assert_eq!(router.route(&ep("www.intimcity.nl", 443)), "freedom");
+        // unrelated traffic keeps going down the chain
+        assert_eq!(router.route(&ep("example.com", 443)), "exit");
+    }
+
     #[test]
     fn default_routing_config_is_freedom_passthrough() {
         let router = RoutingConfig::default().build().unwrap();
