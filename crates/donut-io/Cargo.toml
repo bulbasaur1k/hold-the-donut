@@ -15,6 +15,3 @@ crossbeam-queue.workspace = true
 socket2.workspace = true
 tracing.workspace = true
 rand.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }

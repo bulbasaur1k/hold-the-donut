@@ -280,21 +280,6 @@ pub struct TuningConfig {
     /// Default 10.
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub tls_handshake_timeout_secs: u64,
-    /// Idle timeout for an established TCP relay (seconds) — the analogue
-    /// of Xray's `connIdle`, whose default is likewise 300. Bounds
-    /// *silence*, not lifetime: any byte in either direction resets it, so
-    /// long downloads and idle-but-alive sessions (SSH, WebSocket with
-    /// pings) survive; only a relay where nothing at all moves is cut.
-    ///
-    /// Without it a peer that disappears **without a FIN** — NAT mapping
-    /// evicted, client slept, path broke — parks the copy forever and the
-    /// sockets are held for the process lifetime. Downstream that is worse
-    /// than an FD leak: every held socket also pins one NAT slot on the
-    /// user's upstream router, and a few thousand of those take the whole
-    /// household offline (observed 2026-08-02: 2045 client-side sockets
-    /// against 62 live ones here). 0 disables the reaping. Default 300.
-    #[serde(default = "default_tcp_idle_secs")]
-    pub tcp_idle_secs: u64,
 }
 
 fn default_mux_idle_secs() -> u64 {
@@ -309,9 +294,6 @@ fn default_accept_backoff_ms() -> u64 {
 fn default_tls_handshake_timeout_secs() -> u64 {
     10
 }
-fn default_tcp_idle_secs() -> u64 {
-    300
-}
 
 impl Default for TuningConfig {
     fn default() -> Self {
@@ -320,7 +302,6 @@ impl Default for TuningConfig {
             udp_idle_secs: default_udp_idle_secs(),
             accept_backoff_ms: default_accept_backoff_ms(),
             tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
-            tcp_idle_secs: default_tcp_idle_secs(),
         }
     }
 }

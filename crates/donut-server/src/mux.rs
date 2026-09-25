@@ -30,11 +30,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use donut_core::{Address, Endpoint};
-use donut_routing::Router;
-
 use crate::metrics::Metrics;
-use crate::outbound::{ChainOutbound, Outbounds};
 use crate::vision_xray_splice::RecordTlsServer;
 
 /// Plaintext I/O the Mux relay needs, abstracted over the two carriers it
@@ -336,201 +332,29 @@ async fn resolve(addr: &Addr) -> io::Result<SocketAddr> {
     }
 }
 
-/// One XUDP sub-session's egress, decided **per target** by the routing table
-/// exactly as it is for TCP: a tag selecting a chain outbound sends those
-/// datagrams up the cascade so the *exit* owns the real socket; anything else
-/// keeps the local socket. Before this existed every XUDP session bound a
-/// local socket unconditionally, so UDP always left from the entry's own
-/// address while TCP went abroad — which is what kept Telegram calls broken.
-///
-/// A sid is full-cone (each datagram re-states its target), so one sid can
-/// legitimately hit both a chained and a local target. Both halves are
-/// therefore lazy and coexist.
-#[derive(Default)]
 struct UdpSession {
-    /// Local socket, shared by every target the router keeps on this node.
-    direct: Option<DirectLink>,
-    /// One cascade session per distinct chained target.
-    chain: HashMap<SocketAddr, ChainLink>,
-}
-
-/// The local socket plus the task pumping its reads into the mux response
-/// channel.
-struct DirectLink {
     sock: Arc<UdpSocket>,
     recv_task: JoinHandle<()>,
 }
 
-impl Drop for DirectLink {
+impl Drop for UdpSession {
     fn drop(&mut self) {
         self.recv_task.abort();
-    }
-}
-
-/// The uplink half of one cascade UDP session, plus the task pumping its
-/// downlink back into the mux response channel.
-struct ChainLink {
-    tx: Box<dyn AsyncWrite + Unpin + Send>,
-    recv_task: JoinHandle<()>,
-}
-
-impl Drop for ChainLink {
-    fn drop(&mut self) {
-        self.recv_task.abort();
-    }
-}
-
-/// A mux frame target as the router sees it. Domains stay domains so a chained
-/// target is resolved by the **exit**, not by us.
-fn endpoint_of(addr: &Addr) -> Endpoint {
-    match addr {
-        Addr::Ip(s) => Endpoint::new(Address::Ip(s.ip()), s.port()),
-        Addr::Domain(h, p) => Endpoint::new(Address::Domain(h.clone()), *p),
-    }
-}
-
-/// Frame one datagram for a VLESS-UDP stream (`[len:2 BE][payload]`).
-async fn write_datagram<W: AsyncWrite + Unpin + ?Sized>(w: &mut W, data: &[u8]) -> io::Result<()> {
-    let mut out = Vec::with_capacity(2 + data.len());
-    out.push((data.len() >> 8) as u8);
-    out.push(data.len() as u8);
-    out.extend_from_slice(data);
-    w.write_all(&out).await?;
-    w.flush().await
-}
-
-/// Open one cascade UDP session for `ep` and pump its downlink into the mux
-/// response channel, labelled with `label` (the source address the client is
-/// told the datagrams came from).
-async fn dial_chain(
-    chain: &ChainOutbound,
-    ep: &Endpoint,
-    sid: u16,
-    label: SocketAddr,
-    resp_tx: &mpsc::Sender<(u16, SocketAddr, Vec<u8>)>,
-) -> Option<ChainLink> {
-    let up = match chain.dial_udp(ep).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!(target = %ep, sid, error = %e, "mux: cascade udp dial failed");
-            return None;
-        }
-    };
-    let (mut rd, wr) = tokio::io::split(up);
-    let tx = resp_tx.clone();
-    let recv_task = tokio::spawn(async move {
-        let mut acc = BytesMut::with_capacity(BUF_SIZE);
-        let mut chunk = vec![0u8; 65535];
-        loop {
-            match rd.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => acc.extend_from_slice(&chunk[..n]),
-            }
-            while let Some(dg) = crate::vision_xray_splice::take_datagram(&mut acc) {
-                if tx.send((sid, label, dg)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    });
-    Some(ChainLink {
-        tx: Box::new(wr),
-        recv_task,
-    })
-}
-
-/// Bind this node's own socket for a sid and pump its reads into the mux
-/// response channel. One socket serves every local target on the sid.
-async fn open_direct(
-    sid: u16,
-    ipv6: bool,
-    resp_tx: &mpsc::Sender<(u16, SocketAddr, Vec<u8>)>,
-) -> Option<DirectLink> {
-    let sock = Arc::new(
-        UdpSocket::bind(if ipv6 { "[::]:0" } else { "0.0.0.0:0" })
-            .await
-            .ok()?,
-    );
-    let tx = resp_tx.clone();
-    let rsock = sock.clone();
-    let recv_task = tokio::spawn(async move {
-        let mut b = vec![0u8; 65535];
-        while let Ok((n, src)) = rsock.recv_from(&mut b).await {
-            if tx.send((sid, src, b[..n].to_vec())).await.is_err() {
-                break;
-            }
-        }
-    });
-    Some(DirectLink { sock, recv_task })
-}
-
-/// Send one datagram out of the sub-session, opening the egress the routing
-/// table picks for this target on first use.
-// The cascade session is dialled with async work between the lookup and the
-// insert, so the Entry API doesn't fit cleanly.
-#[allow(clippy::map_entry)]
-async fn send_datagram(
-    sess: &mut UdpSession,
-    sid: u16,
-    target: Option<&Addr>,
-    data: &[u8],
-    router: &Router,
-    outbounds: &Outbounds,
-    resp_tx: &mpsc::Sender<(u16, SocketAddr, Vec<u8>)>,
-) {
-    // A Keep that doesn't re-state its target continues the sid's existing
-    // egress: the single cascade session if there is exactly one, else the
-    // local socket's connected peer.
-    let Some(t) = target else {
-        if sess.chain.len() == 1 {
-            if let Some(link) = sess.chain.values_mut().next() {
-                let _ = write_datagram(&mut link.tx, data).await;
-            }
-        } else if let Some(d) = &sess.direct {
-            let _ = d.sock.send(data).await;
-        }
-        return;
-    };
-
-    let ep = endpoint_of(t);
-    if let Some(chain) = outbounds.get(router.route(&ep)) {
-        // Chained: the exit opens the socket. Resolving here is only to label
-        // the downlink frames — the exit resolves the target itself.
-        let Ok(addr) = resolve(t).await else { return };
-        if !sess.chain.contains_key(&addr) {
-            let Some(link) = dial_chain(chain, &ep, sid, addr, resp_tx).await else {
-                return;
-            };
-            sess.chain.insert(addr, link);
-        }
-        if let Some(link) = sess.chain.get_mut(&addr) {
-            let _ = write_datagram(&mut link.tx, data).await;
-        }
-        return;
-    }
-
-    // Local egress (e.g. domestic geoip rules keeping traffic on this IP).
-    let Ok(addr) = resolve(t).await else { return };
-    if sess.direct.is_none() {
-        sess.direct = open_direct(sid, addr.is_ipv6(), resp_tx).await;
-    }
-    if let Some(d) = &sess.direct {
-        let _ = d.sock.send_to(data, addr).await;
     }
 }
 
 /// Server-side Mux.Cool relay for one `Command::Mux` connection: bridges
-/// multiplexed UDP (XUDP) sub-sessions to their routed egress — a local socket
-/// or a cascade session on the exit. `leftover` is plaintext already read past
-/// the VLESS request.
+/// multiplexed UDP (XUDP) sub-sessions to real UDP sockets. `leftover` is
+/// plaintext already read past the VLESS request.
+// The session is created with async work (resolve/bind/spawn) between the
+// lookup and the insert, so the Entry API doesn't fit cleanly.
+#[allow(clippy::map_entry)]
 pub async fn mux_relay<T: MuxIo>(
     mut tunnel: T,
     leftover: Vec<u8>,
     metrics: &Metrics,
     vision_uuid: Option<[u8; 16]>,
     idle: Duration,
-    router: &Router,
-    outbounds: &Outbounds,
 ) -> io::Result<()> {
     // When the Mux stream is Vision-wrapped (flow=vision + XUDP) the client pads
     // and reads *both* directions: we un-pad the uplink and must Vision-pad the
@@ -549,21 +373,49 @@ pub async fn mux_relay<T: MuxIo>(
         while let Some(frame) = parse_frame(&mut inbuf)? {
             match frame.status {
                 STATUS_NEW | STATUS_KEEP => {
-                    // Create the sub-session on first sight (New, or a Keep we
-                    // haven't seen — be lenient). The egress itself is opened
-                    // lazily per target inside `send_datagram`.
-                    let sess = sessions.entry(frame.sid).or_default();
-                    if let Some(data) = &frame.data {
-                        send_datagram(
-                            sess,
-                            frame.sid,
-                            frame.target.as_ref(),
-                            data,
-                            router,
-                            outbounds,
-                            &resp_tx,
-                        )
-                        .await;
+                    // Create the UDP session on first sight (New, or a Keep we
+                    // haven't seen — be lenient).
+                    if !sessions.contains_key(&frame.sid) {
+                        if let Some(t) = &frame.target {
+                            if let Ok(addr) = resolve(t).await {
+                                let sock = match UdpSocket::bind(if addr.is_ipv6() {
+                                    "[::]:0"
+                                } else {
+                                    "0.0.0.0:0"
+                                })
+                                .await
+                                {
+                                    Ok(s) => Arc::new(s),
+                                    Err(_) => continue,
+                                };
+                                let tx = resp_tx.clone();
+                                let sid = frame.sid;
+                                let rsock = sock.clone();
+                                let recv_task = tokio::spawn(async move {
+                                    let mut b = vec![0u8; 65535];
+                                    while let Ok((n, src)) = rsock.recv_from(&mut b).await {
+                                        if tx.send((sid, src, b[..n].to_vec())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                sessions.insert(frame.sid, UdpSession { sock, recv_task });
+                            }
+                        }
+                    }
+                    // Send this frame's datagram to its (per-packet) target.
+                    if let (Some(sess), Some(t), Some(data)) =
+                        (sessions.get(&frame.sid), &frame.target, &frame.data)
+                    {
+                        if let Ok(addr) = resolve(t).await {
+                            let _ = sess.sock.send_to(data, addr).await;
+                            metrics.add_bytes(data.len() as u64, 0);
+                        }
+                    } else if let (Some(sess), None, Some(data)) =
+                        (sessions.get(&frame.sid), &frame.target, &frame.data)
+                    {
+                        // Keep without a re-stated target: send to the connected peer.
+                        let _ = sess.sock.send(data).await;
                         metrics.add_bytes(data.len() as u64, 0);
                     }
                 }
@@ -729,8 +581,6 @@ mod tests {
                 &m,
                 None,
                 Duration::from_secs(5),
-                &Router::new("freedom"),
-                &Outbounds::default(),
             )
             .await;
         });
@@ -747,140 +597,6 @@ mod tests {
         assert_eq!(f.data.as_deref(), Some(&payload[..]));
 
         // Closing the carrier ends the relay.
-        let _ = client.shutdown().await;
-        drop(client);
-        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
-    }
-
-    /// The same XUDP datagram, but with the router pointing at a chain: it must
-    /// leave from the **exit**, not from a socket on this node.
-    ///
-    /// This is the path the home router takes — mihomo sends all UDP as XUDP —
-    /// so without it Telegram calls from behind the router would still egress
-    /// domestically even though the single-target UDP path was fixed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn xudp_egresses_from_the_cascade_exit() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let echo_addr = echo.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut b = [0u8; 1500];
-            while let Ok((n, src)) = echo.recv_from(&mut b).await {
-                let _ = echo.send_to(&b[..n], src).await;
-            }
-        });
-
-        // A real exit node: it owns the socket the datagram finally leaves on.
-        const LINK_UUID: &str = "22222222-2222-4222-8222-222222222222";
-        let veil =
-            donut_veil::VeilServerConfig::new([0x22u8; 32], ["deadbeef".parse().unwrap()]).unwrap();
-        let exit_pub = veil.public_key_bytes();
-        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        let exit_metrics = Metrics::new();
-        let exit_addr = crate::run_veil_proxy(
-            "127.0.0.1:0".parse().unwrap(),
-            vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
-            veil,
-            "127.0.0.1:9".parse().unwrap(),
-            donut_core::AuthHandle::new(donut_core::UserAuth::new(vec![LINK_UUID
-                .parse::<donut_core::UserId>()
-                .unwrap()])),
-            Arc::new(Router::new("freedom")),
-            Arc::new(donut_dns::Resolver::system().unwrap()),
-            Arc::new(Outbounds::default()),
-            exit_metrics.clone(),
-            crate::RuntimeTuning::default(),
-        )
-        .await
-        .unwrap();
-
-        let outbounds = Outbounds::build(
-            &[donut_config::OutboundConfig {
-                tag: "proxy".to_string(),
-                transport: "veil".to_string(),
-                server: exit_addr.to_string(),
-                uuid: LINK_UUID.to_string(),
-                reality: Some(donut_config::RealityClient {
-                    public_key: exit_pub.iter().map(|b| format!("{b:02x}")).collect(),
-                    short_id: "deadbeef".to_string(),
-                    server_name: "localhost".to_string(),
-                    version: [0, 0, 1],
-                    fingerprint: String::new(),
-                }),
-            }],
-            None,
-        )
-        .unwrap();
-
-        // NEW+UDP+Data targeting the echo, exactly as in the direct test.
-        let port = echo_addr.port();
-        let payload = b"ping-xudp-cascade";
-        let mut meta = vec![
-            0x00,
-            0x01,
-            STATUS_NEW,
-            OPTION_DATA,
-            NET_UDP,
-            (port >> 8) as u8,
-            port as u8,
-            0x01,
-            127,
-            0,
-            0,
-            1,
-        ];
-        meta.extend_from_slice(&[0u8; 8]);
-        let mut frame = Vec::new();
-        frame.push((meta.len() >> 8) as u8);
-        frame.push(meta.len() as u8);
-        frame.extend_from_slice(&meta);
-        frame.push((payload.len() >> 8) as u8);
-        frame.push(payload.len() as u8);
-        frame.extend_from_slice(payload);
-
-        let (mut client, server) = tokio::io::duplex(64 * 1024);
-        let metrics = Metrics::new();
-        let m = metrics.clone();
-        let relay = tokio::spawn(async move {
-            let _ = mux_relay(
-                CarrierMuxIo::new(server),
-                frame,
-                &m,
-                None,
-                Duration::from_secs(5),
-                &Router::new("proxy"),
-                &outbounds,
-            )
-            .await;
-        });
-
-        let mut buf = vec![0u8; 1500];
-        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
-            .await
-            .expect("no XUDP response came back through the cascade")
-            .expect("read");
-        let mut rb = BytesMut::from(&buf[..n]);
-        let f = parse_frame(&mut rb).unwrap().unwrap();
-        assert_eq!(f.status, STATUS_KEEP);
-        assert_eq!(f.data.as_deref(), Some(&payload[..]));
-
-        // The echo would answer either way — only the exit's gauge separates
-        // "went through the cascade" from "bridged locally".
-        let gauge = exit_metrics
-            .render()
-            .lines()
-            .find(|l| l.starts_with("donut_active_sessions{kind=\"udp\"}"))
-            .and_then(|l| l.split_whitespace().last()?.parse::<f64>().ok())
-            .expect("exit metrics must expose the udp gauge");
-        assert!(
-            gauge >= 1.0,
-            "the XUDP datagram must egress from the exit, not from this node"
-        );
-
         let _ = client.shutdown().await;
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
@@ -955,8 +671,6 @@ mod tests {
                 &m,
                 Some(uuid),
                 Duration::from_secs(5),
-                &Router::new("freedom"),
-                &Outbounds::default(),
             )
             .await;
         });
