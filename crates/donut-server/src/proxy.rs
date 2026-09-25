@@ -49,6 +49,10 @@ pub struct RuntimeTuning {
     /// Only the handshake phase is bounded — once it succeeds the session
     /// runs without limit (streaming etc.).
     pub tls_handshake_timeout: Duration,
+    /// Idle timeout for an established TCP relay (Xray's `connIdle`).
+    /// Bounds silence, not lifetime — any byte either way resets it.
+    /// `Duration::ZERO` disables the reaping.
+    pub tcp_idle: Duration,
 }
 
 impl RuntimeTuning {
@@ -58,6 +62,7 @@ impl RuntimeTuning {
             udp_idle: Duration::from_secs(t.udp_idle_secs),
             accept_backoff: Duration::from_millis(t.accept_backoff_ms),
             tls_handshake_timeout: Duration::from_secs(t.tls_handshake_timeout_secs),
+            tcp_idle: Duration::from_secs(t.tcp_idle_secs),
         }
     }
 }
@@ -88,6 +93,8 @@ impl VisionDialect {
         }
     }
 }
+
+use donut_io::idle::IdleTimeout;
 
 use crate::metrics::{Metrics, SessErr, SessionKind};
 use crate::veil_server::VeilServer;
@@ -153,7 +160,7 @@ pub async fn run_carrier_proxy(
                     resolver,
                     outbounds,
                     metrics,
-                    RuntimeTuning::default().mux_idle,
+                    RuntimeTuning::default(),
                 )
                 .await
                 {
@@ -219,7 +226,7 @@ pub async fn run_carrier_backend(
                     resolver,
                     outbounds,
                     metrics,
-                    RuntimeTuning::default().mux_idle,
+                    RuntimeTuning::default(),
                 )
                 .await
                 {
@@ -273,7 +280,7 @@ pub async fn run_quic_proxy(
                     resolver,
                     outbounds,
                     metrics,
-                    RuntimeTuning::default().mux_idle,
+                    RuntimeTuning::default(),
                 )
                 .await
                 {
@@ -359,7 +366,7 @@ pub async fn run_tls_carrier_proxy(
                         resolver,
                         outbounds,
                         metrics,
-                        tuning.mux_idle,
+                        tuning,
                     )
                     .await
                     {
@@ -476,7 +483,7 @@ pub async fn run_veil_proxy(
                                     resolver,
                                     outbounds,
                                     metrics,
-                                    tuning.mux_idle,
+                                    tuning,
                                 )
                                 .await
                                 {
@@ -509,7 +516,7 @@ async fn handle_session<S>(
     resolver: Arc<Resolver>,
     outbounds: Arc<crate::outbound::Outbounds>,
     metrics: Arc<Metrics>,
-    mux_idle: std::time::Duration,
+    tuning: RuntimeTuning,
 ) -> Result<(), ProxyError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -567,7 +574,9 @@ where
             leftover.to_vec(),
             &metrics,
             None,
-            mux_idle,
+            tuning.mux_idle,
+            &router,
+            &outbounds,
         )
         .await;
         match &result {
@@ -578,6 +587,48 @@ where
     }
 
     let target_endpoint = request.target.ok_or(ProxyError::UnsupportedCommand)?;
+
+    // UDP over this transport. The **cascade hop itself lands here** — an exit
+    // node runs transport=veil and is reached with a plain VLESS request — so
+    // an exit that refuses Command::Udp silently kills every datagram the
+    // entry forwards. Relay onward when a tag selects a chain (a 3+ node
+    // chain), otherwise bridge to a real socket: this is where the traffic
+    // finally leaves for the internet, from *this* node's address.
+    if matches!(request.command, Command::Udp) {
+        let tag = router.route(&target_endpoint);
+        if matches!(tag, "block" | "blackhole") {
+            metrics.blackholed();
+            tracing::debug!(target = %target_endpoint, "routing: blackhole — dropping (udp)");
+            return Ok(());
+        }
+        let mut response_buf = BytesMut::with_capacity(8);
+        Response::default().encode(&mut response_buf);
+        let _active = metrics.tunnel_started_kind(SessionKind::Udp);
+        if let Some(chain) = outbounds.get(tag) {
+            let upstream = chain.dial_udp(&target_endpoint).await?;
+            session.write_all(&response_buf).await?;
+            let mut session =
+                IdleTimeout::new(Prefixed::new(leftover.to_vec(), session), Duration::ZERO);
+            let mut upstream = IdleTimeout::new(upstream, tuning.udp_idle);
+            if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut session, &mut upstream).await
+            {
+                metrics.add_bytes(up, down);
+            }
+            return Ok(());
+        }
+        let target_addr = resolve(&resolver, &target_endpoint).await?;
+        session.write_all(&response_buf).await?;
+        return vision_xray_splice::vision_udp_relay(
+            crate::mux::CarrierMuxIo::new(session),
+            target_addr,
+            leftover.to_vec(),
+            &metrics,
+            tuning.udp_idle,
+        )
+        .await
+        .map_err(ProxyError::from);
+    }
+
     if !matches!(request.command, Command::Tcp) {
         return Err(ProxyError::UnsupportedCommand);
     }
@@ -631,8 +682,8 @@ where
                 // donut's own simpler padding (donut-client ↔ donut-server).
                 VisionDialect::Donut => {
                     if let Err(e) = donut_io::vision::copy_bidirectional(
-                        tunnel,
-                        upstream,
+                        IdleTimeout::new(tunnel, tuning.tcp_idle),
+                        IdleTimeout::new(upstream, tuning.tcp_idle),
                         donut_io::vision::VisionConfig::default(),
                     )
                     .await
@@ -663,6 +714,12 @@ where
                     }
                 }
             }
+            // This is the plain-VLESS relay, which is also the RU→PL cascade
+            // hop (the exit runs transport=veil and lands here, not in
+            // `vision_server_splice`). Leaving it unbounded is what let the
+            // upstream cascade sockets dangle after a dropped session.
+            let mut session = IdleTimeout::new(session, tuning.tcp_idle);
+            let mut upstream = IdleTimeout::new(upstream, tuning.tcp_idle);
             if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut session, &mut upstream).await
             {
                 metrics.add_bytes(up, down);
@@ -755,6 +812,8 @@ async fn handle_xray_vision_session(
             &metrics,
             vision_uuid,
             tuning.mux_idle,
+            &router,
+            &outbounds,
         )
         .await;
         match &result {
@@ -788,9 +847,44 @@ async fn handle_xray_vision_session(
     let mut response_buf = BytesMut::with_capacity(8);
     Response::default().encode(&mut response_buf);
 
-    // UDP (QUIC etc.): length-prefixed datagrams to a single target — Vision
-    // and chain outbounds don't apply, so this is always a direct UDP bridge.
+    // UDP (QUIC, Telegram voice, …): length-prefixed datagrams to a single
+    // target. When the routing tag selects a chain outbound the datagrams go
+    // through the cascade, so the *exit* opens the real socket and they leave
+    // from its address — without this, UDP always egressed from the entry's
+    // own (domestic) IP while TCP went abroad, which is what kept Telegram
+    // calls broken. Both hops use the same length-prefix framing, so this is
+    // an opaque byte relay, exactly like the TCP path below.
     if matches!(command, Command::Udp) {
+        if let Some(chain) = outbounds.get(tag) {
+            let dial_start = std::time::Instant::now();
+            let upstream = match chain.dial_udp(&target_endpoint).await {
+                Ok(s) => s,
+                Err(e) => {
+                    metrics.session_error(SessErr::Dial);
+                    return Err(e.into());
+                }
+            };
+            metrics.observe_dial(dial_start.elapsed());
+            tracing::debug!(
+                target = %target_endpoint,
+                outbound = chain.tag(),
+                "routing: chain outbound (udp)"
+            );
+            tunnel.write_plaintext(&response_buf).await?;
+            let _active = metrics.tunnel_started_kind(SessionKind::Udp);
+            let result = vision_xray_splice::tls_plain_relay(
+                tunnel,
+                IdleTimeout::new(upstream, tuning.udp_idle),
+                leftover.to_vec(),
+                Some(&metrics),
+            )
+            .await;
+            match &result {
+                Ok(()) => metrics.session_ok(),
+                Err(e) => metrics.session_error(SessErr::from_io(e)),
+            }
+            return result.map_err(ProxyError::from);
+        }
         let target_addr = resolve(&resolver, &target_endpoint).await?;
         tunnel.write_plaintext(&response_buf).await?;
         let _active = metrics.tunnel_started_kind(SessionKind::Udp);
@@ -858,6 +952,7 @@ async fn handle_xray_vision_session(
                 upstream,
                 leftover.to_vec(),
                 user_uuid,
+                tuning.tcp_idle,
                 &metrics,
             )
             .await
@@ -1048,7 +1143,7 @@ pub async fn run_raw_proxy(
                         resolver,
                         outbounds,
                         metrics,
-                        tuning.mux_idle,
+                        tuning,
                     )
                     .await
                     {
@@ -1058,7 +1153,7 @@ pub async fn run_raw_proxy(
                     tracing::trace!(%decoy, "raw: non-tunnel connection → decoy self-steal");
                     metrics.forwarded();
                     let stream = Prefixed::new(vec![first[0]], tls);
-                    relay_to_decoy(stream, decoy).await;
+                    relay_to_decoy(stream, decoy, tuning.tcp_idle).await;
                 } else {
                     tracing::trace!("raw: non-tunnel connection, no decoy → drop");
                 }
@@ -1071,12 +1166,16 @@ pub async fn run_raw_proxy(
 
 /// Bidirectionally relay a (partly-consumed) client stream to the decoy
 /// backend so a probe sees an ordinary site.
-async fn relay_to_decoy<S>(mut client: S, decoy: SocketAddr)
+async fn relay_to_decoy<S>(client: S, decoy: SocketAddr, tcp_idle: Duration)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match TcpStream::connect(decoy).await {
-        Ok(mut up) => {
+        Ok(up) => {
+            // A probe that opens a connection and then goes quiet is exactly
+            // the shape that stalled 2500+ sockets here on 2026-05-29.
+            let mut client = IdleTimeout::new(client, tcp_idle);
+            let mut up = IdleTimeout::new(up, tcp_idle);
             let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
             let _ = up.shutdown().await;
         }
