@@ -127,19 +127,37 @@ impl ChainOutbound {
         &self.tag
     }
 
-    /// Dial the upstream, present our VLESS credential, and ask it to reach
-    /// `target`. Returns a stream positioned at the relayed payload (the
-    /// upstream's VLESS response prefix is consumed here).
+    /// Dial the upstream for a **TCP** target. Returns a stream positioned at
+    /// the relayed payload (the upstream's VLESS response prefix is consumed
+    /// here).
     pub async fn dial(&self, target: &Endpoint) -> io::Result<Box<dyn Duplex>> {
-        let addr = lookup_host(&self.server)
-            .await?
-            .next()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("chain outbound {}: cannot resolve {}", self.tag, self.server),
-                )
-            })?;
+        self.dial_command(target, Command::Tcp).await
+    }
+
+    /// Dial the upstream for a **UDP** target: the exit opens the real UDP
+    /// socket, so datagrams leave the internet from *its* address instead of
+    /// ours. The duplex carries the same length-prefixed datagram framing the
+    /// client uses, so the caller relays it byte-for-byte.
+    pub async fn dial_udp(&self, target: &Endpoint) -> io::Result<Box<dyn Duplex>> {
+        self.dial_command(target, Command::Udp).await
+    }
+
+    /// Dial the upstream, present our VLESS credential, and ask it to reach
+    /// `target` with `command`.
+    async fn dial_command(
+        &self,
+        target: &Endpoint,
+        command: Command,
+    ) -> io::Result<Box<dyn Duplex>> {
+        let addr = lookup_host(&self.server).await?.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "chain outbound {}: cannot resolve {}",
+                    self.tag, self.server
+                ),
+            )
+        })?;
 
         // veil-TLS handshake (REALITY) + server-auth proof.
         let tls = match &self.dialer {
@@ -162,7 +180,7 @@ impl ChainOutbound {
         let req = Request {
             user: self.uuid,
             flow: FlowKind::None,
-            command: Command::Tcp,
+            command,
             target: Some(target.clone()),
             seed: Vec::new(),
         };

@@ -24,6 +24,7 @@ use rustls::{ServerConfig, ServerConnection};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
+use donut_io::idle::IdleTimeout;
 use donut_io::vision_xray::{
     is_complete_record, xtls_padding, FilterState, Unpadder, COMMAND_PADDING_CONTINUE,
     COMMAND_PADDING_DIRECT, COMMAND_PADDING_END, DEFAULT_SEED,
@@ -303,7 +304,7 @@ where
 
 /// Pull one length-prefixed VLESS-UDP datagram (`[len:2 BE][payload]`) out of
 /// `buf` if a complete one is buffered.
-fn take_datagram(buf: &mut BytesMut) -> Option<Vec<u8>> {
+pub(crate) fn take_datagram(buf: &mut BytesMut) -> Option<Vec<u8>> {
     if buf.len() < 2 {
         return None;
     }
@@ -325,8 +326,8 @@ enum UdpEvent {
 /// — Vision never applies to UDP, so this stays inside the outer TLS (no
 /// splice). Bridges those datagrams to a connected UDP socket. `leftover` is
 /// plaintext already read past the VLESS request (start of the UDP body).
-pub async fn vision_udp_relay(
-    mut tunnel: RecordTlsServer,
+pub async fn vision_udp_relay<T: crate::mux::MuxIo>(
+    mut tunnel: T,
     target: SocketAddr,
     leftover: Vec<u8>,
     metrics: &Metrics,
@@ -357,7 +358,7 @@ pub async fn vision_udp_relay(
         }
         let ev = tokio::time::timeout(idle, async {
             tokio::select! {
-                r = tunnel.read_record_opt() => UdpEvent::Tunnel(r),
+                r = tunnel.read_chunk() => UdpEvent::Tunnel(r),
                 r = sock.recv(&mut udpbuf) => UdpEvent::Sock(r),
             }
         })
@@ -376,12 +377,12 @@ pub async fn vision_udp_relay(
                 frame.push((n >> 8) as u8);
                 frame.push(n as u8);
                 frame.extend_from_slice(&udpbuf[..n]);
-                tunnel.write_plaintext(&frame).await?;
+                tunnel.write_chunk(&frame).await?;
                 metrics.add_bytes(0, n as u64);
             }
         }
     }
-    let _ = tunnel.shutdown().await;
+    let _ = tunnel.close().await;
     Ok(())
 }
 
@@ -427,14 +428,22 @@ async fn read_uplink(
 /// authenticated VLESS user.
 pub async fn vision_server_splice<G>(
     mut tunnel: RecordTlsServer,
-    mut upstream: G,
+    upstream: G,
     leftover: Vec<u8>,
     uuid: [u8; 16],
+    tcp_idle: Duration,
     metrics: &Metrics,
 ) -> io::Result<()>
 where
     G: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Bound the relay on silence (Xray's `connIdle`). Wrapping `upstream`
+    // once covers both phases below: the framed loop polls it every
+    // iteration, and it is one half of the raw copy at the end. Without
+    // this a peer that vanished without a FIN parks the relay forever and
+    // pins a NAT slot on the client's upstream router — see
+    // [`donut_io::idle`].
+    let mut upstream = IdleTimeout::new(upstream, tcp_idle);
     let mut filter = FilterState::default();
 
     // uplink (client -> server): unpad + filter -> upstream
@@ -558,14 +567,20 @@ where
     // Both directions spliced → raw inner-TLS flows untouched. Hand off to a
     // full-duplex raw copy (forward the not-yet-sent uplink leftover first).
     if uplink_spliced && downlink_spliced && !(uplink_done && downlink_done) {
-        let (mut tcp, leftover) = tunnel.into_raw();
+        let (tcp, leftover) = tunnel.into_raw();
         if !leftover.is_empty() {
             upstream.write_all(&leftover).await?;
             metrics.add_bytes(leftover.len() as u64, 0);
         }
+        // Guard the client half too: `upstream` alone would keep resetting
+        // its own deadline if the destination kept talking to a client that
+        // is already gone.
+        let mut tcp = IdleTimeout::new(tcp, tcp_idle);
         if let Ok((up, down)) = tokio::io::copy_bidirectional(&mut tcp, &mut upstream).await {
             metrics.add_bytes(up, down);
         }
+        // Shutting both down is what actually frees the peer's NAT slot:
+        // it sends the FIN the vanished peer never received.
         let _ = tcp.shutdown().await;
         let _ = upstream.shutdown().await;
     }
