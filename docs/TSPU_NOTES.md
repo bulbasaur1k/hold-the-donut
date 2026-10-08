@@ -187,6 +187,32 @@ fingerprint'ом, Gecko (новая обфускация в v2.9.2) ещё эк�
 **Решение по hold-the-donut (2026-06-01)**: Hysteria НЕ интегрируем (нет
 sterного бинаря в нашем коде, не хотим стороннего бинаря). xHTTP — приоритет.
 
+### UDP внутри Vision-потока не создаёт новой поверхности (2026-10-08)
+
+Вопрос возникал при включении UDP-каскада ([UDP_CASCADE.md](UDP_CASCADE.md)):
+не даст ли туннелирование звонков (Telegram voice) ТСПУ новый сигнал, нужна ли
+маскировка «под игры».
+
+**Нет и нет — по архитектуре.** mihomo несёт весь UDP как XUDP *внутри* той же
+VLESS/TCP:443 Vision-сессии, что и TCP-трафик. На цензурируемом плече
+(дом → RU-вход) ТСПУ видит один и тот же REALITY TCP-поток независимо от того,
+едут ли внутри дейтаграммы: UDP там неразличим в принципе, маскировать нечего.
+Единственный UDP, видимый домашнему провайдеру напрямую, — DIRECT-маршрутизируемый
+(vivox и RU-цели) — это настоящий игровой голос/сервисы, а не обфускация. С
+зарубежного выхода цензуры нет вообще. Проверка после включения фичи (2026-10-08):
+SYN-троттлинг к входу не изменился ни по характеру (порт-селективно, :22 чист),
+ни по величине.
+
+**Побочный выигрыш**: иностранный QUIC, уехав в каскад, скрывается от нового
+QUIC-SNI-цензора — ТСПУ с ~2026 парсит QUIC ClientHello и режет по SNI как в TLS
+([net4people #654](https://github.com/net4people/bbs/issues/654), FOCI 2026).
+Прямой иностранный HTTP/3 с домашнего провайдера теперь хуже по цензуростойкости,
+чем туннелированный. Цена — лишний RTT на цепочке хендшейков (см. UDP_CASCADE.md).
+
+Отдельно зафиксировано: троттлинг **SYN** к входу (бэрсты до >50% дропов в моменте,
+роттер-детектор `/root/synprobe.sh` на роутере) — это давление на *TCP-плечо*,
+существует независимо от UDP и лечится сменой IP входа / xHTTP, не маскировкой.
+
 ---
 
 ## 5. Ключевые источники
@@ -205,6 +231,7 @@ sterного бинаря в нашем коде, не хотим сторонн
 ### Community
 - [net4people/bbs #490](https://github.com/net4people/bbs/issues/490) — freeze на иностранной AS
 - [net4people/bbs #546](https://github.com/net4people/bbs/issues/546) — TLS connection-policing на home ISPs
+- [net4people/bbs #654](https://github.com/net4people/bbs/issues/654) — QUIC SNI-цензура в РФ (FOCI 2026)
 - [Xray-core #5332](https://github.com/XTLS/Xray-core/issues/5332) — «failed to read client hello»
 - [Xray-core Discussion #5969](https://github.com/XTLS/Xray-core/discussions/5969) — DPI reassembles segments
 - [Xeovo Hub post #132](https://hub.xeovo.com/posts/132-russia-widespread-vless-outages-due-to-tls-handshake-blockingdegradation-request-tlstransport-hardening-and-anti-probing) — operator summary 2026-01
